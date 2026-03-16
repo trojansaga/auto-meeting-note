@@ -1,30 +1,41 @@
 import logging
-import threading
-import time
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-import whisper  # 오디오 길이 측정용
+import openai
 
 logger = logging.getLogger(__name__)
 
-SAMPLE_RATE = 16000
-LIGHTNING_SPEED_ESTIMATE = 6.0  # x realtime (medium batch=12 실측 기반)
-
-_model_cache: dict = {}
+MAX_DURATION_SECS = 1200  # 20분 (API 한도 1400초에 여유)
+CHUNK_SECS = 1200
 
 
-def _get_model(model_name: str, batch_size: int = 12):
-    cache_key = f"{model_name}_b{batch_size}"
-    if cache_key not in _model_cache:
-        from lightning_whisper_mlx import LightningWhisperMLX
-        logger.info("LightningWhisperMLX 모델 로딩 중: %s (batch_size=%d)", model_name, batch_size)
-        _model_cache[cache_key] = LightningWhisperMLX(
-            model=model_name, batch_size=batch_size, quant=None
-        )
-        logger.info("모델 로딩 완료: %s", model_name)
-    return _model_cache[cache_key]
+def _get_duration(audio_path: Path) -> float:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
+        capture_output=True, text=True,
+    )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def _split_audio(audio_path: Path) -> tuple[list[Path], Path]:
+    tmp_dir = Path(tempfile.mkdtemp())
+    pattern = str(tmp_dir / "chunk_%03d.mp3")
+    cmd = [
+        "ffmpeg", "-i", str(audio_path),
+        "-f", "segment", "-segment_time", str(CHUNK_SECS),
+        "-acodec", "copy", "-y", pattern,
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    return sorted(tmp_dir.glob("chunk_*.mp3")), tmp_dir
 
 
 def _format_timestamp(seconds: float) -> str:
@@ -35,69 +46,64 @@ def _format_timestamp(seconds: float) -> str:
 
 
 def transcribe(
-    wav_path: str,
+    audio_path: str,
     output_path: str,
     original_filename: str,
-    model_name: str = "medium",
+    model_name: str = "gpt-4o-transcribe",
     language: str = "ko",
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
-    wav = Path(wav_path)
-    if not wav.exists():
-        raise FileNotFoundError(f"오디오 파일을 찾을 수 없습니다: {wav_path}")
+    audio = Path(audio_path)
+    if not audio.exists():
+        raise FileNotFoundError(f"오디오 파일을 찾을 수 없습니다: {audio_path}")
 
-    logger.info("STT 처리 시작: %s (모델: %s)", wav.name, model_name)
+    logger.info("STT 처리 시작: %s (모델: %s)", audio.name, model_name)
 
-    # 오디오 길이 측정
-    audio = whisper.load_audio(str(wav))
-    audio_duration = len(audio) / SAMPLE_RATE
-    expected_secs = audio_duration / LIGHTNING_SPEED_ESTIMATE
+    client = openai.OpenAI()
+    duration = _get_duration(audio)
 
-    model = _get_model(model_name)
-
-    # 진행률 타이머 스레드 (예상 처리속도 기반)
-    stop_event = threading.Event()
-
-    def _progress_loop():
-        start = time.time()
-        while not stop_event.is_set():
-            elapsed = time.time() - start
-            pct = min(elapsed / expected_secs * 100, 99)
-            if progress_callback:
-                progress_callback(f"[3/5] STT 처리 중... {pct:.0f}%")
-            time.sleep(1)
-
-    if progress_callback:
-        t = threading.Thread(target=_progress_loop, daemon=True)
-        t.start()
-
+    tmp_dir = None
     try:
-        result = model.transcribe(audio_path=str(wav), language=language)
+        if duration > MAX_DURATION_SECS:
+            chunks, tmp_dir = _split_audio(audio)
+            logger.info("재생 길이 초과 (%.0f초), %d개 청크로 분할", duration, len(chunks))
+        else:
+            chunks = [audio]
+
+        all_segments: list[tuple[float, str]] = []
+        time_offset = 0.0
+
+        for i, chunk in enumerate(chunks):
+            if progress_callback:
+                pct = int(i / len(chunks) * 100)
+                progress_callback(f"[3/5] STT 처리 중... {pct}%")
+
+            with open(chunk, "rb") as f:
+                text = client.audio.transcriptions.create(
+                    model=model_name,
+                    file=f,
+                    language=language,
+                    response_format="text",
+                )
+
+            offset_sec = i * CHUNK_SECS
+            all_segments.append((float(offset_sec), str(text).strip()))
+
     finally:
-        stop_event.set()
+        if tmp_dir and tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     if progress_callback:
         progress_callback("[3/5] STT 처리 완료 (100%)")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     lines = [
         "# 회의 대본\n",
         f"- 파일명: {original_filename}",
         f"- 생성일시: {now}\n",
         "## Transcript\n",
     ]
-
-    for seg in result.get("segments", []):
-        # lightning-whisper-mlx 포맷: [start_ms, end_ms, text]
-        if isinstance(seg, (list, tuple)) and len(seg) >= 3:
-            start_sec = seg[0] / 1000.0
-            text = seg[2].strip()
-        elif isinstance(seg, dict):
-            start_sec = seg.get("start", 0)
-            text = seg.get("text", "").strip()
-        else:
-            continue
+    for start_sec, text in all_segments:
         if text:
             lines.append(f"{_format_timestamp(start_sec)} {text}")
 

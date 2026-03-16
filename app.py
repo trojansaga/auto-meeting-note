@@ -197,7 +197,10 @@ class AutoMeetingNoteApp(rumps.App):
         date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}")
         if not watch_dir.exists():
             return []
-        return sorted(f for f in watch_dir.glob("*.mp4") if date_pattern.match(f.name))
+        return sorted(
+            f for f in watch_dir.iterdir()
+            if f.suffix.lower() in {".mp4", ".mov"} and date_pattern.match(f.name)
+        )
 
     def _process_pending(self, _):
         self._config = load_config()

@@ -38,7 +38,7 @@ class MeetingFileHandler(FileSystemEventHandler):
     def _matches(self, path: str) -> bool:
         p = Path(path)
         return (
-            p.suffix.lower() == ".mp4"
+            p.suffix.lower() in {".mp4", ".mov"}
             and p.name.startswith(self._file_prefix)
         )
 

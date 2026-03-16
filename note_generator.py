@@ -50,7 +50,7 @@ def generate_note(
     output_path: str,
     original_filename: str,
     created_at: str,
-    model: str = "gpt-5.3",
+    model: str = "gpt-5.4",
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
     script = Path(script_path)

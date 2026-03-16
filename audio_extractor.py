@@ -62,9 +62,10 @@ def extract_audio(
         ffmpeg_bin,
         "-i", str(mp4),
         "-vn",
-        "-acodec", "pcm_s16le",
+        "-acodec", "libmp3lame",
         "-ar", "16000",
         "-ac", "1",
+        "-b:a", "32k",
         "-y",
         str(output),
     ]
