@@ -1,0 +1,5 @@
+watch_dir: "~/Desktop"
+file_prefix: "회의_"
+whisper_model: "medium"
+language: "ko"
+openai_model: "gpt-5.3"
