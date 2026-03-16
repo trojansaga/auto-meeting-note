@@ -1,5 +1,7 @@
 watch_dir: "~/Desktop"
 file_prefix: "회의_"
-stt_model: "gpt-4o-transcribe"
+whisper_model: "small"
+whisper_quant: "4bit"
+whisper_batch_size: 4
 language: "ko"
 openai_model: "gpt-5.4"

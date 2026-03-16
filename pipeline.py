@@ -30,7 +30,9 @@ def run_pipeline(
     stem = mp4.stem
 
     watch_dir = Path(config.get("watch_dir", "~/Desktop")).expanduser()
-    stt_model = config.get("stt_model", "gpt-4o-transcribe")
+    whisper_model = config.get("whisper_model", "medium")
+    whisper_quant = config.get("whisper_quant", None)
+    whisper_batch_size = config.get("whisper_batch_size", 12)
     language = config.get("language", "ko")
     openai_model = config.get("openai_model", "gpt-5.4")
 
@@ -56,17 +58,19 @@ def run_pipeline(
 
         # 2. 음성 추출
         _notify(f"[2/5] {STEP_NAMES[1]}")
-        mp3_path = str(work_dir / "audio.mp3")
-        extract_audio(str(moved_mp4), mp3_path, progress_callback=_notify)
+        wav_path = str(work_dir / "audio.wav")
+        extract_audio(str(moved_mp4), wav_path, progress_callback=_notify)
 
         # 3. STT 처리
         _notify(f"[3/5] {STEP_NAMES[2]}")
         script_path = str(work_dir / "script.md")
         transcribe(
-            mp3_path,
+            wav_path,
             script_path,
             original_filename,
-            model_name=stt_model,
+            model_name=whisper_model,
+            quant=whisper_quant,
+            batch_size=whisper_batch_size,
             language=language,
             progress_callback=_notify,
         )
@@ -85,10 +89,10 @@ def run_pipeline(
 
         # 5. 임시 파일 정리
         _notify(f"[5/5] {STEP_NAMES[4]}")
-        mp3_file = Path(mp3_path)
-        if mp3_file.exists():
-            mp3_file.unlink()
-            logger.info("임시 MP3 파일 삭제: %s", mp3_file.name)
+        wav_file = Path(wav_path)
+        if wav_file.exists():
+            wav_file.unlink()
+            logger.info("임시 WAV 파일 삭제: %s", wav_file.name)
 
         _notify(f"✅ 완료: {original_filename}")
         return str(work_dir)

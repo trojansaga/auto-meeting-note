@@ -12,6 +12,11 @@ for _p in ["/opt/homebrew/bin", "/usr/local/bin"]:
     if _p not in os.environ.get("PATH", ""):
         os.environ["PATH"] = _p + ":" + os.environ.get("PATH", "")
 
+# HuggingFace 모델 저장 경로를 쓰기 가능한 위치로 지정
+_HF_HOME = str(Path.home() / "Library" / "Application Support" / "AutoMeetingNote" / "huggingface")
+os.environ.setdefault("HF_HOME", _HF_HOME)
+Path(_HF_HOME).mkdir(parents=True, exist_ok=True)
+
 # mlx, lightning_whisper_mlx 등 네이티브 패키지는 번들링 불가 → venv site-packages 참조
 # 번들 경로: .app/Contents/Resources/app.py → 5단계 위가 프로젝트 루트
 _APP_FILE = Path(__file__).resolve()

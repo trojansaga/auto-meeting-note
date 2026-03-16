@@ -1,41 +1,30 @@
 import logging
-import shutil
-import subprocess
-import tempfile
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-import openai
-
 logger = logging.getLogger(__name__)
 
-MAX_DURATION_SECS = 1200  # 20분 (API 한도 1400초에 여유)
-CHUNK_SECS = 1200
+SAMPLE_RATE = 16000
+
+MODEL_REPOS = {
+    "tiny":     {"base": "mlx-community/whisper-tiny-mlx",     "4bit": "mlx-community/whisper-tiny-mlx-4bit",     "8bit": "mlx-community/whisper-tiny-mlx-8bit"},
+    "small":    {"base": "mlx-community/whisper-small-mlx",    "4bit": "mlx-community/whisper-small-mlx-4bit",    "8bit": "mlx-community/whisper-small-mlx-8bit"},
+    "medium":   {"base": "mlx-community/whisper-medium-mlx",   "4bit": "mlx-community/whisper-medium-mlx-4bit",   "8bit": "mlx-community/whisper-medium-mlx-8bit"},
+    "large-v3": {"base": "mlx-community/whisper-large-v3-mlx", "4bit": "mlx-community/whisper-large-v3-mlx-4bit", "8bit": "mlx-community/whisper-large-v3-mlx-8bit"},
+}
+
+_model_cache: dict = {}
 
 
-def _get_duration(audio_path: Path) -> float:
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
-        capture_output=True, text=True,
-    )
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        return 0.0
-
-
-def _split_audio(audio_path: Path) -> tuple[list[Path], Path]:
-    tmp_dir = Path(tempfile.mkdtemp())
-    pattern = str(tmp_dir / "chunk_%03d.mp3")
-    cmd = [
-        "ffmpeg", "-i", str(audio_path),
-        "-f", "segment", "-segment_time", str(CHUNK_SECS),
-        "-acodec", "copy", "-y", pattern,
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    return sorted(tmp_dir.glob("chunk_*.mp3")), tmp_dir
+def _get_repo(model_name: str, quant: Optional[str]) -> str:
+    if model_name not in MODEL_REPOS:
+        raise ValueError(f"지원하지 않는 모델: {model_name}")
+    variants = MODEL_REPOS[model_name]
+    key = quant if quant in variants else "base"
+    return variants[key]
 
 
 def _format_timestamp(seconds: float) -> str:
@@ -46,52 +35,54 @@ def _format_timestamp(seconds: float) -> str:
 
 
 def transcribe(
-    audio_path: str,
+    wav_path: str,
     output_path: str,
     original_filename: str,
-    model_name: str = "gpt-4o-transcribe",
+    model_name: str = "small",
+    quant: Optional[str] = "4bit",
+    batch_size: int = 4,
     language: str = "ko",
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
-    audio = Path(audio_path)
-    if not audio.exists():
-        raise FileNotFoundError(f"오디오 파일을 찾을 수 없습니다: {audio_path}")
+    import mlx_whisper
+    import whisper as _whisper
 
-    logger.info("STT 처리 시작: %s (모델: %s)", audio.name, model_name)
+    wav = Path(wav_path)
+    if not wav.exists():
+        raise FileNotFoundError(f"오디오 파일을 찾을 수 없습니다: {wav_path}")
 
-    client = openai.OpenAI()
-    duration = _get_duration(audio)
+    repo = _get_repo(model_name, quant)
+    logger.info("STT 처리 시작: %s (repo: %s)", wav.name, repo)
 
-    tmp_dir = None
-    try:
-        if duration > MAX_DURATION_SECS:
-            chunks, tmp_dir = _split_audio(audio)
-            logger.info("재생 길이 초과 (%.0f초), %d개 청크로 분할", duration, len(chunks))
-        else:
-            chunks = [audio]
+    audio = _whisper.load_audio(str(wav))
+    audio_duration = len(audio) / SAMPLE_RATE
+    # mlx-whisper는 small 기준 실시간 10배 이상
+    expected_secs = audio_duration / 10.0
 
-        all_segments: list[tuple[float, str]] = []
-        time_offset = 0.0
+    stop_event = threading.Event()
 
-        for i, chunk in enumerate(chunks):
+    def _progress_loop():
+        start = time.time()
+        while not stop_event.is_set():
+            elapsed = time.time() - start
+            pct = min(elapsed / expected_secs * 100, 99)
             if progress_callback:
-                pct = int(i / len(chunks) * 100)
-                progress_callback(f"[3/5] STT 처리 중... {pct}%")
+                progress_callback(f"[3/5] STT 처리 중... {pct:.0f}%")
+            time.sleep(1)
 
-            with open(chunk, "rb") as f:
-                text = client.audio.transcriptions.create(
-                    model=model_name,
-                    file=f,
-                    language=language,
-                    response_format="text",
-                )
+    if progress_callback:
+        t = threading.Thread(target=_progress_loop, daemon=True)
+        t.start()
 
-            offset_sec = i * CHUNK_SECS
-            all_segments.append((float(offset_sec), str(text).strip()))
-
+    try:
+        result = mlx_whisper.transcribe(
+            str(wav),
+            path_or_hf_repo=repo,
+            language=language,
+            temperature=0,
+        )
     finally:
-        if tmp_dir and tmp_dir.exists():
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        stop_event.set()
 
     if progress_callback:
         progress_callback("[3/5] STT 처리 완료 (100%)")
@@ -103,7 +94,9 @@ def transcribe(
         f"- 생성일시: {now}\n",
         "## Transcript\n",
     ]
-    for start_sec, text in all_segments:
+    for seg in result.get("segments", []):
+        start_sec = seg.get("start", 0)
+        text = seg.get("text", "").strip()
         if text:
             lines.append(f"{_format_timestamp(start_sec)} {text}")
 
