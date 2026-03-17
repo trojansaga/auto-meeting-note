@@ -10,6 +10,11 @@ RESOURCES="$CONTENTS/Resources"
 
 echo "=== $APP_NAME.app 빌드 시작 ==="
 
+if [ ! -d "$SCRIPT_DIR/.venv" ]; then
+    echo "❌ .venv가 없습니다. 먼저 'bash setup_env.sh'를 실행하세요."
+    exit 1
+fi
+
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS" "$RESOURCES"
 

@@ -21,9 +21,10 @@ Path(_HF_HOME).mkdir(parents=True, exist_ok=True)
 # 번들 경로: .app/Contents/Resources/app.py → 5단계 위가 프로젝트 루트
 _APP_FILE = Path(__file__).resolve()
 _PROJECT_ROOT = _APP_FILE.parent.parent.parent.parent.parent  # dist/../ = 프로젝트 루트
-_VENV_SITE = _PROJECT_ROOT / ".venv" / "lib" / "python3.11" / "site-packages"
+_PY_VER = f"python{sys.version_info.major}.{sys.version_info.minor}"
+_VENV_SITE = _PROJECT_ROOT / ".venv" / "lib" / _PY_VER / "site-packages"
 if not _VENV_SITE.exists():
-    _VENV_SITE = _APP_FILE.parent / ".venv" / "lib" / "python3.11" / "site-packages"
+    _VENV_SITE = _APP_FILE.parent / ".venv" / "lib" / _PY_VER / "site-packages"
 if _VENV_SITE.exists() and str(_VENV_SITE) not in sys.path:
     sys.path.insert(0, str(_VENV_SITE))
 
@@ -127,6 +128,8 @@ class AutoMeetingNoteApp(rumps.App):
         self._open_config_item = rumps.MenuItem("설정 파일 열기", callback=self._open_config)
         self._quit_item = rumps.MenuItem("종료", callback=self._quit)
 
+        self._check_dependencies()
+
         self.menu = [
             self._toggle_item,
             self._process_pending_item,
@@ -138,6 +141,43 @@ class AutoMeetingNoteApp(rumps.App):
             None,
             self._quit_item,
         ]
+
+    def _check_dependencies(self):
+        import shutil
+        errors = []
+        warnings = []
+
+        if not shutil.which("ffmpeg"):
+            errors.append("ffmpeg가 없습니다.\n터미널에서 'brew install ffmpeg' 실행 후 앱을 재시작하세요.")
+
+        if not os.environ.get("OPENAI_API_KEY"):
+            errors.append("OPENAI_API_KEY가 설정되지 않았습니다.\n설정 파일 열기 메뉴에서 .env 파일을 확인하세요.")
+
+        try:
+            import mlx_whisper  # noqa: F401
+        except ImportError:
+            errors.append("mlx_whisper 패키지가 없습니다.\n터미널에서 'pip install mlx-whisper' 실행 후 앱을 재시작하세요.")
+
+        if not errors:
+            model_name = self._config.get("whisper_model", "small")
+            quant = self._config.get("whisper_quant", "4bit")
+            from transcriber import MODEL_REPOS
+            variants = MODEL_REPOS.get(model_name, {})
+            repo = variants.get(quant if quant in variants else "base", "")
+            if repo:
+                cache_dir_name = "models--" + repo.replace("/", "--")
+                hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+                model_cache = hf_home / "hub" / cache_dir_name
+                if not model_cache.exists():
+                    warnings.append(
+                        f"Whisper 모델({repo})이 아직 다운로드되지 않았습니다.\n"
+                        "첫 파일 처리 시 자동으로 다운로드됩니다 (수 GB, 시간 소요)."
+                    )
+
+        if errors:
+            rumps.alert(title="설정 오류", message="\n\n".join(errors))
+        if warnings:
+            rumps.alert(title="사전 안내", message="\n\n".join(warnings))
 
     def _flush_ui(self, _):
         if self._pending_app_title is not None:

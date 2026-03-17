@@ -1,6 +1,7 @@
 rumps>=0.4.0
 watchdog>=3.0.0
 openai-whisper>=20231117
+mlx-whisper>=0.4.3
 lightning-whisper-mlx>=0.0.10
 mlx>=0.31.0
 openai>=1.0.0
