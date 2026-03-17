@@ -133,7 +133,8 @@ class AutoMeetingNoteApp(rumps.App):
         self._model_menu_items: dict = {}
         self._model_menu = self._build_model_menu()
 
-        self._check_dependencies()
+        self._download_stop_event: threading.Event = threading.Event()
+        self._download_stop_event.set()  # 초기값: 다운로드 없음
 
         self.menu = [
             self._toggle_item,
@@ -148,6 +149,8 @@ class AutoMeetingNoteApp(rumps.App):
             None,
             self._quit_item,
         ]
+
+        self._check_dependencies()
 
     def _check_dependencies(self):
         import shutil
@@ -183,11 +186,37 @@ class AutoMeetingNoteApp(rumps.App):
         hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
         model_cache = hf_home / "hub" / cache_dir_name
         if not model_cache.exists():
+            resp = rumps.alert(
+                title="모델 다운로드",
+                message=f"Whisper 모델 {model_name} ({quant})을 다운로드하시겠습니까?\n(수백 MB ~ 수 GB, 시간이 걸릴 수 있습니다)",
+                ok="다운로드",
+                cancel="취소",
+            )
+            if resp != 1:
+                return
+            self._download_stop_event = threading.Event()
+            self._show_cancel_item()
             threading.Thread(
                 target=self._download_model,
-                args=(repo, model_cache, hf_home),
+                args=(repo, model_cache, hf_home, self._download_stop_event),
                 daemon=True,
             ).start()
+
+    def _show_cancel_item(self):
+        """메인 스레드에서 호출"""
+        self.menu.add(rumps.MenuItem("⏹ 다운로드 중단", callback=self._cancel_download))
+
+    def _hide_cancel_item(self):
+        """백그라운드 스레드에서 호출 가능"""
+        def _remove(_timer):
+            if "⏹ 다운로드 중단" in self.menu:
+                del self.menu["⏹ 다운로드 중단"]
+            _timer.stop()
+        rumps.Timer(_remove, 0.0).start()
+
+    def _cancel_download(self, _):
+        self._download_stop_event.set()
+        logger.info("사용자가 다운로드를 중단했습니다")
 
     def _build_model_menu(self) -> rumps.MenuItem:
         from transcriber import MODEL_REPOS
@@ -218,48 +247,38 @@ class AutoMeetingNoteApp(rumps.App):
             self._check_and_download_model(model_name, quant)
         return _select
 
-    def _download_model(self, repo: str, model_cache: Path, hf_home: Path):
+    def _download_model(self, repo: str, model_cache: Path, hf_home: Path, stop_event: threading.Event):
         import time
         import huggingface_hub
 
-        self._on_status(f"모델 다운로드 준비 중: {repo}")
+        self._on_status(f"모델 파일 목록 조회 중: {repo}")
 
-        total_files = None
         try:
-            total_files = sum(1 for _ in huggingface_hub.list_repo_files(repo))
-            logger.info("다운로드 대상: %s (%d 파일)", repo, total_files)
+            files = list(huggingface_hub.list_repo_files(repo))
+            total = len(files)
+            logger.info("다운로드 대상: %s (%d 파일)", repo, total)
         except Exception as e:
-            logger.warning("파일 목록 조회 실패: %s", e)
+            logger.error("파일 목록 조회 실패: %s", e)
+            self._on_status(f"❌ 모델 다운로드 실패: 파일 목록 조회 불가")
+            self._hide_cancel_item()
+            return
 
-        stop_monitor = threading.Event()
+        start_time = time.time()
+        try:
+            for i, filename in enumerate(files):
+                if stop_event.is_set():
+                    self._on_status(f"⏹ 다운로드 중단됨: {repo}")
+                    logger.info("다운로드 중단: %s", repo)
+                    return
 
-        def _monitor():
-            start_time = time.time()
-            blobs_dir = model_cache / "blobs"
-            while not stop_monitor.is_set():
                 elapsed = int(time.time() - start_time)
                 mins, secs = divmod(elapsed, 60)
                 time_str = f"{mins}분 {secs}초" if mins else f"{secs}초"
-                downloaded = 0
-                if blobs_dir.exists():
-                    downloaded = sum(
-                        1 for f in blobs_dir.iterdir()
-                        if not f.name.endswith(".incomplete")
-                    )
-                if total_files:
-                    pct = min(downloaded / total_files * 100, 99)
-                    self._on_status(f"모델 다운로드 중... {pct:.0f}% ({downloaded}/{total_files}개) [{time_str}]")
-                else:
-                    self._on_status(f"모델 다운로드 중... ({downloaded}개 완료) [{time_str}]")
-                time.sleep(1)
+                pct = i / total * 100
+                self._on_status(f"모델 다운로드 중... {pct:.0f}% ({i}/{total}개) [{time_str}]")
 
-        monitor_thread = threading.Thread(target=_monitor, daemon=True)
-        monitor_thread.start()
+                huggingface_hub.hf_hub_download(repo_id=repo, filename=filename)
 
-        try:
-            huggingface_hub.snapshot_download(repo_id=repo)
-            stop_monitor.set()
-            monitor_thread.join(timeout=2)
             self._on_status(f"✅ 모델 다운로드 완료: {repo}")
             rumps.notification(
                 title="모델 다운로드 완료",
@@ -268,8 +287,6 @@ class AutoMeetingNoteApp(rumps.App):
             )
             logger.info("모델 다운로드 완료: %s", repo)
         except Exception as e:
-            stop_monitor.set()
-            monitor_thread.join(timeout=2)
             logger.error("모델 다운로드 실패: %s — %s", repo, e)
             self._on_status(f"❌ 모델 다운로드 실패: {repo}")
             rumps.notification(
@@ -277,6 +294,8 @@ class AutoMeetingNoteApp(rumps.App):
                 subtitle=repo,
                 message=str(e),
             )
+        finally:
+            self._hide_cancel_item()
 
     def _flush_ui(self, _):
         if self._pending_app_title is not None:
