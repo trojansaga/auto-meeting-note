@@ -72,9 +72,10 @@ def _ensure_user_config() -> Path:
             default = {
                 "watch_dir": "~/Desktop",
                 "file_prefix": "회의_",
-                "whisper_model": "large-v3",
+                "whisper_model": "tiny",
+                "whisper_quant": "4bit",
                 "language": "ko",
-                "openai_model": "gpt-5.3",
+                "openai_model": "gpt-5.4",
             }
             user_config.write_text(yaml.dump(default, allow_unicode=True), encoding="utf-8")
             logger.info("기본 config.yaml 생성: %s", user_config)
@@ -90,9 +91,10 @@ def load_config() -> dict:
         return {
             "watch_dir": "~/Desktop",
             "file_prefix": "회의_",
-            "whisper_model": "large-v3",
+            "whisper_model": "tiny",
+            "whisper_quant": "4bit",
             "language": "ko",
-            "openai_model": "gpt-5.3",
+            "openai_model": "gpt-5.4",
         }
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -128,6 +130,9 @@ class AutoMeetingNoteApp(rumps.App):
         self._open_config_item = rumps.MenuItem("설정 파일 열기", callback=self._open_config)
         self._quit_item = rumps.MenuItem("종료", callback=self._quit)
 
+        self._model_menu_items: dict = {}
+        self._model_menu = self._build_model_menu()
+
         self._check_dependencies()
 
         self.menu = [
@@ -135,6 +140,8 @@ class AutoMeetingNoteApp(rumps.App):
             self._process_pending_item,
             None,
             self._status_item,
+            None,
+            self._model_menu,
             None,
             self._open_folder_item,
             self._open_config_item,
@@ -162,21 +169,54 @@ class AutoMeetingNoteApp(rumps.App):
             rumps.alert(title="설정 오류", message="\n\n".join(errors))
             return
 
-        model_name = self._config.get("whisper_model", "small")
+        model_name = self._config.get("whisper_model", "tiny")
         quant = self._config.get("whisper_quant", "4bit")
+        self._check_and_download_model(model_name, quant)
+
+    def _check_and_download_model(self, model_name: str, quant: str):
         from transcriber import MODEL_REPOS
         variants = MODEL_REPOS.get(model_name, {})
         repo = variants.get(quant if quant in variants else "base", "")
-        if repo:
-            cache_dir_name = "models--" + repo.replace("/", "--")
-            hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-            model_cache = hf_home / "hub" / cache_dir_name
-            if not model_cache.exists():
-                threading.Thread(
-                    target=self._download_model,
-                    args=(repo, model_cache, hf_home),
-                    daemon=True,
-                ).start()
+        if not repo:
+            return
+        cache_dir_name = "models--" + repo.replace("/", "--")
+        hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+        model_cache = hf_home / "hub" / cache_dir_name
+        if not model_cache.exists():
+            threading.Thread(
+                target=self._download_model,
+                args=(repo, model_cache, hf_home),
+                daemon=True,
+            ).start()
+
+    def _build_model_menu(self) -> rumps.MenuItem:
+        from transcriber import MODEL_REPOS
+        current_model = self._config.get("whisper_model", "tiny")
+        current_quant = self._config.get("whisper_quant", "4bit")
+
+        model_menu = rumps.MenuItem(f"STT 모델: {current_model} ({current_quant})")
+        for model_name in MODEL_REPOS:
+            sub = rumps.MenuItem(model_name)
+            for quant in ["4bit", "base", "8bit"]:
+                item = rumps.MenuItem(quant, callback=self._make_model_callback(model_name, quant))
+                item.state = 1 if (model_name == current_model and quant == current_quant) else 0
+                self._model_menu_items[(model_name, quant)] = item
+                sub.add(item)
+            model_menu.add(sub)
+        return model_menu
+
+    def _make_model_callback(self, model_name: str, quant: str):
+        def _select(_sender):
+            for item in self._model_menu_items.values():
+                item.state = 0
+            self._model_menu_items[(model_name, quant)].state = 1
+            self._model_menu.title = f"STT 모델: {model_name} ({quant})"
+            self._config["whisper_model"] = model_name
+            self._config["whisper_quant"] = quant
+            CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
+            logger.info("STT 모델 변경: %s (%s)", model_name, quant)
+            self._check_and_download_model(model_name, quant)
+        return _select
 
     def _download_model(self, repo: str, model_cache: Path, hf_home: Path):
         import time
