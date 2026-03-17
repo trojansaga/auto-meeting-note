@@ -279,21 +279,27 @@ class AutoMeetingNoteApp(rumps.App):
 
                 huggingface_hub.hf_hub_download(repo_id=repo, filename=filename)
 
-            self._on_status(f"✅ 모델 다운로드 완료: {repo}")
-            rumps.notification(
-                title="모델 다운로드 완료",
-                subtitle=repo,
-                message="Whisper 모델 준비가 완료되었습니다.",
-            )
             logger.info("모델 다운로드 완료: %s", repo)
+            self._on_status(f"✅ 모델 다운로드 완료: {repo}")
+            try:
+                rumps.notification(
+                    title="모델 다운로드 완료",
+                    subtitle=repo,
+                    message="Whisper 모델 준비가 완료되었습니다.",
+                )
+            except Exception:
+                pass
         except Exception as e:
             logger.error("모델 다운로드 실패: %s — %s", repo, e)
             self._on_status(f"❌ 모델 다운로드 실패: {repo}")
-            rumps.notification(
-                title="모델 다운로드 실패",
-                subtitle=repo,
-                message=str(e),
-            )
+            try:
+                rumps.notification(
+                    title="모델 다운로드 실패",
+                    subtitle=repo,
+                    message=str(e),
+                )
+            except Exception:
+                pass
         finally:
             self._hide_cancel_item()
 
