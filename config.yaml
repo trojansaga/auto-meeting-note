@@ -1,6 +1,6 @@
 watch_dir: "~/Desktop"
 file_prefix: "회의_"
-whisper_model: "tiny"
+whisper_model: "small"
 whisper_quant: "4bit"
 whisper_batch_size: 4
 language: "ko"

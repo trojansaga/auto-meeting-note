@@ -72,7 +72,7 @@ def _ensure_user_config() -> Path:
             default = {
                 "watch_dir": "~/Desktop",
                 "file_prefix": "회의_",
-                "whisper_model": "tiny",
+                "whisper_model": "small",
                 "whisper_quant": "4bit",
                 "language": "ko",
                 "openai_model": "gpt-5.4",
@@ -91,7 +91,7 @@ def load_config() -> dict:
         return {
             "watch_dir": "~/Desktop",
             "file_prefix": "회의_",
-            "whisper_model": "tiny",
+            "whisper_model": "small",
             "whisper_quant": "4bit",
             "language": "ko",
             "openai_model": "gpt-5.4",
@@ -169,7 +169,7 @@ class AutoMeetingNoteApp(rumps.App):
             rumps.alert(title="설정 오류", message="\n\n".join(errors))
             return
 
-        model_name = self._config.get("whisper_model", "tiny")
+        model_name = self._config.get("whisper_model", "small")
         quant = self._config.get("whisper_quant", "4bit")
         self._check_and_download_model(model_name, quant)
 
@@ -191,7 +191,7 @@ class AutoMeetingNoteApp(rumps.App):
 
     def _build_model_menu(self) -> rumps.MenuItem:
         from transcriber import MODEL_REPOS
-        current_model = self._config.get("whisper_model", "tiny")
+        current_model = self._config.get("whisper_model", "small")
         current_quant = self._config.get("whisper_quant", "4bit")
 
         model_menu = rumps.MenuItem(f"STT 모델: {current_model} ({current_quant})")
