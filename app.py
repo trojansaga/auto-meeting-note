@@ -172,9 +172,31 @@ class AutoMeetingNoteApp(rumps.App):
             rumps.alert(title="설정 오류", message="\n\n".join(errors))
             return
 
+        threading.Thread(target=self._validate_openai_model, daemon=True).start()
+
         model_name = self._config.get("whisper_model", "small")
         quant = self._config.get("whisper_quant", "4bit")
         self._check_and_download_model(model_name, quant)
+
+    def _validate_openai_model(self):
+        import openai
+        model = self._config.get("openai_model", "gpt-5.4")
+        try:
+            client = openai.OpenAI()
+            available = [m.id for m in client.models.list().data]
+            if model not in available:
+                logger.warning("OpenAI 모델 없음: %s", model)
+                def _alert(_timer):
+                    _timer.stop()
+                    rumps.alert(
+                        title="OpenAI 모델 오류",
+                        message=f"설정된 모델 '{model}'을 찾을 수 없습니다.\n'설정 파일 열기'에서 openai_model 값을 확인해주세요.",
+                    )
+                rumps.Timer(_alert, 0.0).start()
+            else:
+                logger.info("OpenAI 모델 확인 완료: %s", model)
+        except Exception as e:
+            logger.warning("OpenAI 모델 검증 실패: %s", e)
 
     def _check_and_download_model(self, model_name: str, quant: str):
         from transcriber import MODEL_REPOS
