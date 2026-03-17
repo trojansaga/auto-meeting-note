@@ -158,26 +158,85 @@ class AutoMeetingNoteApp(rumps.App):
         except ImportError:
             errors.append("mlx_whisper 패키지가 없습니다.\n터미널에서 'pip install mlx-whisper' 실행 후 앱을 재시작하세요.")
 
-        if not errors:
-            model_name = self._config.get("whisper_model", "small")
-            quant = self._config.get("whisper_quant", "4bit")
-            from transcriber import MODEL_REPOS
-            variants = MODEL_REPOS.get(model_name, {})
-            repo = variants.get(quant if quant in variants else "base", "")
-            if repo:
-                cache_dir_name = "models--" + repo.replace("/", "--")
-                hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-                model_cache = hf_home / "hub" / cache_dir_name
-                if not model_cache.exists():
-                    warnings.append(
-                        f"Whisper 모델({repo})이 아직 다운로드되지 않았습니다.\n"
-                        "첫 파일 처리 시 자동으로 다운로드됩니다 (수 GB, 시간 소요)."
-                    )
-
         if errors:
             rumps.alert(title="설정 오류", message="\n\n".join(errors))
-        if warnings:
-            rumps.alert(title="사전 안내", message="\n\n".join(warnings))
+            return
+
+        model_name = self._config.get("whisper_model", "small")
+        quant = self._config.get("whisper_quant", "4bit")
+        from transcriber import MODEL_REPOS
+        variants = MODEL_REPOS.get(model_name, {})
+        repo = variants.get(quant if quant in variants else "base", "")
+        if repo:
+            cache_dir_name = "models--" + repo.replace("/", "--")
+            hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+            model_cache = hf_home / "hub" / cache_dir_name
+            if not model_cache.exists():
+                threading.Thread(
+                    target=self._download_model,
+                    args=(repo, model_cache, hf_home),
+                    daemon=True,
+                ).start()
+
+    def _download_model(self, repo: str, model_cache: Path, hf_home: Path):
+        import time
+        import huggingface_hub
+
+        self._on_status(f"모델 다운로드 준비 중: {repo}")
+
+        total_files = None
+        try:
+            total_files = sum(1 for _ in huggingface_hub.list_repo_files(repo))
+            logger.info("다운로드 대상: %s (%d 파일)", repo, total_files)
+        except Exception as e:
+            logger.warning("파일 목록 조회 실패: %s", e)
+
+        stop_monitor = threading.Event()
+
+        def _monitor():
+            start_time = time.time()
+            blobs_dir = model_cache / "blobs"
+            while not stop_monitor.is_set():
+                elapsed = int(time.time() - start_time)
+                mins, secs = divmod(elapsed, 60)
+                time_str = f"{mins}분 {secs}초" if mins else f"{secs}초"
+                downloaded = 0
+                if blobs_dir.exists():
+                    downloaded = sum(
+                        1 for f in blobs_dir.iterdir()
+                        if not f.name.endswith(".incomplete")
+                    )
+                if total_files:
+                    pct = min(downloaded / total_files * 100, 99)
+                    self._on_status(f"모델 다운로드 중... {pct:.0f}% ({downloaded}/{total_files}개) [{time_str}]")
+                else:
+                    self._on_status(f"모델 다운로드 중... ({downloaded}개 완료) [{time_str}]")
+                time.sleep(1)
+
+        monitor_thread = threading.Thread(target=_monitor, daemon=True)
+        monitor_thread.start()
+
+        try:
+            huggingface_hub.snapshot_download(repo_id=repo)
+            stop_monitor.set()
+            monitor_thread.join(timeout=2)
+            self._on_status(f"✅ 모델 다운로드 완료: {repo}")
+            rumps.notification(
+                title="모델 다운로드 완료",
+                subtitle=repo,
+                message="Whisper 모델 준비가 완료되었습니다.",
+            )
+            logger.info("모델 다운로드 완료: %s", repo)
+        except Exception as e:
+            stop_monitor.set()
+            monitor_thread.join(timeout=2)
+            logger.error("모델 다운로드 실패: %s — %s", repo, e)
+            self._on_status(f"❌ 모델 다운로드 실패: {repo}")
+            rumps.notification(
+                title="모델 다운로드 실패",
+                subtitle=repo,
+                message=str(e),
+            )
 
     def _flush_ui(self, _):
         if self._pending_app_title is not None:
