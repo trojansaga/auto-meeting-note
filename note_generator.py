@@ -107,7 +107,10 @@ def generate_note(
 
             break
 
-        except (openai.APIError, openai.APIConnectionError, openai.RateLimitError) as e:
+        except (openai.NotFoundError, openai.AuthenticationError) as e:
+            logger.error("재시도 불가 오류: %s", e)
+            raise RuntimeError(f"OpenAI API 오류: {e}") from e
+        except (openai.APIConnectionError, openai.RateLimitError, openai.APIError) as e:
             last_error = e
             if attempt < MAX_RETRIES:
                 delay = BASE_DELAY ** attempt

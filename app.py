@@ -263,10 +263,29 @@ class AutoMeetingNoteApp(rumps.App):
             if response == 1:
                 threading.Thread(target=self._run_single_file, args=(str(f),), daemon=True).start()
 
+    def _confirm_on_main(self, message: str) -> bool:
+        """백그라운드 스레드에서 호출해도 메인 스레드에서 안전하게 dialog를 표시."""
+        result = [False]
+        done = threading.Event()
+
+        def _ask(_timer):
+            result[0] = rumps.alert(title="확인", message=message, ok="예", cancel="아니오") == 1
+            done.set()
+            _timer.stop()
+
+        rumps.Timer(_ask, 0.0).start()
+        done.wait()
+        return result[0]
+
     def _run_single_file(self, path: str):
         filename = Path(path).name
         try:
-            run_pipeline(path, self._config, status_callback=self._on_status)
+            run_pipeline(
+                path,
+                self._config,
+                status_callback=self._on_status,
+                confirm_callback=self._confirm_on_main,
+            )
             self._on_done(filename)
         except Exception as e:
             logger.error("수동 처리 실패: %s — %s", filename, e)

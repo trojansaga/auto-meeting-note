@@ -24,6 +24,7 @@ def run_pipeline(
     mp4_path: str,
     config: dict,
     status_callback: Optional[Callable[[str], None]] = None,
+    confirm_callback: Optional[Callable[[str], bool]] = None,
 ) -> str:
     mp4 = Path(mp4_path)
     original_filename = mp4.name
@@ -57,23 +58,34 @@ def run_pipeline(
             raise FileNotFoundError(f"MP4 파일을 찾을 수 없습니다: {mp4_path}")
 
         # 2. 음성 추출
-        _notify(f"[2/5] {STEP_NAMES[1]}")
         wav_path = str(work_dir / "audio.wav")
-        extract_audio(str(moved_mp4), wav_path, progress_callback=_notify)
+        if Path(wav_path).exists() and confirm_callback and not confirm_callback(
+            "audio.wav가 이미 존재합니다.\n다시 음성을 추출하시겠습니까?"
+        ):
+            _notify("[2/5] 음성 추출 건너뜀 (기존 파일 사용)")
+        else:
+            _notify(f"[2/5] {STEP_NAMES[1]}")
+            extract_audio(str(moved_mp4), wav_path, progress_callback=_notify)
 
         # 3. STT 처리
-        _notify(f"[3/5] {STEP_NAMES[2]}")
         script_path = str(work_dir / "script.md")
-        transcribe(
-            wav_path,
-            script_path,
-            original_filename,
-            model_name=whisper_model,
-            quant=whisper_quant,
-            batch_size=whisper_batch_size,
-            language=language,
-            progress_callback=_notify,
+        skip_stt = Path(script_path).exists() and confirm_callback is not None and not confirm_callback(
+            "script.md가 이미 존재합니다.\n다시 STT를 처리하시겠습니까?"
         )
+        if skip_stt:
+            _notify("[3/5] STT 건너뜀 (기존 파일 사용)")
+        else:
+            _notify(f"[3/5] {STEP_NAMES[2]}")
+            transcribe(
+                wav_path,
+                script_path,
+                original_filename,
+                model_name=whisper_model,
+                quant=whisper_quant,
+                batch_size=whisper_batch_size,
+                language=language,
+                progress_callback=_notify,
+            )
 
         # 4. 회의록 생성
         _notify(f"[4/5] {STEP_NAMES[3]}")
