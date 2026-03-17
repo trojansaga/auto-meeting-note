@@ -377,6 +377,8 @@ class AutoMeetingNoteApp(rumps.App):
         if not files:
             rumps.alert(title="미처리 파일 없음", message="처리할 MP4 파일이 없습니다.")
             return
+        # 모든 확인을 먼저 받은 뒤 스레드 시작 (메인 스레드 점유 충돌 방지)
+        to_process = []
         for f in files:
             response = rumps.alert(
                 title="파일 처리 확인",
@@ -385,7 +387,9 @@ class AutoMeetingNoteApp(rumps.App):
                 cancel="Cancel",
             )
             if response == 1:
-                threading.Thread(target=self._run_single_file, args=(str(f),), daemon=True).start()
+                to_process.append(str(f))
+        for path in to_process:
+            threading.Thread(target=self._run_single_file, args=(path,), daemon=True).start()
 
     def _confirm_on_main(self, message: str) -> bool:
         """백그라운드 스레드에서 호출해도 메인 스레드에서 안전하게 dialog를 표시."""
@@ -393,12 +397,16 @@ class AutoMeetingNoteApp(rumps.App):
         done = threading.Event()
 
         def _ask(_timer):
-            result[0] = rumps.alert(title="확인", message=message, ok="예", cancel="아니오") == 1
-            done.set()
-            _timer.stop()
+            _timer.stop()  # 재진입 방지: alert 실행 전에 타이머 중단
+            try:
+                result[0] = rumps.alert(title="확인", message=message, ok="예", cancel="아니오") == 1
+            except Exception as e:
+                logger.error("confirm dialog 오류: %s", e)
+            finally:
+                done.set()
 
         rumps.Timer(_ask, 0.0).start()
-        done.wait()
+        done.wait(timeout=60)  # 60초 타임아웃 (무한 블록 방지)
         return result[0]
 
     def _run_single_file(self, path: str):
