@@ -128,6 +128,7 @@ class AutoMeetingNoteApp(rumps.App):
         self._status_item = rumps.MenuItem("처리 현황: 대기 중", callback=self._show_status_detail)
         self._open_folder_item = rumps.MenuItem("감시 폴더 열기", callback=self._open_watch_dir)
         self._open_config_item = rumps.MenuItem("설정 파일 열기", callback=self._open_config)
+        self._open_prompt_item = rumps.MenuItem("STT 용어 사전 열기", callback=self._open_prompt)
         self._quit_item = rumps.MenuItem("종료", callback=self._quit)
 
         self._model_menu_items: dict = {}
@@ -146,6 +147,7 @@ class AutoMeetingNoteApp(rumps.App):
             None,
             self._open_folder_item,
             self._open_config_item,
+            self._open_prompt_item,
             None,
             self._quit_item,
         ]
@@ -344,11 +346,14 @@ class AutoMeetingNoteApp(rumps.App):
         self._status_log.append(done_msg)
         self._pending_app_title = "MN ✅"
         self._pending_status_title = f"처리 현황: {done_msg}"
-        rumps.notification(
-            title="회의록 자동 생성 완료",
-            subtitle=filename,
-            message="회의록이 성공적으로 생성되었습니다.",
-        )
+        try:
+            rumps.notification(
+                title="회의록 자동 생성 완료",
+                subtitle=filename,
+                message="회의록이 성공적으로 생성되었습니다.",
+            )
+        except Exception:
+            pass
         rumps.Timer(self._reset_title, 5).start()
 
     def _show_status_detail(self, _):
@@ -410,8 +415,8 @@ class AutoMeetingNoteApp(rumps.App):
             )
             if response == 1:
                 to_process.append(str(f))
-        for path in to_process:
-            threading.Thread(target=self._run_single_file, args=(path,), daemon=True).start()
+        if to_process:
+            threading.Thread(target=self._run_files_sequentially, args=(to_process,), daemon=True).start()
 
     def _confirm_on_main(self, message: str) -> bool:
         """백그라운드 스레드에서 호출해도 메인 스레드에서 안전하게 dialog를 표시."""
@@ -430,6 +435,10 @@ class AutoMeetingNoteApp(rumps.App):
         rumps.Timer(_ask, 0.0).start()
         done.wait(timeout=60)  # 60초 타임아웃 (무한 블록 방지)
         return result[0]
+
+    def _run_files_sequentially(self, paths: list):
+        for path in paths:
+            self._run_single_file(path)
 
     def _run_single_file(self, path: str):
         filename = Path(path).name
@@ -458,6 +467,13 @@ class AutoMeetingNoteApp(rumps.App):
 
     def _open_config(self, _):
         subprocess.Popen(["open", str(CONFIG_PATH)])
+
+    def _open_prompt(self, _):
+        prompt_path = _resource_path() / "dictionary.txt"
+        if not prompt_path.exists():
+            rumps.alert(title="STT 용어 사전", message="dictionary.txt 파일이 없습니다.")
+            return
+        subprocess.Popen(["open", str(prompt_path)])
 
     def _quit(self, _):
         if self._watcher.is_running:

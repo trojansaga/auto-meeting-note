@@ -38,7 +38,7 @@ chmod +x "$MACOS/$APP_NAME"
 
 echo "$VENV_REAL" > "$RESOURCES/.venv_path"
 
-for f in app.py watcher.py pipeline.py audio_extractor.py transcriber.py note_generator.py config.yaml; do
+for f in app.py watcher.py pipeline.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py config.yaml dictionary.txt; do
     cp "$SCRIPT_DIR/$f" "$RESOURCES/"
 done
 

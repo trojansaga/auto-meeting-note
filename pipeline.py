@@ -6,17 +6,21 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from audio_extractor import extract_audio
+from audio_preprocessor import preprocess_audio
 from note_generator import generate_note
 from transcriber import transcribe
+
+DICT_PATH = Path(__file__).parent / "dictionary.txt"
 
 logger = logging.getLogger(__name__)
 
 STEP_NAMES = [
     "폴더 생성 및 파일 이동",
     "음성 추출",
+    "음성 전처리 (노이즈·침묵 제거 / 음량 정규화)",
     "STT 처리",
     "회의록 생성",
-    "임시 파일 정리",
+    "완료",
 ]
 
 
@@ -62,22 +66,41 @@ def run_pipeline(
         if Path(wav_path).exists() and confirm_callback and not confirm_callback(
             "audio.wav가 이미 존재합니다.\n다시 음성을 추출하시겠습니까?"
         ):
-            _notify("[2/5] 음성 추출 건너뜀 (기존 파일 사용)")
+            _notify("[2/6] 음성 추출 건너뜀 (기존 파일 사용)")
         else:
-            _notify(f"[2/5] {STEP_NAMES[1]}")
+            _notify(f"[2/6] {STEP_NAMES[1]}")
             extract_audio(str(moved_mp4), wav_path, progress_callback=_notify)
 
-        # 3. STT 처리
+        # 3. 음성 전처리
+        preprocessed_wav_path = str(work_dir / "audio_preprocessed.wav")
+        _notify(f"[3/6] {STEP_NAMES[2]}")
+        preprocess_audio(wav_path, preprocessed_wav_path, progress_callback=_notify)
+        stt_input_path = preprocessed_wav_path
+
+        # 4. STT 처리
         script_path = str(work_dir / "script.md")
         skip_stt = Path(script_path).exists() and confirm_callback is not None and not confirm_callback(
             "script.md가 이미 존재합니다.\n다시 STT를 처리하시겠습니까?"
         )
         if skip_stt:
-            _notify("[3/5] STT 건너뜀 (기존 파일 사용)")
+            _notify("[4/6] STT 건너뜀 (기존 파일 사용)")
         else:
-            _notify(f"[3/5] {STEP_NAMES[2]}")
+            _notify(f"[4/6] {STEP_NAMES[3]}")
+            initial_prompt = None
+            if DICT_PATH.exists():
+                words = [w.strip() for w in DICT_PATH.read_text(encoding="utf-8").splitlines() if w.strip()]
+                # Whisper initial_prompt 224토큰 한도 내로 제한 (단어당 평균 2토큰 가정 → 100단어)
+                prompt = ""
+                for w in words:
+                    candidate = (prompt + ", " + w) if prompt else w
+                    if len(candidate.encode("utf-8")) > 400:  # 약 100~150단어 수준
+                        break
+                    prompt = candidate
+                initial_prompt = prompt or None
+                if initial_prompt:
+                    logger.info("STT initial_prompt 로드: %d개 단어 (dictionary.txt)", initial_prompt.count(",") + 1)
             transcribe(
-                wav_path,
+                stt_input_path,
                 script_path,
                 original_filename,
                 model_name=whisper_model,
@@ -85,10 +108,11 @@ def run_pipeline(
                 batch_size=whisper_batch_size,
                 language=language,
                 progress_callback=_notify,
+                initial_prompt=initial_prompt,
             )
 
-        # 4. 회의록 생성
-        _notify(f"[4/5] {STEP_NAMES[3]}")
+        # 5. 회의록 생성
+        _notify(f"[5/6] {STEP_NAMES[4]}")
         note_path = str(work_dir / "meeting_note.md")
         generate_note(
             script_path,
@@ -99,12 +123,8 @@ def run_pipeline(
             progress_callback=_notify,
         )
 
-        # 5. 임시 파일 정리
-        _notify(f"[5/5] {STEP_NAMES[4]}")
-        wav_file = Path(wav_path)
-        if wav_file.exists():
-            wav_file.unlink()
-            logger.info("임시 WAV 파일 삭제: %s", wav_file.name)
+        # 6. 완료
+        _notify(f"[6/6] {STEP_NAMES[5]}")
 
         _notify(f"✅ 완료: {original_filename}")
         return str(work_dir)

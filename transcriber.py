@@ -43,6 +43,7 @@ def transcribe(
     batch_size: int = 4,
     language: str = "ko",
     progress_callback: Optional[Callable[[str], None]] = None,
+    initial_prompt: Optional[str] = None,
 ) -> str:
     import mlx_whisper
     import whisper as _whisper
@@ -67,7 +68,7 @@ def transcribe(
             elapsed = time.time() - start
             pct = min(elapsed / expected_secs * 100, 99)
             if progress_callback:
-                progress_callback(f"[3/5] STT 처리 중... {pct:.0f}%")
+                progress_callback(f"[4/6] STT 처리 중... {pct:.0f}%")
             time.sleep(1)
 
     if progress_callback:
@@ -80,12 +81,14 @@ def transcribe(
             path_or_hf_repo=repo,
             language=language,
             temperature=0,
+            initial_prompt=initial_prompt or None,
+            condition_on_previous_text=False,
         )
     finally:
         stop_event.set()
 
     if progress_callback:
-        progress_callback("[3/5] STT 처리 완료 (100%)")
+        progress_callback("[4/6] STT 처리 완료 (100%)")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [

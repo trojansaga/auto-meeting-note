@@ -1,4 +1,6 @@
 rumps>=0.4.0
+noisereduce>=3.0.0
+soundfile>=0.12.0
 watchdog>=3.0.0
 openai-whisper>=20231117
 mlx-whisper>=0.4.3
