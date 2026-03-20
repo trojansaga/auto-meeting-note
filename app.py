@@ -141,6 +141,8 @@ class AutoMeetingNoteApp(rumps.App):
         self._select_file_item = rumps.MenuItem("파일 선택하여 처리...", callback=self._select_and_process)
         self._screen_rec_item = rumps.MenuItem("화면 녹화 시작", callback=self._toggle_screen_rec)
         self._audio_rec_item = rumps.MenuItem("녹음 시작", callback=self._toggle_audio_rec)
+        self._mic_item = rumps.MenuItem("마이크 녹음 포함", callback=self._toggle_mic)
+        self._mic_item.state = 1 if self._config.get("mic_enabled", False) else 0
         self._status_item = rumps.MenuItem("처리 현황: 대기 중", callback=self._show_status_detail)
         self._open_folder_item = rumps.MenuItem("감시 폴더 열기", callback=self._open_watch_dir)
         self._open_export_item = rumps.MenuItem(self._export_menu_title(), callback=self._open_export_dir)
@@ -162,6 +164,7 @@ class AutoMeetingNoteApp(rumps.App):
             self._select_file_item,
             self._screen_rec_item,
             self._audio_rec_item,
+            self._mic_item,
             None,
             self._status_item,
             None,
@@ -282,6 +285,11 @@ class AutoMeetingNoteApp(rumps.App):
                 sub.add(item)
             model_menu.add(sub)
         return model_menu
+
+    def _toggle_mic(self, sender):
+        sender.state = not sender.state
+        self._config["mic_enabled"] = bool(sender.state)
+        CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
 
     def _build_preprocess_menu(self) -> rumps.MenuItem:
         menu = rumps.MenuItem("전처리 설정")
@@ -517,10 +525,10 @@ class AutoMeetingNoteApp(rumps.App):
             sender.title = "화면 녹화 시작"
             self._audio_rec_item.set_callback(self._toggle_audio_rec)
             self._stop_rec_timer()
-            mode, output_path, audio_path = self._recorder.stop()
+            mode, output_path, audio_path, mic_path, audio_offset = self._recorder.stop()
             threading.Thread(
                 target=self._on_recording_stopped,
-                args=(mode, output_path, audio_path),
+                args=(mode, output_path, audio_path, mic_path, audio_offset),
                 daemon=True,
             ).start()
         else:
@@ -544,8 +552,10 @@ class AutoMeetingNoteApp(rumps.App):
             watch_dir.mkdir(parents=True, exist_ok=True)
 
             def _start_bg():
+                mic_enabled = bool(self._config.get("mic_enabled", True))
+                mic_index = str(self._config.get("mic_device_index", "0"))
                 try:
-                    self._recorder.start_screen_recording(watch_dir)
+                    self._recorder.start_screen_recording(watch_dir, mic_enabled=mic_enabled, mic_device_index=mic_index)
                 except Exception as e:
                     logger.error("화면 녹화 시작 실패: %s", e)
                     self._is_recording = False
@@ -566,10 +576,10 @@ class AutoMeetingNoteApp(rumps.App):
             sender.title = "녹음 시작"
             self._screen_rec_item.set_callback(self._toggle_screen_rec)
             self._stop_rec_timer()
-            mode, output_path, audio_path = self._recorder.stop()
+            mode, output_path, audio_path, mic_path, audio_offset = self._recorder.stop()
             threading.Thread(
                 target=self._on_recording_stopped,
-                args=(mode, output_path, audio_path),
+                args=(mode, output_path, audio_path, mic_path, audio_offset),
                 daemon=True,
             ).start()
         else:
@@ -593,8 +603,10 @@ class AutoMeetingNoteApp(rumps.App):
             watch_dir.mkdir(parents=True, exist_ok=True)
 
             def _start_bg():
+                mic_enabled = bool(self._config.get("mic_enabled", True))
+                mic_index = str(self._config.get("mic_device_index", "0"))
                 try:
-                    self._recorder.start_audio_recording(watch_dir)
+                    self._recorder.start_audio_recording(watch_dir, mic_enabled=mic_enabled, mic_device_index=mic_index)
                 except Exception as e:
                     logger.error("녹음 시작 실패: %s", e)
                     self._is_recording = False
@@ -626,7 +638,7 @@ class AutoMeetingNoteApp(rumps.App):
         else:
             self._pending_app_title = "MN"
 
-    def _on_recording_stopped(self, mode: str, output_path, audio_path=None):
+    def _on_recording_stopped(self, mode: str, output_path, audio_path=None, mic_path=None, audio_offset=0.0):
         """녹화/녹음 종료 후 후처리 (백그라운드 스레드에서 실행)."""
         if output_path is None:
             return
@@ -634,15 +646,24 @@ class AutoMeetingNoteApp(rumps.App):
             if mode == "screen":
                 self._on_status("녹화 파일 압축 중...")
                 mp4_path = self._recorder.compress_and_merge(
-                    output_path, audio_path, progress_callback=self._on_status
+                    output_path, audio_path,
+                    mic_path=mic_path,
+                    audio_offset=audio_offset,
+                    progress_callback=self._on_status,
                 )
                 if self._watcher:
                     self._watcher.exclude(str(mp4_path))
                 self._run_single_file(str(mp4_path))
             elif mode == "audio":
+                # 시스템 오디오 + 마이크 믹싱
+                if mic_path:
+                    self._on_status("오디오 믹싱 중...")
+                    final_path = self._recorder.mix_wav(output_path, mic_path)
+                else:
+                    final_path = output_path
                 if self._watcher:
-                    self._watcher.exclude(str(output_path))
-                self._run_single_file(str(output_path))
+                    self._watcher.exclude(str(final_path))
+                self._run_single_file(str(final_path))
         except Exception as e:
             logger.error("녹화 후처리 실패: %s", e)
             err_msg = f"❌ 녹화 후처리 오류: {e}"
