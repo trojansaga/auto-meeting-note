@@ -4,6 +4,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
+import re
 
 from audio_extractor import extract_audio
 from audio_preprocessor import preprocess_audio
@@ -85,7 +86,7 @@ def run_pipeline(
         stt_input_path = preprocessed_wav_path
 
         # 4. STT 처리
-        script_path = str(work_dir / "script.md")
+        script_path = str(work_dir / f"{stem}_script.md")
         skip_stt = Path(script_path).exists() and confirm_callback is not None and not confirm_callback(
             "script.md가 이미 존재합니다.\n다시 STT를 처리하시겠습니까?"
         )
@@ -120,20 +121,41 @@ def run_pipeline(
 
         # 5. 회의록 생성
         _notify(f"[5/6] {STEP_NAMES[4]}")
-        note_path = str(work_dir / "meeting_note.md")
-        generate_note(
+        note_tmp = str(work_dir / "_meeting_note_tmp.md")
+        _, title = generate_note(
             script_path,
-            note_path,
+            note_tmp,
             original_filename,
             created_at,
             model=openai_model,
             progress_callback=_notify,
         )
+        # 파일명: yyyy-mm-dd_hh_[제목]
+        # 폴더명 예: "2026-03-20 15-03-21_회의내용"
+        m = re.match(r'(\d{4}-\d{2}-\d{2})[\s_-](\d{2})', stem)
+        if m:
+            note_filename = f"{m.group(1)}_{m.group(2)}_{title}.md"
+        else:
+            note_filename = f"{stem}_{title}.md"
+        note_path = str(work_dir / note_filename)
+        Path(note_tmp).rename(note_path)
 
-        # 6. 완료
+        # 6. 완료 (모든 파이프라인 단계 성공)
         _notify(f"[6/6] {STEP_NAMES[5]}")
-
         _notify(f"✅ 완료: {original_filename}")
+
+        # 7. 회의록 내보내기 — 완료 후에만 실행, 실패해도 파이프라인 결과에 영향 없음
+        export_dir_raw = config.get("export_dir", "~/Downloads")
+        if export_dir_raw:
+            try:
+                export_dir = Path(export_dir_raw).expanduser()
+                export_dir.mkdir(parents=True, exist_ok=True)
+                export_dest = export_dir / Path(note_path).name
+                shutil.copy2(note_path, str(export_dest))
+                logger.info("회의록 내보내기 완료: %s", export_dest)
+            except Exception as export_err:
+                logger.error("회의록 내보내기 실패 (파이프라인 결과에는 영향 없음): %s", export_err)
+
         return str(work_dir)
 
     except Exception as e:

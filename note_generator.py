@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -16,7 +17,7 @@ USER_PROMPT_TEMPLATE = """아래 회의 대본을 분석하여 회의록을 작�
 
 ## 작성 형식
 
-# 회의록
+# (회의 핵심 내용을 담은 제목을 10자 이내로 작성)
 
 - 파일명: {filename}
 - 일시: {datetime}
@@ -43,6 +44,17 @@ USER_PROMPT_TEMPLATE = """아래 회의 대본을 분석하여 회의록을 작�
 
 MAX_RETRIES = 3
 BASE_DELAY = 2
+
+_INVALID_CHARS = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
+
+
+def _extract_title(content: str) -> str:
+    """생성된 회의록 첫 번째 H1에서 제목 추출. 파일명에 사용 가능한 형태로 반환."""
+    m = re.search(r'^#\s+(.+)', content, re.MULTILINE)
+    if m:
+        title = _INVALID_CHARS.sub('', m.group(1)).strip()
+        return title[:50] if title else "회의록"
+    return "회의록"
 
 
 def generate_note(
@@ -120,9 +132,11 @@ def generate_note(
                 logger.error("API 호출 최종 실패: %s", e)
                 raise RuntimeError(f"OpenAI API 호출 {MAX_RETRIES}회 실패: {last_error}") from e
 
+    title = _extract_title(content)
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(content, encoding="utf-8")
 
-    logger.info("회의록 생성 완료 → %s", output.name)
-    return str(output)
+    logger.info("회의록 생성 완료 → %s (제목: %s)", output.name, title)
+    return str(output), title

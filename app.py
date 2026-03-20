@@ -129,6 +129,8 @@ class AutoMeetingNoteApp(rumps.App):
         self._select_file_item = rumps.MenuItem("파일 선택하여 처리...", callback=self._select_and_process)
         self._status_item = rumps.MenuItem("처리 현황: 대기 중", callback=self._show_status_detail)
         self._open_folder_item = rumps.MenuItem("감시 폴더 열기", callback=self._open_watch_dir)
+        self._open_export_item = rumps.MenuItem(self._export_menu_title(), callback=self._open_export_dir)
+        self._set_export_item = rumps.MenuItem("내보내기 폴더 변경...", callback=self._set_export_dir)
         self._open_config_item = rumps.MenuItem("설정 파일 열기", callback=self._open_config)
         self._open_prompt_item = rumps.MenuItem("STT 용어 사전 열기", callback=self._open_prompt)
         self._quit_item = rumps.MenuItem("종료", callback=self._quit)
@@ -151,6 +153,8 @@ class AutoMeetingNoteApp(rumps.App):
             self._preprocess_menu,
             None,
             self._open_folder_item,
+            self._open_export_item,
+            self._set_export_item,
             self._open_config_item,
             self._open_prompt_item,
             None,
@@ -511,9 +515,41 @@ class AutoMeetingNoteApp(rumps.App):
                 message=str(e),
             )
 
+    def _export_menu_title(self) -> str:
+        export_dir = Path(self._config.get("export_dir", "~/Downloads")).expanduser()
+        return f"내보내기 폴더 열기 ({export_dir})"
+
     def _open_watch_dir(self, _):
         watch_dir = Path(self._config.get("watch_dir", "~/Desktop")).expanduser()
         subprocess.Popen(["open", str(watch_dir)])
+
+    def _open_export_dir(self, _):
+        export_dir = Path(self._config.get("export_dir", "~/Downloads")).expanduser()
+        export_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(["open", str(export_dir)])
+
+    def _set_export_dir(self, _):
+        from AppKit import NSOpenPanel, NSModalResponseOK
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(False)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setTitle_("내보내기 폴더 선택")
+        panel.setPrompt_("선택")
+
+        current = Path(self._config.get("export_dir", "~/Downloads")).expanduser()
+        if current.exists():
+            from AppKit import NSURL
+            panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(current)))
+
+        if panel.runModal() != NSModalResponseOK:
+            return
+
+        selected = str(panel.URLs()[0].path())
+        self._config["export_dir"] = selected
+        CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
+        self._open_export_item.title = self._export_menu_title()
+        logger.info("내보내기 폴더 변경: %s", selected)
 
     def _open_config(self, _):
         subprocess.Popen(["open", str(CONFIG_PATH)])

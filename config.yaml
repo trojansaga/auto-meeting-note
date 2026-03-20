@@ -5,3 +5,4 @@ whisper_quant: "4bit"
 whisper_batch_size: 4
 language: "ko"
 openai_model: "gpt-5.4"
+export_dir: "~/Downloads"
