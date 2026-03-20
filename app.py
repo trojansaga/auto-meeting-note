@@ -28,6 +28,12 @@ if not _VENV_SITE.exists():
 if _VENV_SITE.exists() and str(_VENV_SITE) not in sys.path:
     sys.path.insert(0, str(_VENV_SITE))
 
+try:
+    import setproctitle
+    setproctitle.setproctitle("AutoMeetingNote")
+except ImportError:
+    pass
+
 import rumps
 import yaml
 from dotenv import load_dotenv
@@ -569,6 +575,15 @@ class AutoMeetingNoteApp(rumps.App):
 
 def main():
     logger.info("AutoMeetingNote 앱 시작")
+
+    # exec으로 프로세스 교체 시 .app 번들 연결이 끊겨 LSUIElement가 적용 안 됨
+    # rumps.App 생성 전에 먼저 Accessory 정책 설정 → 독 아이콘 숨김
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    except Exception:
+        pass
+
     app = AutoMeetingNoteApp()
     app.run()
 

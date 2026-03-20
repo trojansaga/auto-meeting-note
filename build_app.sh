@@ -42,6 +42,11 @@ for f in app.py watcher.py pipeline.py audio_extractor.py audio_preprocessor.py 
     cp "$SCRIPT_DIR/$f" "$RESOURCES/"
 done
 
+# 앱 아이콘 복사
+if [ -f "$SCRIPT_DIR/AppIcon.icns" ]; then
+    cp "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+fi
+
 if [ -f "$SCRIPT_DIR/.env" ]; then
     cp "$SCRIPT_DIR/.env" "$RESOURCES/"
 fi
@@ -71,6 +76,8 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
     <string>12.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
 </dict>
 </plist>
 PLIST
