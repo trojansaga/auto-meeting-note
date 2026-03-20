@@ -15,7 +15,7 @@ FFMPEG_SEARCH_PATHS = [
 ]
 
 
-def _find_ffmpeg() -> str | None:
+def find_ffmpeg() -> str | None:
     for p in FFMPEG_SEARCH_PATHS:
         if Path(p).exists():
             return p
@@ -23,7 +23,7 @@ def _find_ffmpeg() -> str | None:
 
 
 def check_ffmpeg() -> bool:
-    return _find_ffmpeg() is not None
+    return find_ffmpeg() is not None
 
 
 def _parse_duration(line: str) -> Optional[float]:
@@ -45,7 +45,7 @@ def extract_audio(
     output_path: str,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
-    ffmpeg_bin = _find_ffmpeg()
+    ffmpeg_bin = find_ffmpeg()
     if not ffmpeg_bin:
         raise EnvironmentError(
             "ffmpeg가 설치되어 있지 않습니다. 'brew install ffmpeg'로 설치하세요."

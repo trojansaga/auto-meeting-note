@@ -67,6 +67,10 @@ class FolderWatcher:
         watch_dir = Path(self._config.get("watch_dir", "~/Desktop")).expanduser()
         logger.info("폴더 감시 시작: %s (주기: %d초)", watch_dir, POLL_INTERVAL)
 
+    def exclude(self, path: str):
+        """외부에서 이미 처리 중인 파일을 watcher가 중복 픽업하지 않도록 등록."""
+        self._processed.add(os.path.realpath(path))
+
     def stop(self):
         self._stop_event.set()
         if self._poll_thread:

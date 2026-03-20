@@ -6,6 +6,7 @@ import sys
 import threading
 from collections import deque
 from pathlib import Path
+from typing import Optional
 
 # 앱 번들은 시스템 PATH를 상속하지 않으므로 Homebrew 경로를 명시적으로 추가
 for _p in ["/opt/homebrew/bin", "/usr/local/bin"]:
@@ -39,6 +40,7 @@ import yaml
 from dotenv import load_dotenv
 
 from pipeline import run_pipeline
+from recorder import Recorder
 from watcher import FolderWatcher
 
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "AutoMeetingNote"
@@ -125,6 +127,10 @@ class AutoMeetingNoteApp(rumps.App):
             tick_callback=self._on_tick,
         )
 
+        self._recorder = Recorder()
+        self._rec_timer: Optional[rumps.Timer] = None
+        self._is_recording = False  # screencapture 프로세스 종료 여부와 무관한 앱 레벨 상태
+
         self._status_log: deque = deque(maxlen=50)
         self._pending_status_title = None
         self._pending_app_title = None
@@ -133,6 +139,8 @@ class AutoMeetingNoteApp(rumps.App):
         self._toggle_item = rumps.MenuItem("감시 시작", callback=self._toggle_watch)
         self._process_pending_item = rumps.MenuItem("미처리 파일 즉시 처리", callback=self._process_pending)
         self._select_file_item = rumps.MenuItem("파일 선택하여 처리...", callback=self._select_and_process)
+        self._screen_rec_item = rumps.MenuItem("화면 녹화 시작", callback=self._toggle_screen_rec)
+        self._audio_rec_item = rumps.MenuItem("녹음 시작", callback=self._toggle_audio_rec)
         self._status_item = rumps.MenuItem("처리 현황: 대기 중", callback=self._show_status_detail)
         self._open_folder_item = rumps.MenuItem("감시 폴더 열기", callback=self._open_watch_dir)
         self._open_export_item = rumps.MenuItem(self._export_menu_title(), callback=self._open_export_dir)
@@ -152,6 +160,8 @@ class AutoMeetingNoteApp(rumps.App):
             self._toggle_item,
             self._process_pending_item,
             self._select_file_item,
+            self._screen_rec_item,
+            self._audio_rec_item,
             None,
             self._status_item,
             None,
@@ -375,13 +385,15 @@ class AutoMeetingNoteApp(rumps.App):
     def _on_status(self, message: str):
         logger.info("상태: %s", message)
         self._status_log.append(message)
-        self._pending_app_title = "MN ⏳"
+        if not self._is_recording:
+            self._pending_app_title = "MN ⏳"
         self._pending_status_title = f"처리 현황: {message}"
 
     def _on_done(self, filename: str):
         done_msg = f"✅ 완료: {filename}"
         self._status_log.append(done_msg)
-        self._pending_app_title = "MN ✅"
+        if not self._is_recording:
+            self._pending_app_title = "MN ✅"
         self._pending_status_title = f"처리 현황: {done_msg}"
         try:
             rumps.notification(
@@ -400,7 +412,8 @@ class AutoMeetingNoteApp(rumps.App):
             rumps.alert(title="처리 현황", message="\n".join(self._status_log))
 
     def _on_tick(self, remaining: int):
-        self._pending_app_title = f"MN 👁 {remaining}s"
+        if not self._is_recording:
+            self._pending_app_title = f"MN 👁 {remaining}s"
 
     def _reset_title(self, _timer):
         if self._watcher.is_running:
@@ -477,6 +490,164 @@ class AutoMeetingNoteApp(rumps.App):
             return
 
         threading.Thread(target=self._run_files_sequentially, args=(paths,), daemon=True).start()
+
+    @staticmethod
+    def _check_screen_permission() -> bool:
+        try:
+            import Quartz
+            return bool(Quartz.CGPreflightScreenCaptureAccess())
+        except Exception:
+            return True  # 확인 불가 시 허용으로 간주
+
+    @staticmethod
+    def _check_mic_permission() -> bool:
+        try:
+            import AVFoundation
+            status = AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(
+                AVFoundation.AVMediaTypeAudio
+            )
+            return status == 3  # AVAuthorizationStatusAuthorized
+        except Exception:
+            return True
+
+    def _toggle_screen_rec(self, sender):
+        if self._is_recording:
+            # 녹화 중지
+            self._is_recording = False
+            sender.title = "화면 녹화 시작"
+            self._audio_rec_item.set_callback(self._toggle_audio_rec)
+            self._stop_rec_timer()
+            mode, output_path, audio_path = self._recorder.stop()
+            threading.Thread(
+                target=self._on_recording_stopped,
+                args=(mode, output_path, audio_path),
+                daemon=True,
+            ).start()
+        else:
+            # 권한 확인
+            if not self._check_screen_permission():
+                rumps.alert(
+                    title="화면 녹화 권한 필요",
+                    message="화면 녹화 권한이 없습니다.\n\n"
+                            "시스템 설정 → 개인 정보 보호 및 보안 → 화면 및 시스템 오디오 녹음\n"
+                            "에서 AutoMeetingNote를 허용한 후 앱을 재시작하세요.",
+                )
+                return
+            # UI 먼저 업데이트 후 백그라운드에서 SCStream + screencapture 시작
+            # (SCShareableContent 콜백이 메인 스레드 필요 → 메인 스레드 블록 시 데드락)
+            self._is_recording = True
+            sender.title = "녹화 중지"
+            self._audio_rec_item.set_callback(None)
+            self._start_rec_timer()
+
+            watch_dir = Path(self._config.get("watch_dir", "~/Desktop")).expanduser()
+            watch_dir.mkdir(parents=True, exist_ok=True)
+
+            def _start_bg():
+                try:
+                    self._recorder.start_screen_recording(watch_dir)
+                except Exception as e:
+                    logger.error("화면 녹화 시작 실패: %s", e)
+                    self._is_recording = False
+                    self._stop_rec_timer()
+                    def _revert(t):
+                        t.stop()
+                        sender.title = "화면 녹화 시작"
+                        self._audio_rec_item.set_callback(self._toggle_audio_rec)
+                    rumps.Timer(_revert, 0).start()
+                    rumps.notification("AutoMeetingNote", "화면 녹화 오류", str(e))
+
+            threading.Thread(target=_start_bg, daemon=True).start()
+
+    def _toggle_audio_rec(self, sender):
+        if self._is_recording:
+            # 녹음 중지
+            self._is_recording = False
+            sender.title = "녹음 시작"
+            self._screen_rec_item.set_callback(self._toggle_screen_rec)
+            self._stop_rec_timer()
+            mode, output_path, audio_path = self._recorder.stop()
+            threading.Thread(
+                target=self._on_recording_stopped,
+                args=(mode, output_path, audio_path),
+                daemon=True,
+            ).start()
+        else:
+            # 권한 확인 (시스템 오디오는 화면 녹화 권한 필요)
+            if not self._check_screen_permission():
+                rumps.alert(
+                    title="화면 녹화 권한 필요",
+                    message="시스템 오디오 녹음에는 화면 녹화 권한이 필요합니다.\n\n"
+                            "시스템 설정 → 개인 정보 보호 및 보안 → 화면 및 시스템 오디오 녹음\n"
+                            "에서 AutoMeetingNote를 허용한 후 앱을 재시작하세요.",
+                )
+                return
+            # UI 먼저 업데이트 후 백그라운드에서 SCStream 시작
+            # (SCShareableContent 콜백이 메인 스레드 필요 → 메인 스레드 블록 시 데드락)
+            self._is_recording = True
+            sender.title = "녹음 중지"
+            self._screen_rec_item.set_callback(None)
+            self._start_rec_timer()
+
+            watch_dir = Path(self._config.get("watch_dir", "~/Desktop")).expanduser()
+            watch_dir.mkdir(parents=True, exist_ok=True)
+
+            def _start_bg():
+                try:
+                    self._recorder.start_audio_recording(watch_dir)
+                except Exception as e:
+                    logger.error("녹음 시작 실패: %s", e)
+                    self._is_recording = False
+                    self._stop_rec_timer()
+                    def _revert(t):
+                        t.stop()
+                        sender.title = "녹음 시작"
+                        self._screen_rec_item.set_callback(self._toggle_screen_rec)
+                        rumps.alert(title="녹음 오류", message=str(e))
+                    rumps.Timer(_revert, 0.0).start()
+
+            threading.Thread(target=_start_bg, daemon=True).start()
+
+    def _start_rec_timer(self):
+        self._rec_timer = rumps.Timer(self._update_rec_display, 1)
+        self._rec_timer.start()
+
+    def _update_rec_display(self, _timer):
+        elapsed = int(self._recorder.elapsed_seconds)
+        mins, secs = divmod(elapsed, 60)
+        self._pending_app_title = f"● REC {mins:02d}:{secs:02d}"
+
+    def _stop_rec_timer(self):
+        if self._rec_timer:
+            self._rec_timer.stop()
+            self._rec_timer = None
+        if self._watcher.is_running:
+            pass  # 카운트다운이 복원
+        else:
+            self._pending_app_title = "MN"
+
+    def _on_recording_stopped(self, mode: str, output_path, audio_path=None):
+        """녹화/녹음 종료 후 후처리 (백그라운드 스레드에서 실행)."""
+        if output_path is None:
+            return
+        try:
+            if mode == "screen":
+                self._on_status("녹화 파일 압축 중...")
+                mp4_path = self._recorder.compress_and_merge(
+                    output_path, audio_path, progress_callback=self._on_status
+                )
+                if self._watcher:
+                    self._watcher.exclude(str(mp4_path))
+                self._run_single_file(str(mp4_path))
+            elif mode == "audio":
+                if self._watcher:
+                    self._watcher.exclude(str(output_path))
+                self._run_single_file(str(output_path))
+        except Exception as e:
+            logger.error("녹화 후처리 실패: %s", e)
+            err_msg = f"❌ 녹화 후처리 오류: {e}"
+            self._status_log.append(err_msg)
+            self._pending_status_title = f"처리 현황: {err_msg}"
 
     def _confirm_on_main(self, message: str) -> bool:
         """백그라운드 스레드에서 호출해도 메인 스레드에서 안전하게 dialog를 표시."""
@@ -568,6 +739,11 @@ class AutoMeetingNoteApp(rumps.App):
         subprocess.Popen(["open", str(prompt_path)])
 
     def _quit(self, _):
+        if self._is_recording:
+            try:
+                self._recorder.stop()
+            except Exception:
+                pass
         if self._watcher.is_running:
             self._watcher.stop()
         rumps.quit_application()

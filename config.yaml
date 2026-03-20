@@ -6,3 +6,7 @@ whisper_batch_size: 4
 language: "ko"
 openai_model: "gpt-5.4"
 export_dir: "~/Downloads"
+audio_input_device: "0"
+# 화면 녹화 시 시스템 오디오 캡처용 오디오 장치 ID (BlackHole 등 가상 오디오 드라이버 필요)
+# 미설정 시 기본 마이크(-g) 사용. BlackHole 설치 후 장치 ID를 ffmpeg -f avfoundation -list_devices true -i "" 로 확인
+# screen_audio_device_id: "2"

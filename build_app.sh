@@ -38,7 +38,7 @@ chmod +x "$MACOS/$APP_NAME"
 
 echo "$VENV_REAL" > "$RESOURCES/.venv_path"
 
-for f in app.py watcher.py pipeline.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py config.yaml dictionary.txt; do
+for f in app.py watcher.py pipeline.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py config.yaml dictionary.txt; do
     cp "$SCRIPT_DIR/$f" "$RESOURCES/"
 done
 
@@ -78,6 +78,10 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
     <true/>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>회의 음성을 녹음하기 위해 마이크 접근이 필요합니다.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>회의 화면 녹화 및 시스템 오디오 녹음을 위해 화면 녹화 접근이 필요합니다.</string>
 </dict>
 </plist>
 PLIST

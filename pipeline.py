@@ -34,6 +34,7 @@ def run_pipeline(
     mp4 = Path(mp4_path)
     original_filename = mp4.name
     stem = mp4.stem
+    is_audio_only = mp4.suffix.lower() == ".wav"
 
     watch_dir = Path(config.get("watch_dir", "~/Desktop")).expanduser()
     whisper_model = config.get("whisper_model", "medium")
@@ -63,14 +64,19 @@ def run_pipeline(
             raise FileNotFoundError(f"MP4 파일을 찾을 수 없습니다: {mp4_path}")
 
         # 2. 음성 추출
-        wav_path = str(work_dir / "audio.wav")
-        if Path(wav_path).exists() and confirm_callback and not confirm_callback(
-            "audio.wav가 이미 존재합니다.\n다시 음성을 추출하시겠습니까?"
-        ):
-            _notify("[2/6] 음성 추출 건너뜀 (기존 파일 사용)")
+        if is_audio_only:
+            # WAV 직접 입력 (녹음 기능) — 음성 추출 건너뜀
+            wav_path = str(moved_mp4)
+            _notify("[2/6] 음성 추출 건너뜀 (오디오 파일 직접 입력)")
         else:
-            _notify(f"[2/6] {STEP_NAMES[1]}")
-            extract_audio(str(moved_mp4), wav_path, progress_callback=_notify)
+            wav_path = str(work_dir / "audio.wav")
+            if Path(wav_path).exists() and confirm_callback and not confirm_callback(
+                "audio.wav가 이미 존재합니다.\n다시 음성을 추출하시겠습니까?"
+            ):
+                _notify("[2/6] 음성 추출 건너뜀 (기존 파일 사용)")
+            else:
+                _notify(f"[2/6] {STEP_NAMES[1]}")
+                extract_audio(str(moved_mp4), wav_path, progress_callback=_notify)
 
         # 3. 음성 전처리
         preprocessed_wav_path = str(work_dir / "audio_preprocessed.wav")
