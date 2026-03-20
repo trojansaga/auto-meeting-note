@@ -74,7 +74,14 @@ def run_pipeline(
         # 3. 음성 전처리
         preprocessed_wav_path = str(work_dir / "audio_preprocessed.wav")
         _notify(f"[3/6] {STEP_NAMES[2]}")
-        preprocess_audio(wav_path, preprocessed_wav_path, progress_callback=_notify)
+        preprocess_audio(
+            wav_path,
+            preprocessed_wav_path,
+            progress_callback=_notify,
+            noise_reduce=config.get("preprocess_noise_reduce", True),
+            vad=config.get("preprocess_vad", True),
+            normalize=config.get("preprocess_normalize", True),
+        )
         stt_input_path = preprocessed_wav_path
 
         # 4. STT 처리

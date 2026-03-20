@@ -12,8 +12,8 @@ FRAME_MS = 30        # VAD 프레임 크기 (ms)
 MIN_SPEECH_MS = 250  # 유지할 최소 음성 구간 길이
 MERGE_GAP_MS = 400   # 이 이하 간격의 구간은 합침
 PAD_MS = 150         # 음성 구간 앞뒤 여유
-TARGET_RMS = 0.08    # 정규화 목표 RMS
-MAX_GAIN = 8.0       # 최대 증폭 배율 (과도한 증폭 방지)
+TARGET_RMS = 0.15    # 정규화 목표 RMS
+MAX_GAIN = 12.0      # 최대 증폭 배율 (과도한 증폭 방지)
 
 
 def _energy_vad(
@@ -88,21 +88,36 @@ def preprocess_audio(
     wav_path: str,
     output_path: str,
     progress_callback: Optional[Callable[[str], None]] = None,
+    noise_reduce: bool = True,
+    vad: bool = True,
+    normalize: bool = True,
 ) -> str:
     """
-    오디오 전처리 파이프라인:
+    오디오 전처리 파이프라인 (각 단계 개별 활성화 가능):
     1. 배경 노이즈 제거 (noisereduce)
     2. 침묵 구간 제거 (에너지 기반 VAD)
     3. 화자 음량 정규화 (구간별 RMS 정규화)
     """
-    import noisereduce as nr
-
     def _notify(msg: str):
         logger.info(msg)
         if progress_callback:
             progress_callback(msg)
 
-    _notify("[3/6] 오디오 로드 중...")
+    steps = []
+    if noise_reduce:
+        steps.append("노이즈 제거")
+    if vad:
+        steps.append("침묵 제거")
+    if normalize:
+        steps.append("음량 정규화")
+
+    if not steps:
+        logger.info("전처리 비활성화 — 원본 파일 그대로 사용")
+        import shutil
+        shutil.copy2(wav_path, output_path)
+        return output_path
+
+    _notify(f"[3/6] 오디오 로드 중... ({', '.join(steps)})")
     audio, sr = sf.read(wav_path, dtype="float32")
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
@@ -110,40 +125,64 @@ def preprocess_audio(
     original_duration = len(audio) / sr
 
     # 1. 배경 노이즈 제거
-    _notify("[3/6] 배경 노이즈 제거 중...")
-    audio = nr.reduce_noise(y=audio, sr=sr, stationary=False, prop_decrease=0.75)
+    if noise_reduce:
+        import noisereduce as nr
+        _notify("[3/6] 배경 노이즈 제거 중...")
+        audio = nr.reduce_noise(y=audio, sr=sr, stationary=False, prop_decrease=0.75)
 
-    # 2. 음성 구간 감지 (VAD)
-    _notify("[3/6] 침묵 구간 감지 중...")
-    segments = _energy_vad(audio, sr)
-    logger.info("음성 구간 감지: %d개", len(segments))
+    # 2. 침묵 구간 제거 (VAD)
+    if vad:
+        _notify("[3/6] 침묵 구간 감지 중...")
+        segments = _energy_vad(audio, sr)
+        logger.info("음성 구간 감지: %d개", len(segments))
 
-    if not segments:
-        logger.warning("음성 구간을 감지하지 못했습니다 — 원본 오디오를 그대로 사용합니다.")
+        if not segments:
+            logger.warning("음성 구간을 감지하지 못했습니다 — 원본 오디오를 그대로 사용합니다.")
+            sf.write(output_path, audio, sr)
+            import gc
+            del audio
+            gc.collect()
+            _notify("[3/6] 전처리 완료 (음성 구간 미감지, 원본 사용)")
+            return output_path
+
+        # 3. 음량 정규화
+        if normalize:
+            _notify("[3/6] 화자 음량 정규화 중...")
+            audio = _normalize_segments(audio, segments)
+
+        # 음성 구간만 이어 붙이기 (구간 사이 0.3초 침묵 삽입 — Whisper 구간 인식 보조)
+        silence_gap = np.zeros(int(sr * 0.3), dtype=np.float32)
+        parts = []
+        for s, e in segments:
+            if parts:
+                parts.append(silence_gap)
+            parts.append(audio[s:e])
+        output_audio = np.concatenate(parts)
+
+        output_duration = len(output_audio) / sr
+        removed_pct = (1.0 - output_duration / original_duration) * 100.0
+        _notify(
+            f"[3/6] 전처리 완료: {original_duration:.0f}초 → {output_duration:.0f}초 "
+            f"(침묵 {removed_pct:.0f}% 제거, {len(segments)}개 구간)"
+        )
+        sf.write(output_path, output_audio, sr)
+
+        import gc
+        del audio, output_audio, parts
+        gc.collect()
+    else:
+        # VAD 없이 음량 정규화만
+        if normalize:
+            _notify("[3/6] 화자 음량 정규화 중...")
+            full_seg = [(0, len(audio))]
+            audio = _normalize_segments(audio, full_seg)
+
+        _notify(f"[3/6] 전처리 완료: {original_duration:.0f}초")
         sf.write(output_path, audio, sr)
-        _notify("[3/6] 전처리 완료 (음성 구간 미감지, 원본 사용)")
-        return output_path
 
-    # 3. 음량 정규화
-    _notify("[3/6] 화자 음량 정규화 중...")
-    audio = _normalize_segments(audio, segments)
+        import gc
+        del audio
+        gc.collect()
 
-    # 4. 음성 구간만 이어 붙이기 (구간 사이 0.3초 침묵 삽입 — Whisper 구간 인식 보조)
-    silence_gap = np.zeros(int(sr * 0.3), dtype=np.float32)
-    parts = []
-    for s, e in segments:
-        if parts:
-            parts.append(silence_gap)
-        parts.append(audio[s:e])
-    output_audio = np.concatenate(parts)
-
-    output_duration = len(output_audio) / sr
-    removed_pct = (1.0 - output_duration / original_duration) * 100.0
-    _notify(
-        f"[3/6] 전처리 완료: {original_duration:.0f}초 → {output_duration:.0f}초 "
-        f"(침묵 {removed_pct:.0f}% 제거, {len(segments)}개 구간)"
-    )
-
-    sf.write(output_path, output_audio, sr)
     logger.info("전처리 완료 → %s", Path(output_path).name)
     return output_path

@@ -57,6 +57,7 @@ def transcribe(
 
     audio = _whisper.load_audio(str(wav))
     audio_duration = len(audio) / SAMPLE_RATE
+    del audio  # duration 계산 후 즉시 해제
     # mlx-whisper는 small 기준 실시간 10배 이상
     expected_secs = audio_duration / 10.0
 
@@ -103,9 +104,18 @@ def transcribe(
         if text:
             lines.append(f"{_format_timestamp(start_sec)} {text}")
 
+    # 결과 추출 후 즉시 해제
+    del result
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(lines), encoding="utf-8")
+
+    # MLX Metal GPU 캐시 및 Python 힙 해제
+    import gc
+    import mlx.core as mx
+    gc.collect()
+    mx.metal.clear_cache()
 
     logger.info("STT 처리 완료 → %s", output.name)
     return str(output)

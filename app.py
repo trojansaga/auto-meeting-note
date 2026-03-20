@@ -116,6 +116,7 @@ class AutoMeetingNoteApp(rumps.App):
             config=self._config,
             status_callback=self._on_status,
             done_callback=self._on_done,
+            tick_callback=self._on_tick,
         )
 
         self._status_log: deque = deque(maxlen=50)
@@ -125,6 +126,7 @@ class AutoMeetingNoteApp(rumps.App):
 
         self._toggle_item = rumps.MenuItem("감시 시작", callback=self._toggle_watch)
         self._process_pending_item = rumps.MenuItem("미처리 파일 즉시 처리", callback=self._process_pending)
+        self._select_file_item = rumps.MenuItem("파일 선택하여 처리...", callback=self._select_and_process)
         self._status_item = rumps.MenuItem("처리 현황: 대기 중", callback=self._show_status_detail)
         self._open_folder_item = rumps.MenuItem("감시 폴더 열기", callback=self._open_watch_dir)
         self._open_config_item = rumps.MenuItem("설정 파일 열기", callback=self._open_config)
@@ -133,6 +135,7 @@ class AutoMeetingNoteApp(rumps.App):
 
         self._model_menu_items: dict = {}
         self._model_menu = self._build_model_menu()
+        self._preprocess_menu = self._build_preprocess_menu()
 
         self._download_stop_event: threading.Event = threading.Event()
         self._download_stop_event.set()  # 초기값: 다운로드 없음
@@ -140,10 +143,12 @@ class AutoMeetingNoteApp(rumps.App):
         self.menu = [
             self._toggle_item,
             self._process_pending_item,
+            self._select_file_item,
             None,
             self._status_item,
             None,
             self._model_menu,
+            self._preprocess_menu,
             None,
             self._open_folder_item,
             self._open_config_item,
@@ -258,6 +263,28 @@ class AutoMeetingNoteApp(rumps.App):
             model_menu.add(sub)
         return model_menu
 
+    def _build_preprocess_menu(self) -> rumps.MenuItem:
+        menu = rumps.MenuItem("전처리 설정")
+        steps = [
+            ("노이즈 제거", "preprocess_noise_reduce"),
+            ("침묵 구간 제거", "preprocess_vad"),
+            ("음량 정규화", "preprocess_normalize"),
+        ]
+        for label, key in steps:
+            item = rumps.MenuItem(label, callback=self._make_preprocess_callback(key))
+            item.state = 1 if self._config.get(key, True) else 0
+            menu.add(item)
+        return menu
+
+    def _make_preprocess_callback(self, key: str):
+        def _toggle(sender):
+            current = self._config.get(key, True)
+            self._config[key] = not current
+            sender.state = 1 if self._config[key] else 0
+            CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
+            logger.info("전처리 설정 변경: %s = %s", key, self._config[key])
+        return _toggle
+
     def _make_model_callback(self, model_name: str, quant: str):
         def _select(_sender):
             for item in self._model_menu_items.values():
@@ -362,9 +389,12 @@ class AutoMeetingNoteApp(rumps.App):
         else:
             rumps.alert(title="처리 현황", message="\n".join(self._status_log))
 
+    def _on_tick(self, remaining: int):
+        self._pending_app_title = f"MN 👁 {remaining}s"
+
     def _reset_title(self, _timer):
         if self._watcher.is_running:
-            self.title = "MN 👁"
+            pass  # 카운트다운이 계속 업데이트하므로 덮어쓰지 않음
         else:
             self.title = "MN"
         _timer.stop()
@@ -381,10 +411,11 @@ class AutoMeetingNoteApp(rumps.App):
                 config=self._config,
                 status_callback=self._on_status,
                 done_callback=self._on_done,
+                tick_callback=self._on_tick,
             )
             self._watcher.start()
             sender.title = "감시 중지"
-            self.title = "MN 👁"
+            self.title = "MN 👁 60s"
             logger.info("사용자가 감시를 시작했습니다")
 
     def _find_unprocessed_files(self) -> list:
@@ -417,6 +448,25 @@ class AutoMeetingNoteApp(rumps.App):
                 to_process.append(str(f))
         if to_process:
             threading.Thread(target=self._run_files_sequentially, args=(to_process,), daemon=True).start()
+
+    def _select_and_process(self, _):
+        from AppKit import NSOpenPanel, NSModalResponseOK
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(False)
+        panel.setAllowsMultipleSelection_(True)
+        panel.setAllowedFileTypes_(["mp4", "mov", "MP4", "MOV"])
+        panel.setTitle_("처리할 파일 선택")
+        panel.setPrompt_("선택")
+
+        if panel.runModal() != NSModalResponseOK:
+            return
+
+        paths = [str(url.path()) for url in panel.URLs()]
+        if not paths:
+            return
+
+        threading.Thread(target=self._run_files_sequentially, args=(paths,), daemon=True).start()
 
     def _confirm_on_main(self, message: str) -> bool:
         """백그라운드 스레드에서 호출해도 메인 스레드에서 안전하게 dialog를 표시."""
