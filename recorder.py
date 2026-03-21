@@ -26,6 +26,14 @@ class Recorder:
         self._audio_offset: float = 0.0           # 화면 녹화 시 오디오 선행 시간(초)
         self._start_time: Optional[float] = None
         self._lock = threading.Lock()
+        # pause/resume 세그먼트 지원
+        self._segments: list = []          # (output_path, audio_path, mic_path, audio_offset) 목록
+        self._is_paused: bool = False
+        self._seg_index: int = 0
+        self._output_dir: Optional[Path] = None
+        self._mic_enabled: bool = True
+        self._mic_device_index: str = "0"
+        self._base_ts: Optional[str] = None
 
     @property
     def is_recording(self) -> bool:
@@ -38,6 +46,10 @@ class Recorder:
     @property
     def mode(self) -> Optional[str]:
         return self._mode
+
+    @property
+    def is_paused(self) -> bool:
+        return self._is_paused
 
     @property
     def elapsed_seconds(self) -> float:
@@ -96,6 +108,14 @@ class Recorder:
             from system_audio import SystemAudioCapture
 
             ts = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+            self._segments = []
+            self._seg_index = 0
+            self._is_paused = False
+            self._output_dir = output_dir
+            self._mic_enabled = mic_enabled
+            self._mic_device_index = mic_device_index
+            self._base_ts = ts
+
             mov_path = output_dir / f"{ts}_녹화.mov"
             audio_path = output_dir / f"{ts}_녹화_sys.wav"
 
@@ -143,6 +163,14 @@ class Recorder:
             from system_audio import SystemAudioCapture
 
             ts = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+            self._segments = []
+            self._seg_index = 0
+            self._is_paused = False
+            self._output_dir = output_dir
+            self._mic_enabled = mic_enabled
+            self._mic_device_index = mic_device_index
+            self._base_ts = ts
+
             sys_path = output_dir / f"{ts}_녹음_sys.wav"
 
             self._sys_audio = SystemAudioCapture()
@@ -160,54 +188,138 @@ class Recorder:
             self._start_time = time.time()
             return sys_path
 
+    def _stop_current_processes(self) -> None:
+        """현재 실행 중인 프로세스 중지. _lock 보유 상태에서 호출."""
+        if self._mode == "screen":
+            if self._screen_process is not None:
+                try:
+                    if self._screen_process.poll() is None:
+                        try:
+                            self._screen_process.stdin.write(b"\n")
+                            self._screen_process.stdin.flush()
+                        except OSError:
+                            os.kill(self._screen_process.pid, signal.SIGINT)
+                    self._screen_process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    self._screen_process.kill()
+                    self._screen_process.wait()
+                except Exception as e:
+                    logger.error("screencapture 중지 오류: %s", e)
+                self._screen_process = None
+
+            if self._sys_audio is not None:
+                try:
+                    self._sys_audio.stop()
+                except Exception as e:
+                    logger.error("시스템 오디오 중지 오류: %s", e)
+                self._sys_audio = None
+
+            self._stop_mic()
+
+        elif self._mode == "audio":
+            if self._sys_audio is not None:
+                try:
+                    self._sys_audio.stop()
+                except Exception as e:
+                    logger.error("시스템 오디오 중지 오류: %s", e)
+                self._sys_audio = None
+
+            self._stop_mic()
+
+    def pause(self) -> None:
+        """녹화/녹음 일시 정지. 현재 세그먼트를 저장하고 프로세스 중지."""
+        with self._lock:
+            if self._mode is None or self._is_paused:
+                return
+            self._stop_current_processes()
+            self._segments.append((self._output_path, self._audio_path, self._mic_path, self._audio_offset))
+            self._output_path = None
+            self._audio_path = None
+            self._mic_path = None
+            self._audio_offset = 0.0
+            self._is_paused = True
+            logger.info("일시 정지 (세그먼트 %d 저장)", self._seg_index)
+
+    def resume(self) -> None:
+        """일시 정지 재개. 반드시 백그라운드 스레드에서 호출 (SCStream 초기화 블로킹)."""
+        with self._lock:
+            if not self._is_paused:
+                return
+            from system_audio import SystemAudioCapture
+
+            self._seg_index += 1
+            seg = self._seg_index
+            ts = self._base_ts
+
+            if self._mode == "screen":
+                mov_path = self._output_dir / f"{ts}_녹화_seg{seg}.mov"
+                audio_path = self._output_dir / f"{ts}_녹화_sys_seg{seg}.wav"
+
+                self._sys_audio = SystemAudioCapture()
+                self._sys_audio.start(audio_path)
+                sys_audio_ready_time = time.time()
+                logger.info("재개: 시스템 오디오 시작: %s", audio_path.name)
+
+                if self._mic_enabled:
+                    mic_path = self._output_dir / f"{ts}_녹화_mic_seg{seg}.wav"
+                    self._start_mic(mic_path, self._mic_device_index)
+                    self._mic_path = mic_path if self._mic_process else None
+                else:
+                    self._mic_path = None
+
+                sc_cmd = ["/usr/sbin/screencapture", "-v", str(mov_path)]
+                screen_start_time = time.time()
+                logger.info("재개: 화면 녹화 시작: %s", mov_path.name)
+                self._screen_process = subprocess.Popen(
+                    sc_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._audio_offset = screen_start_time - sys_audio_ready_time
+                self._output_path = mov_path
+                self._audio_path = audio_path
+
+            elif self._mode == "audio":
+                sys_path = self._output_dir / f"{ts}_녹음_sys_seg{seg}.wav"
+
+                self._sys_audio = SystemAudioCapture()
+                self._sys_audio.start(sys_path)
+                logger.info("재개: 시스템 오디오 시작: %s", sys_path.name)
+
+                if self._mic_enabled:
+                    mic_path = self._output_dir / f"{ts}_녹음_mic_seg{seg}.wav"
+                    self._start_mic(mic_path, self._mic_device_index)
+                    self._mic_path = mic_path if self._mic_process else None
+                else:
+                    self._mic_path = None
+
+                self._output_path = sys_path
+
+            self._is_paused = False
+            logger.info("녹화/녹음 재개 (세그먼트 %d)", self._seg_index)
+
     def stop(self) -> tuple:
         """녹화/녹음 중지. (mode, output_path, audio_path, mic_path, audio_offset) 반환."""
         with self._lock:
             mode = self._mode
-            output_path = self._output_path
-            audio_path = self._audio_path
-            mic_path = self._mic_path
-            audio_offset = self._audio_offset
 
-            if mode == "screen":
-                # screencapture 중지: stdin에 개행 전송
-                if self._screen_process is not None:
-                    try:
-                        if self._screen_process.poll() is None:
-                            try:
-                                self._screen_process.stdin.write(b"\n")
-                                self._screen_process.stdin.flush()
-                            except OSError:
-                                os.kill(self._screen_process.pid, signal.SIGINT)
-                        self._screen_process.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        self._screen_process.kill()
-                        self._screen_process.wait()
-                    except Exception as e:
-                        logger.error("screencapture 중지 오류: %s", e)
-                    self._screen_process = None
+            if not self._is_paused:
+                # 현재 녹화 중: 프로세스 중지 후 마지막 세그먼트 저장
+                self._stop_current_processes()
+                if self._output_path is not None:
+                    self._segments.append((self._output_path, self._audio_path, self._mic_path, self._audio_offset))
+            # 일시 정지 중이면 프로세스 없음, 세그먼트는 이미 pause()에서 저장됨
 
-                # 시스템 오디오 중지
-                if self._sys_audio is not None:
-                    try:
-                        self._sys_audio.stop()
-                    except Exception as e:
-                        logger.error("시스템 오디오 중지 오류: %s", e)
-                    self._sys_audio = None
+            segments = list(self._segments)
 
-                # 마이크 중지
-                self._stop_mic()
-
-            elif mode == "audio":
-                if self._sys_audio is not None:
-                    try:
-                        self._sys_audio.stop()
-                    except Exception as e:
-                        logger.error("시스템 오디오 중지 오류: %s", e)
-                    self._sys_audio = None
-
-                # 마이크 중지
-                self._stop_mic()
+            if not segments:
+                output_path = audio_path = mic_path = None
+                audio_offset = 0.0
+            elif len(segments) == 1:
+                output_path, audio_path, mic_path, audio_offset = segments[0]
+            else:
+                output_path, audio_path, mic_path, audio_offset = self._concat_segments(mode, segments)
 
             self._mode = None
             self._output_path = None
@@ -215,9 +327,120 @@ class Recorder:
             self._mic_path = None
             self._audio_offset = 0.0
             self._start_time = None
+            self._segments = []
+            self._seg_index = 0
+            self._is_paused = False
 
             logger.info("녹화/녹음 중지 완료")
             return mode, output_path, audio_path, mic_path, audio_offset
+
+    def _trim_wav(self, ffmpeg_bin: str, in_path: Path, offset: float, out_path: Path) -> None:
+        """오디오 앞부분을 offset초만큼 잘라 out_path에 저장."""
+        if offset <= 0.05:
+            import shutil
+            shutil.copy2(str(in_path), str(out_path))
+            return
+        cmd = [ffmpeg_bin, "-ss", f"{offset:.3f}", "-i", str(in_path), "-c", "copy", "-y", str(out_path)]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _concat_files(self, ffmpeg_bin: str, paths: list, out_path: Path) -> None:
+        """ffmpeg concat demuxer로 파일 목록을 하나로 합침."""
+        list_file = out_path.with_suffix(".concat.txt")
+        with open(list_file, "w", encoding="utf-8") as f:
+            for p in paths:
+                f.write(f"file '{p}'\n")
+        cmd = [ffmpeg_bin, "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", "-y", str(out_path)]
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            list_file.unlink()
+        except OSError:
+            pass
+        if result.returncode != 0:
+            raise RuntimeError(f"세그먼트 합치기 실패: {out_path.name}")
+
+    def _concat_segments(self, mode: str, segments: list) -> tuple:
+        """여러 세그먼트 파일을 하나로 합쳐 (output_path, audio_path, mic_path, offset) 반환."""
+        ffmpeg_bin = find_ffmpeg()
+        if not ffmpeg_bin:
+            logger.warning("ffmpeg 없음 — 첫 세그먼트만 사용")
+            return segments[0]
+
+        ts = self._base_ts
+        parent = segments[0][0].parent
+
+        if mode == "screen":
+            final_mov = parent / f"{ts}_녹화.mov"
+            final_sys = parent / f"{ts}_녹화_sys.wav"
+            final_mic = parent / f"{ts}_녹화_mic.wav"
+
+            mov_paths, trimmed_sys, trimmed_mic = [], [], []
+            for i, (out_path, audio_path, mic_path, offset) in enumerate(segments):
+                if out_path and out_path.exists():
+                    mov_paths.append(out_path)
+                if audio_path and audio_path.exists() and audio_path.stat().st_size > 44:
+                    trimmed = parent / f"_trim_sys_{i}.wav"
+                    self._trim_wav(ffmpeg_bin, audio_path, offset, trimmed)
+                    trimmed_sys.append(trimmed)
+                if mic_path and mic_path.exists() and mic_path.stat().st_size > 44:
+                    trimmed = parent / f"_trim_mic_{i}.wav"
+                    self._trim_wav(ffmpeg_bin, mic_path, offset, trimmed)
+                    trimmed_mic.append(trimmed)
+
+            if mov_paths:
+                self._concat_files(ffmpeg_bin, mov_paths, final_mov)
+            if trimmed_sys:
+                self._concat_files(ffmpeg_bin, trimmed_sys, final_sys)
+                for f in trimmed_sys:
+                    f.unlink(missing_ok=True)
+            if trimmed_mic:
+                self._concat_files(ffmpeg_bin, trimmed_mic, final_mic)
+                for f in trimmed_mic:
+                    f.unlink(missing_ok=True)
+
+            # 원본 세그먼트 파일 삭제
+            for out_path, audio_path, mic_path, _ in segments:
+                for f in [out_path, audio_path, mic_path]:
+                    if f and f.exists() and f not in (final_mov, final_sys, final_mic):
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass
+
+            return (
+                final_mov if mov_paths else None,
+                final_sys if trimmed_sys else None,
+                final_mic if trimmed_mic else None,
+                0.0,
+            )
+
+        elif mode == "audio":
+            final_sys = parent / f"{ts}_녹음_sys.wav"
+            final_mic = parent / f"{ts}_녹음_mic.wav"
+
+            sys_paths = [seg[1] for seg in segments if seg[1] and seg[1].exists() and seg[1].stat().st_size > 44]
+            mic_paths = [seg[2] for seg in segments if seg[2] and seg[2].exists() and seg[2].stat().st_size > 44]
+
+            if sys_paths:
+                self._concat_files(ffmpeg_bin, sys_paths, final_sys)
+            if mic_paths:
+                self._concat_files(ffmpeg_bin, mic_paths, final_mic)
+
+            for _, audio_path, mic_path, _ in segments:
+                for f in [audio_path, mic_path]:
+                    if f and f.exists() and f not in (final_sys, final_mic):
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass
+
+            return (
+                None,
+                final_sys if sys_paths else None,
+                final_mic if mic_paths else None,
+                0.0,
+            )
+
+        return segments[0]
 
     def mix_wav(self, sys_path: Path, mic_path: Path) -> Path:
         """시스템 오디오 + 마이크 WAV를 amix로 믹싱 → 단일 WAV 반환. 원본 삭제."""

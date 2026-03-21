@@ -132,6 +132,7 @@ class AutoMeetingNoteApp(rumps.App):
         self._select_file_item = rumps.MenuItem("파일 선택하여 처리...", callback=self._select_and_process)
         self._screen_rec_item = rumps.MenuItem("화면 녹화 시작", callback=self._toggle_screen_rec)
         self._audio_rec_item = rumps.MenuItem("녹음 시작", callback=self._toggle_audio_rec)
+        self._pause_item = rumps.MenuItem("일시 정지", callback=None)
         self._mic_item = rumps.MenuItem("마이크 녹음 포함", callback=self._toggle_mic)
         self._mic_item.state = 1 if self._config.get("mic_enabled", False) else 0
         self._stt_skip_item = rumps.MenuItem("녹화/녹음만 (STT 건너뛰기)", callback=self._toggle_stt_skip)
@@ -156,6 +157,7 @@ class AutoMeetingNoteApp(rumps.App):
             self._select_file_item,
             self._screen_rec_item,
             self._audio_rec_item,
+            self._pause_item,
             self._flags_menu,
             None,
             self._status_item,
@@ -462,6 +464,8 @@ class AutoMeetingNoteApp(rumps.App):
             self._is_recording = False
             sender.title = "화면 녹화 시작"
             self._audio_rec_item.set_callback(self._toggle_audio_rec)
+            self._pause_item.title = "일시 정지"
+            self._pause_item.set_callback(None)
             self._stop_rec_timer()
             mode, output_path, audio_path, mic_path, audio_offset = self._recorder.stop()
             threading.Thread(
@@ -484,6 +488,7 @@ class AutoMeetingNoteApp(rumps.App):
             self._is_recording = True
             sender.title = "녹화 중지"
             self._audio_rec_item.set_callback(None)
+            self._pause_item.set_callback(self._toggle_pause)
             self._start_rec_timer()
 
             watch_dir = Path(self._config.get("watch_dir", "~/Desktop")).expanduser()
@@ -502,6 +507,7 @@ class AutoMeetingNoteApp(rumps.App):
                         t.stop()
                         sender.title = "화면 녹화 시작"
                         self._audio_rec_item.set_callback(self._toggle_audio_rec)
+                        self._pause_item.set_callback(None)
                     rumps.Timer(_revert, 0).start()
                     rumps.notification("AutoMeetingNote", "화면 녹화 오류", str(e))
 
@@ -513,6 +519,8 @@ class AutoMeetingNoteApp(rumps.App):
             self._is_recording = False
             sender.title = "녹음 시작"
             self._screen_rec_item.set_callback(self._toggle_screen_rec)
+            self._pause_item.title = "일시 정지"
+            self._pause_item.set_callback(None)
             self._stop_rec_timer()
             mode, output_path, audio_path, mic_path, audio_offset = self._recorder.stop()
             threading.Thread(
@@ -535,6 +543,7 @@ class AutoMeetingNoteApp(rumps.App):
             self._is_recording = True
             sender.title = "녹음 중지"
             self._screen_rec_item.set_callback(None)
+            self._pause_item.set_callback(self._toggle_pause)
             self._start_rec_timer()
 
             watch_dir = Path(self._config.get("watch_dir", "~/Desktop")).expanduser()
@@ -553,10 +562,31 @@ class AutoMeetingNoteApp(rumps.App):
                         t.stop()
                         sender.title = "녹음 시작"
                         self._screen_rec_item.set_callback(self._toggle_screen_rec)
+                        self._pause_item.set_callback(None)
                         rumps.alert(title="녹음 오류", message=str(e))
                     rumps.Timer(_revert, 0.0).start()
 
             threading.Thread(target=_start_bg, daemon=True).start()
+
+    def _toggle_pause(self, sender):
+        if self._recorder.is_paused:
+            # 재개: 백그라운드에서 SCStream 초기화 (블로킹)
+            sender.title = "일시 정지"
+            threading.Thread(target=self._do_resume, daemon=True).start()
+        else:
+            # 일시 정지
+            sender.title = "녹화 재개"
+            self._recorder.pause()
+
+    def _do_resume(self):
+        try:
+            self._recorder.resume()
+        except Exception as e:
+            logger.error("재개 실패: %s", e)
+            def _revert(t):
+                t.stop()
+                self._pause_item.title = "녹화 재개"
+            rumps.Timer(_revert, 0).start()
 
     def _start_rec_timer(self):
         self._rec_timer = rumps.Timer(self._update_rec_display, 1)
@@ -565,7 +595,10 @@ class AutoMeetingNoteApp(rumps.App):
     def _update_rec_display(self, _timer):
         elapsed = int(self._recorder.elapsed_seconds)
         mins, secs = divmod(elapsed, 60)
-        self._pending_app_title = f"● REC {mins:02d}:{secs:02d}"
+        if self._recorder.is_paused:
+            self._pending_app_title = f"⏸ REC {mins:02d}:{secs:02d}"
+        else:
+            self._pending_app_title = f"● REC {mins:02d}:{secs:02d}"
 
     def _stop_rec_timer(self):
         if self._rec_timer:
