@@ -41,7 +41,6 @@ from dotenv import load_dotenv
 
 from pipeline import run_pipeline
 from recorder import Recorder
-from watcher import FolderWatcher
 
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "AutoMeetingNote"
 APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -54,7 +53,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(str(LOG_FILE), encoding="utf-8"),
+        logging.FileHandler(str(LOG_FILE), mode="w", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -120,12 +119,6 @@ class AutoMeetingNoteApp(rumps.App):
         load_dotenv(env_path)
 
         self._config = load_config()
-        self._watcher = FolderWatcher(
-            config=self._config,
-            status_callback=self._on_status,
-            done_callback=self._on_done,
-            tick_callback=self._on_tick,
-        )
 
         self._recorder = Recorder()
         self._rec_timer: Optional[rumps.Timer] = None
@@ -136,19 +129,20 @@ class AutoMeetingNoteApp(rumps.App):
         self._pending_app_title = None
         rumps.Timer(self._flush_ui, 0.3).start()
 
-        self._toggle_item = rumps.MenuItem("감시 시작", callback=self._toggle_watch)
-        self._process_pending_item = rumps.MenuItem("미처리 파일 즉시 처리", callback=self._process_pending)
         self._select_file_item = rumps.MenuItem("파일 선택하여 처리...", callback=self._select_and_process)
         self._screen_rec_item = rumps.MenuItem("화면 녹화 시작", callback=self._toggle_screen_rec)
         self._audio_rec_item = rumps.MenuItem("녹음 시작", callback=self._toggle_audio_rec)
         self._mic_item = rumps.MenuItem("마이크 녹음 포함", callback=self._toggle_mic)
         self._mic_item.state = 1 if self._config.get("mic_enabled", False) else 0
+        self._stt_skip_item = rumps.MenuItem("녹화/녹음만 (STT 건너뛰기)", callback=self._toggle_stt_skip)
+        self._stt_skip_item.state = 1 if self._config.get("stt_skip", False) else 0
+        self._flags_menu = rumps.MenuItem("녹화/녹음 옵션")
+        self._flags_menu.add(self._mic_item)
+        self._flags_menu.add(self._stt_skip_item)
         self._status_item = rumps.MenuItem("처리 현황: 대기 중", callback=self._show_status_detail)
-        self._open_folder_item = rumps.MenuItem("감시 폴더 열기", callback=self._open_watch_dir)
-        self._open_export_item = rumps.MenuItem(self._export_menu_title(), callback=self._open_export_dir)
-        self._set_export_item = rumps.MenuItem("내보내기 폴더 변경...", callback=self._set_export_dir)
         self._open_config_item = rumps.MenuItem("설정 파일 열기", callback=self._open_config)
         self._open_prompt_item = rumps.MenuItem("STT 용어 사전 열기", callback=self._open_prompt)
+        self._open_log_item = rumps.MenuItem("로그 파일 열기", callback=self._open_log)
         self._quit_item = rumps.MenuItem("종료", callback=self._quit)
 
         self._model_menu_items: dict = {}
@@ -159,23 +153,19 @@ class AutoMeetingNoteApp(rumps.App):
         self._download_stop_event.set()  # 초기값: 다운로드 없음
 
         self.menu = [
-            self._toggle_item,
-            self._process_pending_item,
             self._select_file_item,
             self._screen_rec_item,
             self._audio_rec_item,
-            self._mic_item,
+            self._flags_menu,
             None,
             self._status_item,
             None,
             self._model_menu,
             self._preprocess_menu,
             None,
-            self._open_folder_item,
-            self._open_export_item,
-            self._set_export_item,
             self._open_config_item,
             self._open_prompt_item,
+            self._open_log_item,
             None,
             self._quit_item,
         ]
@@ -289,6 +279,11 @@ class AutoMeetingNoteApp(rumps.App):
     def _toggle_mic(self, sender):
         sender.state = not sender.state
         self._config["mic_enabled"] = bool(sender.state)
+        CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
+
+    def _toggle_stt_skip(self, sender):
+        sender.state = not sender.state
+        self._config["stt_skip"] = bool(sender.state)
         CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
 
     def _build_preprocess_menu(self) -> rumps.MenuItem:
@@ -419,66 +414,9 @@ class AutoMeetingNoteApp(rumps.App):
         else:
             rumps.alert(title="처리 현황", message="\n".join(self._status_log))
 
-    def _on_tick(self, remaining: int):
-        if not self._is_recording:
-            self._pending_app_title = f"MN 👁 {remaining}s"
-
     def _reset_title(self, _timer):
-        if self._watcher.is_running:
-            pass  # 카운트다운이 계속 업데이트하므로 덮어쓰지 않음
-        else:
-            self.title = "MN"
+        self.title = "MN"
         _timer.stop()
-
-    def _toggle_watch(self, sender):
-        if self._watcher.is_running:
-            self._watcher.stop()
-            sender.title = "감시 시작"
-            self.title = "MN"
-            logger.info("사용자가 감시를 중지했습니다")
-        else:
-            self._config = load_config()
-            self._watcher = FolderWatcher(
-                config=self._config,
-                status_callback=self._on_status,
-                done_callback=self._on_done,
-                tick_callback=self._on_tick,
-            )
-            self._watcher.start()
-            sender.title = "감시 중지"
-            self.title = "MN 👁 60s"
-            logger.info("사용자가 감시를 시작했습니다")
-
-    def _find_unprocessed_files(self) -> list:
-        import re
-        watch_dir = Path(self._config.get("watch_dir", "~/Desktop")).expanduser()
-        date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}")
-        if not watch_dir.exists():
-            return []
-        return sorted(
-            f for f in watch_dir.iterdir()
-            if f.suffix.lower() in {".mp4", ".mov"} and date_pattern.match(f.name)
-        )
-
-    def _process_pending(self, _):
-        self._config = load_config()
-        files = self._find_unprocessed_files()
-        if not files:
-            rumps.alert(title="미처리 파일 없음", message="처리할 MP4 파일이 없습니다.")
-            return
-        # 모든 확인을 먼저 받은 뒤 스레드 시작 (메인 스레드 점유 충돌 방지)
-        to_process = []
-        for f in files:
-            response = rumps.alert(
-                title="파일 처리 확인",
-                message=f"다음 파일을 처리하시겠습니까?\n\n{f.name}",
-                ok="OK",
-                cancel="Cancel",
-            )
-            if response == 1:
-                to_process.append(str(f))
-        if to_process:
-            threading.Thread(target=self._run_files_sequentially, args=(to_process,), daemon=True).start()
 
     def _select_and_process(self, _):
         from AppKit import NSOpenPanel, NSModalResponseOK
@@ -633,15 +571,13 @@ class AutoMeetingNoteApp(rumps.App):
         if self._rec_timer:
             self._rec_timer.stop()
             self._rec_timer = None
-        if self._watcher.is_running:
-            pass  # 카운트다운이 복원
-        else:
-            self._pending_app_title = "MN"
+        self._pending_app_title = "MN"
 
     def _on_recording_stopped(self, mode: str, output_path, audio_path=None, mic_path=None, audio_offset=0.0):
         """녹화/녹음 종료 후 후처리 (백그라운드 스레드에서 실행)."""
         if output_path is None:
             return
+        stt_skip = self._config.get("stt_skip", False)
         try:
             if mode == "screen":
                 self._on_status("녹화 파일 압축 중...")
@@ -651,8 +587,9 @@ class AutoMeetingNoteApp(rumps.App):
                     audio_offset=audio_offset,
                     progress_callback=self._on_status,
                 )
-                if self._watcher:
-                    self._watcher.exclude(str(mp4_path))
+                if stt_skip:
+                    self._on_status(f"✅ 녹화 완료 (STT 건너뜀): {mp4_path.name}")
+                    return
                 self._run_single_file(str(mp4_path))
             elif mode == "audio":
                 # 시스템 오디오 + 마이크 믹싱
@@ -661,8 +598,9 @@ class AutoMeetingNoteApp(rumps.App):
                     final_path = self._recorder.mix_wav(output_path, mic_path)
                 else:
                     final_path = output_path
-                if self._watcher:
-                    self._watcher.exclude(str(final_path))
+                if stt_skip:
+                    self._on_status(f"✅ 녹음 완료 (STT 건너뜀): {final_path.name}")
+                    return
                 self._run_single_file(str(final_path))
         except Exception as e:
             logger.error("녹화 후처리 실패: %s", e)
@@ -713,42 +651,6 @@ class AutoMeetingNoteApp(rumps.App):
                 message=str(e),
             )
 
-    def _export_menu_title(self) -> str:
-        export_dir = Path(self._config.get("export_dir", "~/Downloads")).expanduser()
-        return f"내보내기 폴더 열기 ({export_dir})"
-
-    def _open_watch_dir(self, _):
-        watch_dir = Path(self._config.get("watch_dir", "~/Desktop")).expanduser()
-        subprocess.Popen(["open", str(watch_dir)])
-
-    def _open_export_dir(self, _):
-        export_dir = Path(self._config.get("export_dir", "~/Downloads")).expanduser()
-        export_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen(["open", str(export_dir)])
-
-    def _set_export_dir(self, _):
-        from AppKit import NSOpenPanel, NSModalResponseOK
-        panel = NSOpenPanel.openPanel()
-        panel.setCanChooseFiles_(False)
-        panel.setCanChooseDirectories_(True)
-        panel.setAllowsMultipleSelection_(False)
-        panel.setTitle_("내보내기 폴더 선택")
-        panel.setPrompt_("선택")
-
-        current = Path(self._config.get("export_dir", "~/Downloads")).expanduser()
-        if current.exists():
-            from AppKit import NSURL
-            panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(current)))
-
-        if panel.runModal() != NSModalResponseOK:
-            return
-
-        selected = str(panel.URLs()[0].path())
-        self._config["export_dir"] = selected
-        CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
-        self._open_export_item.title = self._export_menu_title()
-        logger.info("내보내기 폴더 변경: %s", selected)
-
     def _open_config(self, _):
         subprocess.Popen(["open", str(CONFIG_PATH)])
 
@@ -759,14 +661,15 @@ class AutoMeetingNoteApp(rumps.App):
             return
         subprocess.Popen(["open", str(prompt_path)])
 
+    def _open_log(self, _):
+        subprocess.Popen(["open", str(LOG_FILE)])
+
     def _quit(self, _):
         if self._is_recording:
             try:
                 self._recorder.stop()
             except Exception:
                 pass
-        if self._watcher.is_running:
-            self._watcher.stop()
         rumps.quit_application()
 
 
