@@ -80,7 +80,7 @@ echo "컴파일 완료"
 
 echo "$VENV_REAL" > "$RESOURCES/.venv_path"
 
-for f in app.py pipeline.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py config.yaml dictionary.txt; do
+for f in app.py hotkey_manager.py pipeline.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py config.yaml dictionary.txt; do
     cp "$SCRIPT_DIR/$f" "$RESOURCES/"
 done
 

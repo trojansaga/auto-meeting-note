@@ -39,6 +39,7 @@ import rumps
 import yaml
 from dotenv import load_dotenv
 
+from hotkey_manager import HotkeyManager, format_hotkey, DEFAULT_HOTKEYS, HOTKEY_LABELS
 from pipeline import run_pipeline
 from recorder import Recorder
 
@@ -121,6 +122,7 @@ class AutoMeetingNoteApp(rumps.App):
         self._recorder = Recorder()
         self._rec_timer: Optional[rumps.Timer] = None
         self._is_recording = False  # screencapture 프로세스 종료 여부와 무관한 앱 레벨 상태
+        self._recording_mode = None  # 'screen' or 'audio'
 
         self._status_log: deque = deque(maxlen=50)
         self._pending_status_title = None
@@ -147,6 +149,7 @@ class AutoMeetingNoteApp(rumps.App):
         self._model_menu_items: dict = {}
         self._model_menu = self._build_model_menu()
         self._preprocess_menu = self._build_preprocess_menu()
+        self._hotkey_menu = self._build_hotkey_menu()
 
         self._download_stop_event: threading.Event = threading.Event()
         self._download_stop_event.set()  # 초기값: 다운로드 없음
@@ -162,6 +165,7 @@ class AutoMeetingNoteApp(rumps.App):
             None,
             self._model_menu,
             self._preprocess_menu,
+            self._hotkey_menu,
             None,
             self._open_config_item,
             self._open_prompt_item,
@@ -171,6 +175,7 @@ class AutoMeetingNoteApp(rumps.App):
         ]
 
         self._check_dependencies()
+        self._setup_hotkeys()
 
     def _check_dependencies(self):
         import shutil
@@ -307,6 +312,117 @@ class AutoMeetingNoteApp(rumps.App):
             CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
             logger.info("전처리 설정 변경: %s = %s", key, self._config[key])
         return _toggle
+
+    def _build_hotkey_menu(self) -> rumps.MenuItem:
+        hotkeys_cfg = self._config.get("hotkeys", DEFAULT_HOTKEYS)
+        menu = rumps.MenuItem("단축키 설정")
+
+        self._hotkey_items: dict = {}
+        for action, label in HOTKEY_LABELS.items():
+            hk = hotkeys_cfg.get(action, DEFAULT_HOTKEYS.get(action, {}))
+            mod, key = hk.get("mod", 0), hk.get("key", 0)
+            display = format_hotkey(mod, key)
+            item = rumps.MenuItem(
+                f"{label}: {display}",
+                callback=self._make_hotkey_setter(action, label),
+            )
+            self._hotkey_items[action] = item
+            menu.add(item)
+
+        menu.add(None)
+        menu.add(rumps.MenuItem("단축키 초기화", callback=self._reset_hotkeys))
+        return menu
+
+    def _setup_hotkeys(self):
+        self._hotkey_manager = HotkeyManager()
+        hotkeys_cfg = self._config.get("hotkeys", DEFAULT_HOTKEYS)
+
+        callbacks = {
+            "screen_record": self._hotkey_screen_rec,
+            "audio_record": self._hotkey_audio_rec,
+            "pause_resume": self._hotkey_pause_resume,
+        }
+        for action, cb in callbacks.items():
+            hk = hotkeys_cfg.get(action, DEFAULT_HOTKEYS.get(action, {}))
+            self._hotkey_manager.register(action, hk["mod"], hk["key"], cb)
+
+        self._hotkey_manager.start()
+
+    def _hotkey_screen_rec(self):
+        if self._is_recording and self._recording_mode != 'screen':
+            return
+        self._toggle_screen_rec(self._screen_rec_item)
+
+    def _hotkey_audio_rec(self):
+        if self._is_recording and self._recording_mode != 'audio':
+            return
+        self._toggle_audio_rec(self._audio_rec_item)
+
+    def _hotkey_pause_resume(self):
+        if not self._is_recording:
+            return
+        self._toggle_pause(self._pause_item)
+
+    def _make_hotkey_setter(self, action: str, label: str):
+        def _on_click(_sender):
+            rumps.alert(
+                title="단축키 변경",
+                message=f"'{label}' 단축키를 변경합니다.\n\n"
+                        "확인을 누른 후 새 단축키 조합을 눌러주세요.\n"
+                        "(수정자 키 + 일반 키, Esc로 취소)",
+            )
+
+            self._pending_app_title = "MN ⌨️"
+
+            def _on_recorded(mod, keycode):
+                display = format_hotkey(mod, keycode)
+
+                if "hotkeys" not in self._config:
+                    from copy import deepcopy
+                    self._config["hotkeys"] = deepcopy(DEFAULT_HOTKEYS)
+                self._config["hotkeys"][action] = {"mod": mod, "key": keycode}
+                CONFIG_PATH.write_text(
+                    yaml.dump(self._config, allow_unicode=True), encoding="utf-8"
+                )
+
+                self._hotkey_manager.update_binding(action, mod, keycode)
+                self._hotkey_items[action].title = f"{label}: {display}"
+                self._pending_app_title = "MN"
+
+                logger.info("단축키 변경: %s → %s", action, display)
+                try:
+                    rumps.notification("AutoMeetingNote", "단축키 변경", f"{label}: {display}")
+                except Exception:
+                    pass
+
+            def _on_cancel():
+                self._pending_app_title = "MN"
+
+            self._hotkey_manager.start_recording(_on_recorded, _on_cancel)
+
+            def _timeout(timer):
+                timer.stop()
+                if self._hotkey_manager.is_recording:
+                    self._hotkey_manager.cancel_recording()
+
+            rumps.Timer(_timeout, 10).start()
+
+        return _on_click
+
+    def _reset_hotkeys(self, _sender):
+        from copy import deepcopy
+        self._config["hotkeys"] = deepcopy(DEFAULT_HOTKEYS)
+        CONFIG_PATH.write_text(
+            yaml.dump(self._config, allow_unicode=True), encoding="utf-8"
+        )
+
+        for action, hk in DEFAULT_HOTKEYS.items():
+            self._hotkey_manager.update_binding(action, hk["mod"], hk["key"])
+            label = HOTKEY_LABELS[action]
+            self._hotkey_items[action].title = f"{label}: {format_hotkey(hk['mod'], hk['key'])}"
+
+        logger.info("단축키 초기화")
+        rumps.alert(title="단축키 초기화", message="모든 단축키가 기본값으로 초기화되었습니다.")
 
     def _make_model_callback(self, model_name: str, quant: str):
         def _select(_sender):
@@ -460,6 +576,7 @@ class AutoMeetingNoteApp(rumps.App):
         if self._is_recording:
             # 녹화 중지
             self._is_recording = False
+            self._recording_mode = None
             sender.title = "화면 녹화 시작"
             self._audio_rec_item.set_callback(self._toggle_audio_rec)
             self._pause_item.title = "일시 정지"
@@ -484,6 +601,7 @@ class AutoMeetingNoteApp(rumps.App):
             # UI 먼저 업데이트 후 백그라운드에서 SCStream + screencapture 시작
             # (SCShareableContent 콜백이 메인 스레드 필요 → 메인 스레드 블록 시 데드락)
             self._is_recording = True
+            self._recording_mode = 'screen'
             sender.title = "녹화 중지"
             self._audio_rec_item.set_callback(None)
             self._pause_item.set_callback(self._toggle_pause)
@@ -515,6 +633,7 @@ class AutoMeetingNoteApp(rumps.App):
         if self._is_recording:
             # 녹음 중지
             self._is_recording = False
+            self._recording_mode = None
             sender.title = "녹음 시작"
             self._screen_rec_item.set_callback(self._toggle_screen_rec)
             self._pause_item.title = "일시 정지"
@@ -539,6 +658,7 @@ class AutoMeetingNoteApp(rumps.App):
             # UI 먼저 업데이트 후 백그라운드에서 SCStream 시작
             # (SCShareableContent 콜백이 메인 스레드 필요 → 메인 스레드 블록 시 데드락)
             self._is_recording = True
+            self._recording_mode = 'audio'
             sender.title = "녹음 중지"
             self._screen_rec_item.set_callback(None)
             self._pause_item.set_callback(self._toggle_pause)
@@ -707,6 +827,7 @@ class AutoMeetingNoteApp(rumps.App):
                 self._recorder.stop()
             except Exception:
                 pass
+        self._hotkey_manager.stop()
         rumps.quit_application()
 
 
