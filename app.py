@@ -53,7 +53,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(str(LOG_FILE), mode="w", encoding="utf-8"),
+        logging.FileHandler(str(LOG_FILE), mode="a", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -78,7 +78,6 @@ def _ensure_user_config() -> Path:
         else:
             default = {
                 "watch_dir": "~/Desktop",
-                "file_prefix": "회의_",
                 "whisper_model": "small",
                 "whisper_quant": "4bit",
                 "language": "ko",
@@ -97,7 +96,6 @@ def load_config() -> dict:
         logger.warning("config.yaml 없음, 기본값 사용")
         return {
             "watch_dir": "~/Desktop",
-            "file_prefix": "회의_",
             "whisper_model": "small",
             "whisper_quant": "4bit",
             "language": "ko",
@@ -623,6 +621,9 @@ class AutoMeetingNoteApp(rumps.App):
                 if stt_skip:
                     self._on_status(f"✅ 녹화 완료 (STT 건너뜀): {mp4_path.name}")
                     return
+                if not self._confirm_on_main(f"녹화 파일이 준비되었습니다.\n({mp4_path.name})\n\n회의록 생성을 시작할까요?"):
+                    self._on_status(f"회의록 생성 취소됨: {mp4_path.name}")
+                    return
                 self._run_single_file(str(mp4_path))
             elif mode == "audio":
                 # 시스템 오디오 + 마이크 믹싱
@@ -633,6 +634,9 @@ class AutoMeetingNoteApp(rumps.App):
                     final_path = output_path
                 if stt_skip:
                     self._on_status(f"✅ 녹음 완료 (STT 건너뜀): {final_path.name}")
+                    return
+                if not self._confirm_on_main(f"녹음 파일이 준비되었습니다.\n({final_path.name})\n\n회의록 생성을 시작할까요?"):
+                    self._on_status(f"회의록 생성 취소됨: {final_path.name}")
                     return
                 self._run_single_file(str(final_path))
         except Exception as e:
@@ -707,6 +711,7 @@ class AutoMeetingNoteApp(rumps.App):
 
 
 def main():
+    logger.info("=" * 60)
     logger.info("AutoMeetingNote 앱 시작")
 
     # exec으로 프로세스 교체 시 .app 번들 연결이 끊겨 LSUIElement가 적용 안 됨

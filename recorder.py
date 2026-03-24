@@ -141,7 +141,7 @@ class Recorder:
                 sc_cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
 
             # 오디오(sys_audio_ready_time)와 영상(screen_start_time)의 시작 차이만큼 trim
@@ -205,6 +205,14 @@ class Recorder:
                     self._screen_process.wait()
                 except Exception as e:
                     logger.error("screencapture 중지 오류: %s", e)
+                sc_stderr = b""
+                try:
+                    sc_stderr = self._screen_process.stderr.read()
+                except Exception:
+                    pass
+                rc = self._screen_process.returncode
+                if rc != 0 or sc_stderr:
+                    logger.warning("screencapture 종료 (exit=%s) stderr: %s", rc, sc_stderr.decode(errors="replace").strip())
                 self._screen_process = None
 
             if self._sys_audio is not None:
@@ -503,6 +511,11 @@ class Recorder:
 
         mp4_path = mov_path.with_suffix(".mp4")
 
+        if not mov_path.exists():
+            raise RuntimeError(f"화면 녹화 파일이 없습니다: {mov_path.name} (screencapture가 파일을 생성하지 못했습니다)")
+        if mov_path.stat().st_size < 100:
+            raise RuntimeError(f"화면 녹화 파일이 너무 작습니다: {mov_path.name} ({mov_path.stat().st_size} bytes)")
+
         has_sys = audio_path and audio_path.exists() and audio_path.stat().st_size > 44
         has_mic = mic_path and mic_path.exists() and mic_path.stat().st_size > 44
 
@@ -576,11 +589,15 @@ class Recorder:
         total_duration: Optional[float] = None
         dur_pat = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
         time_pat = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+        stderr_lines: list = []
 
         for line in process.stderr:
             line = line.strip()
             if not line:
                 continue
+            stderr_lines.append(line)
+            if len(stderr_lines) > 100:
+                stderr_lines.pop(0)
             if total_duration is None:
                 m = dur_pat.search(line)
                 if m:
@@ -595,6 +612,7 @@ class Recorder:
         process.wait()
 
         if process.returncode != 0:
+            logger.error("ffmpeg 실패 (exit=%d) 마지막 로그:\n%s", process.returncode, "\n".join(stderr_lines[-20:]))
             raise RuntimeError(f"압축 실패 (exit code {process.returncode})")
 
         if progress_callback:

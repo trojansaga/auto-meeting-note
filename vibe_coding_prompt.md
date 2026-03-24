@@ -2,19 +2,21 @@
 
 ## 프로젝트 개요
 
-macOS 메뉴바 앱으로, 특정 폴더를 감시하여 회의 녹화 mp4 파일이 감지되면 자동으로 STT → 대본 작성 → 회의록 생성까지 수행하는 파이프라인을 구현한다.
+macOS 메뉴바 앱으로, 화면 녹화 또는 오디오 녹음을 직접 수행하고 완료 후 확인 팝업을 거쳐 자동으로 음성 전처리 → STT → 회의록 생성까지 수행하는 파이프라인을 구현한다. 외부 파일 선택을 통한 수동 처리도 지원한다.
 
 ## 기술 스택
 
 - Python 3.11+
 - rumps: macOS 메뉴바 앱
-- watchdog: 파일시스템 감시
-- ffmpeg (subprocess): mp4에서 음성 추출
-- openai-whisper (large-v3, 로컬): 한국어 STT (키 불필요, 로컬 실행)
+- ScreenCaptureKit (pyobjc): macOS 시스템 오디오 캡처
+- screencapture (macOS 내장): 화면 녹화
+- ffmpeg (subprocess): 음성 추출, 영상 압축, 오디오 믹싱
+- mlx-whisper / lightning-whisper-mlx: Apple Silicon 최적화 로컬 STT
+- noisereduce / soundfile: 음성 전처리 (노이즈 제거, VAD, 음량 정규화)
 - openai (Python SDK): 회의록 생성 (GPT API)
 - python-dotenv: .env 파일에서 API 키 로드
 - pyyaml: 설정 관리
-- py2app: macOS 앱 번들 빌드
+- Swift 런처 + build_app.sh: macOS .app 번들 빌드
 
 시스템 의존성: `brew install ffmpeg`
 
@@ -69,15 +71,21 @@ auto-meeting-note/
 ├── .venv/                 # Python 가상환경 (git 제외)
 ├── .gitignore
 ├── setup_env.sh           # 환경 셋업 스크립트
+├── build_app.sh           # .app 번들 빌드 스크립트 (Swift 런처 컴파일 포함)
 ├── app.py                 # 메뉴바 앱 진입점
 ├── config.yaml            # 사용자 설정
-├── watcher.py             # 폴더 감시
+├── recorder.py            # 화면 녹화 / 오디오 녹음 (screencapture + SCStream)
+├── system_audio.py        # ScreenCaptureKit 기반 시스템 오디오 캡처
 ├── pipeline.py            # 파이프라인 오케스트레이션
 ├── audio_extractor.py     # mp4 → wav 추출
-├── transcriber.py         # Whisper STT
-├── note_generator.py      # Claude API 회의록 생성
+├── audio_preprocessor.py  # 음성 전처리 (노이즈 제거, VAD, 음량 정규화)
+├── transcriber.py         # mlx-whisper STT
+├── note_generator.py      # OpenAI API 회의록 생성
+├── generate_prompt.py     # 회의록 생성 프롬프트 빌더
+├── dictionary.txt         # STT 용어 사전 (initial_prompt)
+├── filter_prompt.txt      # 회의 내용 필터링 프롬프트
 ├── requirements.txt
-└── setup.py               # py2app 빌드
+└── setup.py               # py2app 설정 (참조용)
 ```
 
 ## 상세 요구사항
@@ -87,15 +95,20 @@ auto-meeting-note/
 아래 항목을 포함하는 설정 파일을 생성한다.
 
 ```yaml
-watch_dir: "~/Desktop"
-file_prefix: "회의_"
-whisper_model: "large-v3"
-language: "ko"
-openai_model: "gpt-5.3"
+watch_dir: "~/Desktop"           # 녹화/녹음 파일 저장 및 작업 디렉토리
+whisper_model: "small"           # STT 모델 (small, medium, large-v3 등)
+whisper_quant: "4bit"            # 모델 양자화 (4bit, 8bit, base)
+whisper_batch_size: 4            # STT 배치 크기
+language: "ko"                   # STT 언어
+openai_model: "gpt-5.4"         # 회의록 생성 모델
+export_dir: "~/Downloads"        # 회의록 내보내기 디렉토리
+mic_enabled: false               # 마이크 동시 녹음 여부
+mic_device_index: "0"            # 마이크 장치 인덱스
 ```
 
-- API 키는 config.yaml에 저장하지 않고, 프로젝트 루트의 `.env` 파일에서 관리한다.
-- `watch_dir`의 `~`는 런타임에 `os.path.expanduser()`로 확장한다.
+- API 키는 config.yaml에 저장하지 않고, `~/Library/Application Support/AutoMeetingNote/.env` 파일에서 관리한다.
+- `watch_dir`, `export_dir`의 `~`는 런타임에 `Path.expanduser()`로 확장한다.
+- 설정 파일은 `~/Library/Application Support/AutoMeetingNote/config.yaml`에 저장되며, 없으면 번들 기본값에서 복사한다.
 
 `.env` 파일 형식:
 
@@ -109,46 +122,63 @@ OPENAI_API_KEY=sk-...
 
 rumps 라이브러리로 macOS 메뉴바 앱을 구현한다.
 
-- 메뉴바 아이콘: 텍스트 기반 ("📝" 또는 "MN")
+- 메뉴바 아이콘: 텍스트 기반 ("MN"), 녹화 중에는 "● REC MM:SS" 표시
 - 메뉴 항목:
-  - **감시 시작/중지** (토글): watcher 스레드를 시작/중지
-  - **감시 폴더 열기**: Finder에서 watch_dir 열기
-  - **설정 파일 열기**: config.yaml을 기본 에디터로 열기
+  - **파일 선택하여 처리...**: NSOpenPanel으로 mp4/mov 파일을 선택하여 수동 처리
+  - **화면 녹화 시작/중지** (토글): screencapture + SCStream으로 화면 녹화
+  - **녹음 시작/중지** (토글): SCStream으로 시스템 오디오 녹음
+  - **일시 정지/재개**: 녹화·녹음 중 일시 정지
+  - **녹화/녹음 옵션**: 마이크 녹음 포함, STT 건너뛰기 토글
+  - **처리 현황**: 파이프라인 진행 상태 표시
+  - **STT 모델 선택**: Whisper 모델/양자화 변경 및 다운로드
+  - **전처리 설정**: 노이즈 제거, 침묵 구간 제거, 음량 정규화 토글
+  - **설정 파일 열기** / **STT 용어 사전 열기** / **로그 파일 열기**
   - **종료**
-- 상태 표시: 감시 중일 때와 파이프라인 처리 중일 때 메뉴바 텍스트로 상태를 표시한다.
+- 녹화/녹음 완료 시 확인 팝업을 표시하여 회의록 생성 여부를 사용자가 결정한다.
 - 파이프라인 완료 시 macOS 알림(rumps.notification)을 발송한다.
-- watcher는 별도 스레드에서 실행하여 메뉴바 앱이 블로킹되지 않도록 한다.
+- 녹화·녹음·파이프라인은 별도 스레드에서 실행하여 메뉴바 앱이 블로킹되지 않도록 한다.
+- UI 업데이트는 rumps.Timer를 통해 메인 스레드에서 flush한다.
 
-### 3. watcher.py - 폴더 감시
+### 3. recorder.py - 녹화/녹음
 
-watchdog 라이브러리로 특정 폴더를 감시한다.
+화면 녹화와 오디오 녹음을 담당한다.
 
-- `FileSystemEventHandler`를 상속하여 구현한다.
-- `on_created` 또는 `on_moved` 이벤트에서 `.mp4` 확장자 + `file_prefix` 패턴에 매칭되는 파일만 처리한다.
-- **파일 쓰기 완료 감지**: 녹화 중인 파일을 잡지 않도록, 파일 크기를 3초 간격으로 2회 비교하여 변동이 없을 때만 파이프라인을 시작한다.
-- 동일 파일에 대해 중복 처리를 방지한다 (이미 처리된 파일 목록 관리).
-- 파이프라인 호출은 별도 스레드에서 실행하여 감시가 중단되지 않도록 한다.
+- **화면 녹화**: macOS `screencapture -v` 명령을 subprocess로 실행, SCStream으로 시스템 오디오를 동시 캡처
+- **오디오 녹음**: SCStream으로 시스템 오디오만 캡처 (화면 녹화 없음)
+- **마이크 녹음**: ffmpeg의 avfoundation 입력을 사용하여 마이크 오디오 동시 녹음
+- **일시 정지/재개**: 세그먼트 분할 방식으로 구현 (정지 시 현재 세그먼트 종료, 재개 시 새 세그먼트 시작)
+- **후처리**: ffmpeg로 MOV→MP4 압축, 시스템 오디오·마이크 오디오 믹싱, 세그먼트 결합
+- 녹화 파일은 `watch_dir`에 타임스탬프 기반 파일명으로 저장
 
-### 4. pipeline.py - 파이프라인 오케스트레이션
+### 4. system_audio.py - 시스템 오디오 캡처
+
+ScreenCaptureKit (pyobjc) 기반으로 macOS 시스템 오디오를 캡처한다.
+
+- SCStream API를 사용하여 시스템 전체 오디오를 PCM WAV로 캡처
+- CoreMedia 프레임워크로 오디오 버퍼 데이터 직접 추출
+- 16kHz, mono, 16bit PCM 포맷
+
+### 5. pipeline.py - 파이프라인 오케스트레이션
 
 전체 처리 흐름을 순차적으로 실행한다.
 
 ```
-입력: mp4 파일 경로
+입력: mp4/mov/wav 파일 경로
 처리 순서:
-  1. 파일명(확장자 제외)과 동일한 이름의 폴더를 watch_dir 내에 생성
-  2. mp4 파일을 생성된 폴더로 이동
-  3. audio_extractor 호출 → 폴더 내 audio.wav 생성
-  4. transcriber 호출 → 폴더 내 script.md 생성
-  5. note_generator 호출 → 폴더 내 meeting_note.md 생성
-  6. 임시 audio.wav 파일 삭제 (디스크 절약)
-  7. 상태 콜백을 통해 app.py에 완료 알림 전달
+  1. [1/6] 파일명 기반 작업 폴더를 watch_dir 내에 생성, 파일 이동
+  2. [2/6] 음성 추출 (mp4/mov → wav, WAV 직접 입력 시 건너뜀)
+  3. [3/6] 음성 전처리 (노이즈 제거, 침묵 구간 제거, 음량 정규화)
+  4. [4/6] STT 처리 (mlx-whisper)
+  5. [5/6] 회의록 생성 (OpenAI GPT API)
+  6. [6/6] 완료 → export_dir로 회의록 복사
 ```
 
+- 기존 결과물이 있으면 confirm_callback으로 재처리 여부를 확인한다.
 - 각 단계에서 예외 발생 시 해당 폴더에 `error.log`를 생성하고, 이후 단계를 중단한다.
 - 각 단계 시작/완료 시 콜백 함수를 호출하여 메뉴바 상태를 업데이트한다.
+- 완료된 회의록은 `export_dir` (기본: ~/Downloads)로 자동 복사한다.
 
-### 5. audio_extractor.py - 음성 추출
+### 6. audio_extractor.py - 음성 추출
 
 ffmpeg를 subprocess로 호출하여 mp4에서 음성을 추출한다.
 
@@ -161,13 +191,24 @@ ffmpeg -i input.mp4 -vn -acodec pcm_s16le -ar 16000 -ac 1 output.wav
 - ffmpeg 미설치 시 명확한 에러 메시지를 출력한다.
 - subprocess 실행 시 stdout/stderr를 캡처하여 에러 발생 시 로깅한다.
 
-### 6. transcriber.py - STT (Whisper)
+### 7. audio_preprocessor.py - 음성 전처리
 
-openai-whisper 라이브러리를 사용하여 로컬에서 STT를 수행한다.
+STT 정확도 향상을 위해 음성 파일을 전처리한다.
 
-- 모델: config의 `whisper_model` 값 사용 (기본 `large-v3`)
-- 언어: `language="ko"` 고정
-- 모델은 최초 실행 시 자동 다운로드되며, 이후 캐시에서 로드한다.
+- **노이즈 제거**: noisereduce 라이브러리 사용
+- **침묵 구간 제거 (VAD)**: 에너지 기반 음성 활동 감지로 무음 구간 제거
+- **음량 정규화**: 피크 기준 정규화
+- 각 단계는 config에서 개별적으로 on/off 가능 (`preprocess_noise_reduce`, `preprocess_vad`, `preprocess_normalize`)
+
+### 8. transcriber.py - STT (mlx-whisper)
+
+mlx-whisper / lightning-whisper-mlx를 사용하여 Apple Silicon에서 로컬 STT를 수행한다.
+
+- 모델: config의 `whisper_model` 값 사용 (기본 `small`)
+- 양자화: config의 `whisper_quant` 값 사용 (기본 `4bit`)
+- 언어: config의 `language` 값 사용 (기본 `ko`)
+- 모델은 HuggingFace Hub에서 다운로드되며, `~/Library/Application Support/AutoMeetingNote/huggingface`에 캐시된다.
+- `dictionary.txt`의 용어를 initial_prompt로 전달하여 도메인 특화 용어의 인식 정확도를 향상한다.
 - 출력 형식 (script.md):
 
 ```markdown
@@ -185,12 +226,12 @@ openai-whisper 라이브러리를 사용하여 로컬에서 STT를 수행한다.
 
 - Whisper 결과의 segments에서 start 타임스탬프를 `[HH:MM:SS]` 형식으로 변환하여 각 세그먼트 앞에 붙인다.
 
-### 7. note_generator.py - 회의록 생성
+### 9. note_generator.py - 회의록 생성
 
 OpenAI Python SDK를 사용하여 GPT API로 회의록을 생성한다.
 
 - API 키는 `.env`에서 `load_dotenv()`로 로드한 뒤 `os.environ["OPENAI_API_KEY"]`로 읽는다.
-- 사용 모델: config의 `openai_model` 값 (기본 `gpt-4o`)
+- 사용 모델: config의 `openai_model` 값 (기본 `gpt-5.4`)
 - script.md의 내용을 입력으로 전달한다.
 - 시스템 프롬프트:
 
@@ -235,22 +276,31 @@ OpenAI Python SDK를 사용하여 GPT API로 회의록을 생성한다.
 - 출력을 meeting_note.md로 저장한다.
 - API 호출 실패 시 재시도 로직을 포함한다 (최대 3회, 지수 백오프).
 
-### 8. requirements.txt
+### 10. requirements.txt
 
 가상환경에서 `pip install -r requirements.txt`로 설치한다.
 
 ```
 rumps>=0.4.0
+noisereduce>=3.0.0
+soundfile>=0.12.0
 watchdog>=3.0.0
 openai-whisper>=20231117
+mlx-whisper>=0.4.3
+lightning-whisper-mlx>=0.0.10
+mlx>=0.31.0
 openai>=1.0.0
 python-dotenv>=1.0.0
 pyyaml>=6.0
 torch>=2.0.0
 py2app>=0.28.0
+setproctitle>=1.3.0
+pyobjc-framework-Quartz>=9.0
+pyobjc-framework-AVFoundation>=9.0
+pyobjc-framework-ScreenCaptureKit>=12.0
 ```
 
-### 9. .gitignore
+### 11. .gitignore
 
 ```
 .venv/
@@ -263,61 +313,26 @@ dist/
 .DS_Store
 ```
 
-### 10. setup.py (py2app 빌드)
+### 12. build_app.sh - 앱 빌드
 
-py2app을 사용하여 macOS .app 번들로 빌드할 수 있도록 setup.py를 작성한다. 반드시 가상환경 활성화 상태에서 `python setup.py py2app`으로 빌드한다.
+`build_app.sh`로 macOS .app 번들을 빌드한다.
 
-```python
-from setuptools import setup
+- Swift로 네이티브 런처 바이너리를 컴파일하여 `MacOS/` 폴더에 배치
+- 런처는 자식 프로세스로 Python 앱을 실행하고, 시그널(SIGTERM, SIGINT, SIGHUP)을 전달
+- 소스 파일과 config.yaml, dictionary.txt를 `Resources/`에 복사
+- Info.plist에 `LSUIElement: true`를 설정하여 Dock에 표시하지 않음
 
-APP = ['app.py']
-OPTIONS = {
-    'argv_emulation': False,
-    'plist': {
-        'LSUIElement': True,  # Dock에 표시하지 않음 (메뉴바 전용)
-    },
-    'packages': ['rumps', 'watchdog', 'whisper', 'openai', 'dotenv', 'torch'],
-}
-
-setup(
-    app=APP,
-    name='AutoMeetingNote',
-    options={'py2app': OPTIONS},
-    setup_requires=['py2app'],
-)
+```bash
+bash build_app.sh
+# → dist/AutoMeetingNote.app 생성
 ```
-
-### 11. 처리 현황 상세 표시 (예정)
-
-파이프라인 각 단계에서 더 구체적인 진행 상황을 메뉴바에 표시한다.
-
-#### 단계별 상세 진행 정보
-
-| 단계 | 현재 | 목표 |
-|------|------|------|
-| 음성 추출 | `[2/5] 음성 추출` | `[2/5] 음성 추출 중... (00:01:23 / 00:45:00)` — ffmpeg stderr에서 time= 파싱 |
-| STT | `[3/5] STT 처리` | `[3/5] STT 처리 중... 32%` — Whisper `segments` 진행률 콜백 |
-| 회의록 생성 | `[4/5] 회의록 생성` | `[4/5] 회의록 생성 중... (스트리밍)` — OpenAI streaming으로 토큰 수신 표시 |
-
-#### 구현 방식
-
-- **음성 추출**: `subprocess.Popen`으로 ffmpeg를 실행하고, stderr에서 `time=HH:MM:SS` 패턴을 실시간 파싱하여 진행률 콜백 호출
-- **STT**: Whisper의 `transcribe()` 결과 segments를 처리하기 전 전체 오디오 길이 대비 현재 segment 시작 시각으로 진행률(%) 계산. Whisper 내부 훅 또는 segment 단위 순회로 구현
-- **회의록 생성**: OpenAI SDK의 streaming 모드(`stream=True`)로 호출하여 청크 수신 시마다 콜백
-
-#### 영향 파일
-
-- `audio_extractor.py`: `subprocess.Popen` + stderr 실시간 읽기, `progress_callback` 파라미터 추가
-- `transcriber.py`: segment 순회 중 진행률 계산, `progress_callback` 파라미터 추가
-- `note_generator.py`: streaming 모드 전환, `progress_callback` 파라미터 추가
-- `pipeline.py`: 각 모듈에 `progress_callback` 전달, 상태 메시지 포맷 변경
-- `app.py`: 기존 `status_callback` 그대로 활용 (변경 불필요)
 
 ## 구현 주의사항
 
-1. **스레딩**: rumps 메인 루프와 watcher/pipeline은 반드시 별도 스레드에서 실행한다. rumps의 메인 루프를 블로킹하면 앱이 응답 불가 상태가 된다.
-2. **파일 경로**: 모든 경로에서 한글 파일명을 정상 처리해야 한다. `os.path`를 사용하여 경로를 조합한다.
-3. **Whisper 모델 로딩**: 모델 로딩에 시간이 걸리므로, 앱 시작 시 또는 최초 처리 시 한 번만 로드하고 재사용한다.
-4. **디스크 용량**: audio.wav는 처리 완료 후 삭제하여 디스크 공간을 절약한다. 1시간 회의의 WAV 파일은 약 115MB이다.
-5. **로깅**: Python logging 모듈을 사용하여 각 모듈에서 처리 상태를 로깅한다. 로그 파일은 `~/Library/Logs/AutoMeetingNote/app.log`에 저장한다.
-6. **동시 처리 방지**: 하나의 파이프라인이 실행 중일 때 새 파일이 감지되면 큐에 넣고 순차 처리한다 (Whisper가 GPU 메모리를 점유하므로 동시 실행 방지).
+1. **스레딩**: rumps 메인 루프와 녹화/파이프라인은 반드시 별도 스레드에서 실행한다. rumps의 메인 루프를 블로킹하면 앱이 응답 불가 상태가 된다. UI 업데이트는 rumps.Timer를 통해 메인 스레드에서 flush한다.
+2. **파일 경로**: 모든 경로에서 한글 파일명을 정상 처리해야 한다. `pathlib.Path`를 사용하여 경로를 조합한다.
+3. **Whisper 모델**: mlx-whisper 모델은 HuggingFace Hub에서 다운로드한다. 앱 시작 시 모델 존재 여부를 확인하고, 없으면 다운로드 팝업을 표시한다.
+4. **로깅**: Python logging 모듈을 사용하여 각 모듈에서 처리 상태를 로깅한다. 로그 파일은 `~/Library/Logs/AutoMeetingNote/app.log`에 append 모드로 저장한다.
+5. **동시 처리 방지**: 하나의 파이프라인이 실행 중일 때 새 파일은 순차 처리한다.
+6. **권한**: 화면 녹화/시스템 오디오 캡처에는 macOS의 화면 녹화 권한이 필요하다. 앱 시작 시 권한을 확인하고 없으면 안내 팝업을 표시한다.
+7. **녹화 후 확인**: 녹화/녹음 완료 후 바로 파이프라인을 실행하지 않고, 확인 팝업을 표시하여 사용자가 회의록 생성 여부를 선택한다.

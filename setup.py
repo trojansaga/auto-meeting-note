@@ -34,7 +34,6 @@ OPTIONS = {
         'certifi',
     ],
     'includes': [
-        'watcher',
         'pipeline',
         'audio_extractor',
         'transcriber',

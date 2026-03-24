@@ -20,25 +20,67 @@ mkdir -p "$MACOS" "$RESOURCES"
 
 VENV_REAL="$(cd "$SCRIPT_DIR/.venv" && pwd -P)"
 
-cat > "$MACOS/$APP_NAME" << 'LAUNCHER'
-#!/bin/bash
-DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
-VENV_PYTHON="$DIR/.venv_path"
+# Swift 런처 소스 작성
+SWIFT_SRC="$SCRIPT_DIR/.build_launcher.swift"
+cat > "$SWIFT_SRC" << 'SWIFT_EOF'
+import Foundation
 
-if [ -f "$VENV_PYTHON" ]; then
-    PYTHON="$(cat "$VENV_PYTHON")/bin/python3"
-else
-    PYTHON="python3"
-fi
+var gChildPID: pid_t = 0
 
-export PYTHONPATH="$DIR"
-exec "$PYTHON" "$DIR/app.py"
-LAUNCHER
-chmod +x "$MACOS/$APP_NAME"
+func forwardSignal(_ sig: Int32) {
+    if gChildPID > 0 { kill(gChildPID, sig) }
+}
+
+guard let resourcesPath = Bundle.main.resourcePath else {
+    fputs("AutoMeetingNote: resources not found\n", stderr); exit(1)
+}
+
+// venv python 경로 읽기
+let venvFile = URL(fileURLWithPath: resourcesPath).appendingPathComponent(".venv_path").path
+var pythonPath = "/usr/bin/python3"
+if let venv = try? String(contentsOfFile: venvFile, encoding: .utf8) {
+    let candidate = URL(fileURLWithPath: venv.trimmingCharacters(in: .whitespacesAndNewlines))
+        .appendingPathComponent("bin/python3").path
+    if FileManager.default.isExecutableFile(atPath: candidate) { pythonPath = candidate }
+}
+
+let appScript = URL(fileURLWithPath: resourcesPath).appendingPathComponent("app.py").path
+
+var env = ProcessInfo.processInfo.environment
+env["PYTHONPATH"] = resourcesPath
+let curPath = env["PATH"] ?? "/usr/bin:/bin"
+if !curPath.contains("/opt/homebrew/bin") {
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + curPath
+}
+
+let child = Process()
+child.executableURL = URL(fileURLWithPath: pythonPath)
+child.arguments = [appScript]
+child.environment = env
+
+do {
+    try child.run()
+} catch {
+    fputs("AutoMeetingNote: launch failed: \(error)\n", stderr); exit(1)
+}
+
+gChildPID = child.processIdentifier
+signal(SIGTERM, forwardSignal)
+signal(SIGINT,  forwardSignal)
+signal(SIGHUP,  forwardSignal)
+
+child.waitUntilExit()
+exit(child.terminationStatus)
+SWIFT_EOF
+
+echo "Swift 런처 컴파일 중..."
+swiftc -O -o "$MACOS/$APP_NAME" "$SWIFT_SRC"
+rm -f "$SWIFT_SRC"
+echo "컴파일 완료"
 
 echo "$VENV_REAL" > "$RESOURCES/.venv_path"
 
-for f in app.py watcher.py pipeline.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py config.yaml dictionary.txt; do
+for f in app.py pipeline.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py config.yaml dictionary.txt; do
     cp "$SCRIPT_DIR/$f" "$RESOURCES/"
 done
 
