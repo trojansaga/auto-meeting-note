@@ -111,9 +111,12 @@ def transcribe(
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(lines), encoding="utf-8")
 
-    # MLX Metal GPU 캐시 및 Python 힙 해제
+    # MLX 모델 캐시 해제 (ModelHolder 클래스 변수가 모델을 영구 보관하므로 명시적으로 제거)
     import gc
     import mlx.core as mx
+    from mlx_whisper.transcribe import ModelHolder
+    ModelHolder.model = None
+    ModelHolder.model_path = None
     gc.collect()
     mx.metal.clear_cache()
 

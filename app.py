@@ -1,9 +1,12 @@
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
+from datetime import datetime
 from collections import deque
 from pathlib import Path
 from typing import Optional
@@ -40,7 +43,7 @@ import yaml
 from dotenv import load_dotenv
 
 from hotkey_manager import HotkeyManager, format_hotkey, DEFAULT_HOTKEYS, HOTKEY_LABELS
-from pipeline import run_pipeline
+from pipeline import run_pipeline, PipelineCancelledError
 from recorder import Recorder
 
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "AutoMeetingNote"
@@ -127,6 +130,7 @@ class AutoMeetingNoteApp(rumps.App):
         self._status_log: deque = deque(maxlen=50)
         self._pending_status_title = None
         self._pending_app_title = None
+        self._reset_title_at: Optional[float] = None
         rumps.Timer(self._flush_ui, 0.3).start()
 
         self._select_file_item = rumps.MenuItem("파일 선택하여 처리...", callback=self._select_and_process)
@@ -153,6 +157,14 @@ class AutoMeetingNoteApp(rumps.App):
 
         self._download_stop_event: threading.Event = threading.Event()
         self._download_stop_event.set()  # 초기값: 다운로드 없음
+
+        self._pipeline_stop_event: threading.Event = threading.Event()
+        self._pipeline_pause_event: threading.Event = threading.Event()
+        self._pipeline_pause_event.set()  # set = 실행 중, clear = 일시중단
+        self._pipeline_start_time: Optional[float] = None
+        self._pipeline_step: tuple = (0, 0)
+        self._pipeline_base_msg: str = ""
+        self._pipeline_running: bool = False
 
         self.menu = [
             self._select_file_item,
@@ -261,9 +273,38 @@ class AutoMeetingNoteApp(rumps.App):
             _timer.stop()
         rumps.Timer(_remove, 0.0).start()
 
+    def _notify(self, title: str, subtitle: str = "", message: str = ""):
+        """rumps.notification 실패 시 osascript로 fallback."""
+        try:
+            rumps.notification(title=title, subtitle=subtitle, message=message)
+        except Exception as e:
+            logger.warning("rumps 알림 실패, osascript 사용: %s", e)
+            try:
+                parts = [f'display notification "{message}" with title "{title}"']
+                if subtitle:
+                    parts = [f'display notification "{message}" with title "{title}" subtitle "{subtitle}"']
+                subprocess.run(["osascript", "-e", parts[0]], timeout=5, check=False)
+            except Exception as e2:
+                logger.error("알림 전송 실패: %s", e2)
+
     def _cancel_download(self, _):
         self._download_stop_event.set()
         logger.info("사용자가 다운로드를 중단했습니다")
+
+    def _pause_pipeline(self, _):
+        self._pipeline_pause_event.clear()
+        self._pipeline_base_msg = "⏸ 일시중단됨 (STT 처리 중이면 완료 후 중단)"
+        logger.info("파이프라인 일시중단")
+
+    def _resume_pipeline(self, _):
+        self._pipeline_pause_event.set()
+        logger.info("파이프라인 재개")
+
+    def _cancel_pipeline(self, _):
+        self._pipeline_pause_event.set()  # 일시중단 상태면 해제하여 stop 체크 도달 가능하게
+        self._pipeline_stop_event.set()
+        self._pipeline_base_msg = "⏹ 처리 중단 요청됨..."
+        logger.info("사용자가 처리를 중단했습니다")
 
     def _build_model_menu(self) -> rumps.MenuItem:
         from transcriber import MODEL_REPOS
@@ -390,10 +431,7 @@ class AutoMeetingNoteApp(rumps.App):
                 self._pending_app_title = "MN"
 
                 logger.info("단축키 변경: %s → %s", action, display)
-                try:
-                    rumps.notification("AutoMeetingNote", "단축키 변경", f"{label}: {display}")
-                except Exception:
-                    pass
+                self._notify("AutoMeetingNote", "단축키 변경", f"{label}: {display}")
 
             def _on_cancel():
                 self._pending_app_title = "MN"
@@ -471,25 +509,11 @@ class AutoMeetingNoteApp(rumps.App):
 
             logger.info("모델 다운로드 완료: %s", repo)
             self._on_status(f"✅ 모델 다운로드 완료: {repo}")
-            try:
-                rumps.notification(
-                    title="모델 다운로드 완료",
-                    subtitle=repo,
-                    message="Whisper 모델 준비가 완료되었습니다.",
-                )
-            except Exception:
-                pass
+            self._notify("모델 다운로드 완료", repo, "Whisper 모델 준비가 완료되었습니다.")
         except Exception as e:
             logger.error("모델 다운로드 실패: %s — %s", repo, e)
             self._on_status(f"❌ 모델 다운로드 실패: {repo}")
-            try:
-                rumps.notification(
-                    title="모델 다운로드 실패",
-                    subtitle=repo,
-                    message=str(e),
-                )
-            except Exception:
-                pass
+            self._notify("모델 다운로드 실패", repo, str(e))
         finally:
             self._hide_cancel_item()
 
@@ -497,7 +521,30 @@ class AutoMeetingNoteApp(rumps.App):
         if self._pending_app_title is not None:
             self.title = self._pending_app_title
             self._pending_app_title = None
-        if self._pending_status_title is not None:
+        if self._reset_title_at is not None and time.time() >= self._reset_title_at:
+            self.title = "MN"
+            self._reset_title_at = None
+        if self._pipeline_running:
+            if "⏹ 처리 중단" not in self.menu:
+                self.menu.add(rumps.MenuItem("⏹ 처리 중단", callback=self._cancel_pipeline))
+            is_paused = not self._pipeline_pause_event.is_set()
+            if is_paused:
+                if "⏸ 처리 일시중단" in self.menu:
+                    del self.menu["⏸ 처리 일시중단"]
+                if "▶ 처리 재개" not in self.menu:
+                    self.menu.add(rumps.MenuItem("▶ 처리 재개", callback=self._resume_pipeline))
+            else:
+                if "▶ 처리 재개" in self.menu:
+                    del self.menu["▶ 처리 재개"]
+                if "⏸ 처리 일시중단" not in self.menu:
+                    self.menu.add(rumps.MenuItem("⏸ 처리 일시중단", callback=self._pause_pipeline))
+        else:
+            for label in ["⏹ 처리 중단", "⏸ 처리 일시중단", "▶ 처리 재개"]:
+                if label in self.menu:
+                    del self.menu[label]
+        if self._pipeline_start_time is not None:
+            self._status_item.title = self._build_pipeline_status()
+        elif self._pending_status_title is not None:
             self._status_item.title = self._pending_status_title
             self._pending_status_title = None
 
@@ -506,7 +553,13 @@ class AutoMeetingNoteApp(rumps.App):
         self._status_log.append(message)
         if not self._is_recording:
             self._pending_app_title = "MN ⏳"
-        self._pending_status_title = f"처리 현황: {message}"
+        if self._pipeline_start_time is not None:
+            self._pipeline_base_msg = message
+            m = re.match(r'\[(\d+)/(\d+)\]', message)
+            if m:
+                self._pipeline_step = (int(m.group(1)), int(m.group(2)))
+        else:
+            self._pending_status_title = f"처리 현황: {message}"
 
     def _on_done(self, filename: str):
         done_msg = f"✅ 완료: {filename}"
@@ -514,25 +567,36 @@ class AutoMeetingNoteApp(rumps.App):
         if not self._is_recording:
             self._pending_app_title = "MN ✅"
         self._pending_status_title = f"처리 현황: {done_msg}"
-        try:
-            rumps.notification(
-                title="회의록 자동 생성 완료",
-                subtitle=filename,
-                message="회의록이 성공적으로 생성되었습니다.",
-            )
-        except Exception:
-            pass
-        rumps.Timer(self._reset_title, 5).start()
+        self._notify("회의록 자동 생성 완료", filename, "회의록이 성공적으로 생성되었습니다.")
+        self._schedule_title_reset(5)
+
+    def _schedule_title_reset(self, delay: float = 5):
+        self._reset_title_at = time.time() + delay
+
+    def _build_pipeline_status(self) -> str:
+        elapsed = time.time() - self._pipeline_start_time
+        elapsed_str = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
+        start_str = datetime.fromtimestamp(self._pipeline_start_time).strftime("%H:%M:%S")
+        base = self._pipeline_base_msg or "처리 중..."
+        k, n = self._pipeline_step
+        is_paused = not self._pipeline_pause_event.is_set()
+        if is_paused:
+            time_info = f"시작 {start_str} | 경과 {elapsed_str}"
+            return f"처리 현황: ⏸ {base} | {time_info}"
+        if k > 0 and n > 0 and k < n:
+            total_est = elapsed * n / k
+            remaining = total_est - elapsed
+            rem_str = f"{int(remaining // 60):02d}:{int(remaining % 60):02d}"
+            time_info = f"시작 {start_str} | 경과 {elapsed_str} | 예상잔여 {rem_str}"
+        else:
+            time_info = f"시작 {start_str} | 경과 {elapsed_str}"
+        return f"처리 현황: {base} | {time_info}"
 
     def _show_status_detail(self, _):
         if not self._status_log:
             rumps.alert(title="처리 현황", message="진행 중인 작업이 없습니다.")
         else:
             rumps.alert(title="처리 현황", message="\n".join(self._status_log))
-
-    def _reset_title(self, _timer):
-        self.title = "MN"
-        _timer.stop()
 
     def _select_and_process(self, _):
         from AppKit import NSOpenPanel, NSModalResponseOK
@@ -625,7 +689,7 @@ class AutoMeetingNoteApp(rumps.App):
                         self._audio_rec_item.set_callback(self._toggle_audio_rec)
                         self._pause_item.set_callback(None)
                     rumps.Timer(_revert, 0).start()
-                    rumps.notification("AutoMeetingNote", "화면 녹화 오류", str(e))
+                    self._notify("AutoMeetingNote", "화면 녹화 오류", str(e))
 
             threading.Thread(target=_start_bg, daemon=True).start()
 
@@ -738,11 +802,14 @@ class AutoMeetingNoteApp(rumps.App):
                     audio_offset=audio_offset,
                     progress_callback=self._on_status,
                 )
+                self._notify("AutoMeetingNote", "녹화 완료", mp4_path.name)
                 if stt_skip:
                     self._on_status(f"✅ 녹화 완료 (STT 건너뜀): {mp4_path.name}")
+                    self._schedule_title_reset(5)
                     return
                 if not self._confirm_on_main(f"녹화 파일이 준비되었습니다.\n({mp4_path.name})\n\n회의록 생성을 시작할까요?"):
                     self._on_status(f"회의록 생성 취소됨: {mp4_path.name}")
+                    self._schedule_title_reset(5)
                     return
                 self._run_single_file(str(mp4_path))
             elif mode == "audio":
@@ -752,11 +819,14 @@ class AutoMeetingNoteApp(rumps.App):
                     final_path = self._recorder.mix_wav(output_path, mic_path)
                 else:
                     final_path = output_path
+                self._notify("AutoMeetingNote", "녹음 완료", final_path.name)
                 if stt_skip:
                     self._on_status(f"✅ 녹음 완료 (STT 건너뜀): {final_path.name}")
+                    self._schedule_title_reset(5)
                     return
                 if not self._confirm_on_main(f"녹음 파일이 준비되었습니다.\n({final_path.name})\n\n회의록 생성을 시작할까요?"):
                     self._on_status(f"회의록 생성 취소됨: {final_path.name}")
+                    self._schedule_title_reset(5)
                     return
                 self._run_single_file(str(final_path))
         except Exception as e:
@@ -764,6 +834,7 @@ class AutoMeetingNoteApp(rumps.App):
             err_msg = f"❌ 녹화 후처리 오류: {e}"
             self._status_log.append(err_msg)
             self._pending_status_title = f"처리 현황: {err_msg}"
+            self._schedule_title_reset(5)
 
     def _confirm_on_main(self, message: str) -> bool:
         """백그라운드 스레드에서 호출해도 메인 스레드에서 안전하게 dialog를 표시."""
@@ -786,27 +857,42 @@ class AutoMeetingNoteApp(rumps.App):
     def _run_files_sequentially(self, paths: list):
         for path in paths:
             self._run_single_file(path)
+            if self._pipeline_stop_event.is_set():
+                break
 
     def _run_single_file(self, path: str):
         filename = Path(path).name
+        self._pipeline_stop_event.clear()
+        self._pipeline_pause_event.set()  # 항상 실행 상태로 시작
+        self._pipeline_start_time = time.time()
+        self._pipeline_step = (0, 0)
+        self._pipeline_base_msg = ""
+        self._pipeline_running = True
         try:
             run_pipeline(
                 path,
                 self._config,
                 status_callback=self._on_status,
                 confirm_callback=self._confirm_on_main,
+                stop_event=self._pipeline_stop_event,
+                pause_event=self._pipeline_pause_event,
             )
             self._on_done(filename)
+        except PipelineCancelledError:
+            msg = "⏹ 처리 중단됨"
+            self._status_log.append(msg)
+            self._pending_status_title = f"처리 현황: {msg}"
+            self._schedule_title_reset(5)
         except Exception as e:
             logger.error("수동 처리 실패: %s — %s", filename, e)
             err_msg = f"❌ 오류: {filename}"
             self._status_log.append(err_msg)
             self._pending_status_title = f"처리 현황: {err_msg}"
-            rumps.notification(
-                title="처리 실패",
-                subtitle=filename,
-                message=str(e),
-            )
+            self._notify("처리 실패", filename, str(e))
+        finally:
+            self._pipeline_pause_event.set()  # 잔류 일시중단 상태 해제
+            self._pipeline_start_time = None
+            self._pipeline_running = False
 
     def _open_config(self, _):
         subprocess.Popen(["open", str(CONFIG_PATH)])

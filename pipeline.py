@@ -3,8 +3,13 @@ import shutil
 import traceback
 from datetime import datetime
 from pathlib import Path
+from threading import Event
 from typing import Callable, Optional
 import re
+
+
+class PipelineCancelledError(Exception):
+    pass
 
 from audio_extractor import extract_audio
 from audio_preprocessor import preprocess_audio
@@ -30,6 +35,8 @@ def run_pipeline(
     config: dict,
     status_callback: Optional[Callable[[str], None]] = None,
     confirm_callback: Optional[Callable[[str], bool]] = None,
+    stop_event: Optional[Event] = None,
+    pause_event: Optional[Event] = None,
 ) -> str:
     mp4 = Path(mp4_path)
     original_filename = mp4.name
@@ -44,6 +51,7 @@ def run_pipeline(
     openai_model = config.get("openai_model", "gpt-5.4")
 
     work_dir = watch_dir / stem
+    moved_mp4 = work_dir / mp4.name
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def _notify(msg: str):
@@ -51,11 +59,23 @@ def run_pipeline(
         if status_callback:
             status_callback(msg)
 
+    def _check_stop():
+        if stop_event is not None and stop_event.is_set():
+            raise PipelineCancelledError("처리가 중단되었습니다.")
+
+    def _check_pause():
+        """일시중단 이벤트가 해제되어 있으면 재개될 때까지 대기. 대기 중에도 stop 확인."""
+        if pause_event is None:
+            _check_stop()
+            return
+        while not pause_event.wait(timeout=0.5):
+            _check_stop()
+        _check_stop()
+
     try:
         # 1. 폴더 생성 및 파일 이동
         _notify(f"[1/5] {STEP_NAMES[0]}")
         work_dir.mkdir(parents=True, exist_ok=True)
-        moved_mp4 = work_dir / mp4.name
         if mp4.exists():
             shutil.move(str(mp4), str(moved_mp4))
         elif moved_mp4.exists():
@@ -63,6 +83,7 @@ def run_pipeline(
         else:
             raise FileNotFoundError(f"MP4 파일을 찾을 수 없습니다: {mp4_path}")
 
+        _check_pause()
         # 2. 음성 추출
         if is_audio_only:
             # WAV 직접 입력 (녹음 기능) — 음성 추출 건너뜀
@@ -78,6 +99,7 @@ def run_pipeline(
                 _notify(f"[2/6] {STEP_NAMES[1]}")
                 extract_audio(str(moved_mp4), wav_path, progress_callback=_notify)
 
+        _check_pause()
         # 3. 음성 전처리
         preprocessed_wav_path = str(work_dir / "audio_preprocessed.wav")
         _notify(f"[3/6] {STEP_NAMES[2]}")
@@ -91,6 +113,7 @@ def run_pipeline(
         )
         stt_input_path = preprocessed_wav_path
 
+        _check_pause()
         # 4. STT 처리
         script_path = str(work_dir / f"{stem}_script.md")
         skip_stt = Path(script_path).exists() and confirm_callback is not None and not confirm_callback(
@@ -125,6 +148,7 @@ def run_pipeline(
                 initial_prompt=initial_prompt,
             )
 
+        _check_pause()
         # 5. 회의록 생성
         _notify(f"[5/6] {STEP_NAMES[4]}")
         note_tmp = str(work_dir / "_meeting_note_tmp.md")
@@ -163,6 +187,23 @@ def run_pipeline(
                 logger.error("회의록 내보내기 실패 (파이프라인 결과에는 영향 없음): %s", export_err)
 
         return str(work_dir)
+
+    except PipelineCancelledError:
+        logger.info("파이프라인 중단: %s", original_filename)
+        # 파일을 원래 위치로 복원
+        if moved_mp4.exists() and not mp4.exists():
+            try:
+                shutil.move(str(moved_mp4), str(mp4))
+                logger.info("파일 복원: %s → %s", moved_mp4, mp4)
+            except Exception as restore_err:
+                logger.error("파일 복원 실패: %s", restore_err)
+        # 작업 디렉토리가 비어 있으면 제거
+        try:
+            if work_dir.exists() and not any(work_dir.iterdir()):
+                work_dir.rmdir()
+        except OSError:
+            pass
+        raise
 
     except Exception as e:
         error_msg = f"파이프라인 오류 ({original_filename}): {e}"

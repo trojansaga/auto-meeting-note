@@ -120,6 +120,8 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
     <true/>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <key>NSUserNotificationAlertStyle</key>
+    <string>alert</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>회의 음성을 녹음하기 위해 마이크 접근이 필요합니다.</string>
     <key>NSScreenCaptureUsageDescription</key>
