@@ -6,6 +6,7 @@ openai-whisper>=20231117
 mlx-whisper>=0.4.3
 lightning-whisper-mlx>=0.0.10
 mlx>=0.31.0
+qwen-asr>=0.0.6
 openai>=1.0.0
 python-dotenv>=1.0.0
 pyyaml>=6.0

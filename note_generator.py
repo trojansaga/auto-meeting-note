@@ -2,9 +2,12 @@ import logging
 import re
 import time
 from pathlib import Path
+from threading import Event
 from typing import Callable, Optional
 
 import openai
+
+from cancellation import OperationCancelledError
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +67,7 @@ def generate_note(
     created_at: str,
     model: str = "gpt-5.4",
     progress_callback: Optional[Callable[[str], None]] = None,
+    stop_event: Optional[Event] = None,
 ) -> str:
     script = Path(script_path)
     if not script.exists():
@@ -86,11 +90,16 @@ def generate_note(
     client = openai.OpenAI()
     last_error = None
 
+    def _check_stop():
+        if stop_event is not None and stop_event.is_set():
+            raise OperationCancelledError("회의록 생성이 중단되었습니다.")
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            _check_stop()
             logger.info("회의록 생성 API 호출 (시도 %d/%d, 모델: %s)", attempt, MAX_RETRIES, model)
 
-            if progress_callback:
+            if progress_callback or stop_event is not None:
                 content_parts = []
                 received_chars = 0
 
@@ -101,14 +110,17 @@ def generate_note(
                     stream=True,
                 ) as stream:
                     for chunk in stream:
+                        _check_stop()
                         delta = chunk.choices[0].delta.content or ""
                         content_parts.append(delta)
                         received_chars += len(delta)
-                        pct = min(received_chars / estimated_chars * 100, 99)
-                        progress_callback(f"[4/5] 회의록 생성 중... {pct:.0f}%")
+                        if progress_callback:
+                            pct = min(received_chars / estimated_chars * 100, 99)
+                            progress_callback(f"[5/6] 회의록 생성 중... {pct:.0f}%")
 
                 content = "".join(content_parts)
-                progress_callback("[4/5] 회의록 생성 완료 (100%)")
+                if progress_callback:
+                    progress_callback("[5/6] 회의록 생성 완료 (100%)")
             else:
                 response = client.chat.completions.create(
                     model=model,
@@ -119,12 +131,15 @@ def generate_note(
 
             break
 
+        except OperationCancelledError:
+            raise
         except (openai.NotFoundError, openai.AuthenticationError) as e:
             logger.error("재시도 불가 오류: %s", e)
             raise RuntimeError(f"OpenAI API 오류: {e}") from e
         except (openai.APIConnectionError, openai.RateLimitError, openai.APIError) as e:
             last_error = e
             if attempt < MAX_RETRIES:
+                _check_stop()
                 delay = BASE_DELAY ** attempt
                 logger.warning("API 호출 실패 (시도 %d/%d), %d초 후 재시도: %s", attempt, MAX_RETRIES, delay, e)
                 time.sleep(delay)
@@ -132,6 +147,7 @@ def generate_note(
                 logger.error("API 호출 최종 실패: %s", e)
                 raise RuntimeError(f"OpenAI API 호출 {MAX_RETRIES}회 실패: {last_error}") from e
 
+    _check_stop()
     title = _extract_title(content)
 
     output = Path(output_path)

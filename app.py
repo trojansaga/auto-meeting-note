@@ -1,5 +1,6 @@
 import logging
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -45,6 +46,17 @@ from dotenv import load_dotenv
 from hotkey_manager import HotkeyManager, format_hotkey, DEFAULT_HOTKEYS, HOTKEY_LABELS
 from pipeline import run_pipeline, PipelineCancelledError
 from recorder import Recorder
+from transcriber import (
+    DEFAULT_QWEN_MODEL,
+    DEFAULT_STT_BACKEND,
+    DEFAULT_WHISPER_MODEL,
+    DEFAULT_WHISPER_QUANT,
+    QWEN_MODEL_REPOS,
+    WHISPER_MODEL_REPOS,
+    get_backend_label,
+    get_model_display_name,
+    get_model_download_repo,
+)
 
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "AutoMeetingNote"
 APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -60,8 +72,68 @@ logging.basicConfig(
         logging.FileHandler(str(LOG_FILE), mode="a", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
+    force=True,
 )
 logger = logging.getLogger(__name__)
+
+RUNTIME_NOTIFICATION_BUNDLE_ID = "com.automeetingnote.runtime"
+
+DEFAULT_CONFIG = {
+    "watch_dir": "~/Desktop",
+    "stt_backend": DEFAULT_STT_BACKEND,
+    "whisper_model": DEFAULT_WHISPER_MODEL,
+    "whisper_quant": DEFAULT_WHISPER_QUANT,
+    "whisper_batch_size": 4,
+    "qwen_model": DEFAULT_QWEN_MODEL,
+    "qwen_dtype": None,
+    "qwen_device_map": None,
+    "qwen_attn_implementation": None,
+    "qwen_forced_aligner": None,
+    "qwen_return_timestamps": False,
+    "qwen_max_new_tokens": 4096,
+    "qwen_max_batch_size": 1,
+    "qwen_chunk_seconds": 600,
+    "language": "ko",
+    "openai_model": "gpt-5.4",
+    "export_dir": "~/Downloads",
+    "mic_enabled": False,
+    "mic_device_index": "0",
+    "stt_skip": False,
+}
+
+
+def _ensure_notification_runtime_plist():
+    """rumps가 찾는 python 실행 디렉터리의 Info.plist를 보정한다."""
+    plist_path = Path(sys.executable).resolve().parent / "Info.plist"
+    desired = {
+        "CFBundleIdentifier": RUNTIME_NOTIFICATION_BUNDLE_ID,
+        "CFBundleName": "AutoMeetingNote",
+        "CFBundleDisplayName": "AutoMeetingNote",
+    }
+
+    try:
+        current = {}
+        if plist_path.exists():
+            with plist_path.open("rb") as f:
+                loaded = plistlib.load(f)
+                if isinstance(loaded, dict):
+                    current = loaded
+
+        changed = False
+        for key, value in desired.items():
+            if current.get(key) != value:
+                current[key] = value
+                changed = True
+
+        if changed:
+            with plist_path.open("wb") as f:
+                plistlib.dump(current, f, sort_keys=True)
+            logger.info("알림 런타임 plist 준비: %s", plist_path)
+    except Exception as e:
+        logger.warning("알림 런타임 plist 준비 실패: %s", e)
+
+
+_ensure_notification_runtime_plist()
 
 
 def _resource_path() -> Path:
@@ -80,14 +152,7 @@ def _ensure_user_config() -> Path:
             shutil.copy2(str(bundled), str(user_config))
             logger.info("기본 config.yaml 복사: %s", user_config)
         else:
-            default = {
-                "watch_dir": "~/Desktop",
-                "whisper_model": "small",
-                "whisper_quant": "4bit",
-                "language": "ko",
-                "openai_model": "gpt-5.4",
-            }
-            user_config.write_text(yaml.dump(default, allow_unicode=True), encoding="utf-8")
+            user_config.write_text(yaml.dump(DEFAULT_CONFIG, allow_unicode=True), encoding="utf-8")
             logger.info("기본 config.yaml 생성: %s", user_config)
     return user_config
 
@@ -98,15 +163,12 @@ CONFIG_PATH = _ensure_user_config()
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
         logger.warning("config.yaml 없음, 기본값 사용")
-        return {
-            "watch_dir": "~/Desktop",
-            "whisper_model": "small",
-            "whisper_quant": "4bit",
-            "language": "ko",
-            "openai_model": "gpt-5.4",
-        }
+        return dict(DEFAULT_CONFIG)
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        loaded = yaml.safe_load(f) or {}
+    config = dict(DEFAULT_CONFIG)
+    config.update(loaded)
+    return config
 
 
 class AutoMeetingNoteApp(rumps.App):
@@ -192,7 +254,6 @@ class AutoMeetingNoteApp(rumps.App):
     def _check_dependencies(self):
         import shutil
         errors = []
-        warnings = []
 
         if not shutil.which("ffmpeg"):
             errors.append("ffmpeg가 없습니다.\n터미널에서 'brew install ffmpeg' 실행 후 앱을 재시작하세요.")
@@ -200,10 +261,10 @@ class AutoMeetingNoteApp(rumps.App):
         if not os.environ.get("OPENAI_API_KEY"):
             errors.append("OPENAI_API_KEY가 설정되지 않았습니다.\n설정 파일 열기 메뉴에서 .env 파일을 확인하세요.")
 
-        try:
-            import mlx_whisper  # noqa: F401
-        except ImportError:
-            errors.append("mlx_whisper 패키지가 없습니다.\n터미널에서 'pip install mlx-whisper' 실행 후 앱을 재시작하세요.")
+        backend = self._config.get("stt_backend", DEFAULT_STT_BACKEND)
+        stt_dependency_error = self._get_stt_dependency_error(backend)
+        if stt_dependency_error:
+            errors.append(stt_dependency_error)
 
         if errors:
             rumps.alert(title="설정 오류", message="\n\n".join(errors))
@@ -211,9 +272,28 @@ class AutoMeetingNoteApp(rumps.App):
 
         threading.Thread(target=self._validate_openai_model, daemon=True).start()
 
-        model_name = self._config.get("whisper_model", "small")
-        quant = self._config.get("whisper_quant", "4bit")
-        self._check_and_download_model(model_name, quant)
+        backend, model_name, quant = self._get_current_stt_selection()
+        self._check_and_download_model(backend, model_name, quant)
+
+    def _get_stt_dependency_error(self, backend: str) -> Optional[str]:
+        if backend == "qwen3_asr":
+            try:
+                import qwen_asr  # noqa: F401
+                return None
+            except ImportError:
+                return (
+                    "qwen-asr 패키지가 없습니다.\n"
+                    "터미널에서 'pip install qwen-asr' 실행 후 앱을 재시작하세요."
+                )
+
+        try:
+            import mlx_whisper  # noqa: F401
+            return None
+        except ImportError:
+            return (
+                "mlx_whisper 패키지가 없습니다.\n"
+                "터미널에서 'pip install mlx-whisper' 실행 후 앱을 재시작하세요."
+            )
 
     def _validate_openai_model(self):
         import openai
@@ -235,19 +315,38 @@ class AutoMeetingNoteApp(rumps.App):
         except Exception as e:
             logger.warning("OpenAI 모델 검증 실패: %s", e)
 
-    def _check_and_download_model(self, model_name: str, quant: str):
-        from transcriber import MODEL_REPOS
-        variants = MODEL_REPOS.get(model_name, {})
-        repo = variants.get(quant if quant in variants else "base", "")
+    def _save_config(self):
+        CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
+
+    def _get_current_stt_selection(self) -> tuple[str, str, Optional[str]]:
+        backend = self._config.get("stt_backend", DEFAULT_STT_BACKEND)
+        if backend == "qwen3_asr":
+            return backend, self._config.get("qwen_model", DEFAULT_QWEN_MODEL), None
+        return (
+            "whisper",
+            self._config.get("whisper_model", DEFAULT_WHISPER_MODEL),
+            self._config.get("whisper_quant", DEFAULT_WHISPER_QUANT),
+        )
+
+    def _get_model_menu_title(self) -> str:
+        backend, model_name, quant = self._get_current_stt_selection()
+        backend_label = get_backend_label(backend)
+        model_label = get_model_display_name(backend, model_name, quant)
+        return f"STT 모델: {backend_label} / {model_label}"
+
+    def _check_and_download_model(self, backend: str, model_name: str, quant: Optional[str]):
+        repo = get_model_download_repo(backend, model_name, quant)
         if not repo:
             return
         cache_dir_name = "models--" + repo.replace("/", "--")
         hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
         model_cache = hf_home / "hub" / cache_dir_name
         if not model_cache.exists():
+            backend_label = get_backend_label(backend)
+            model_label = get_model_display_name(backend, model_name, quant)
             resp = rumps.alert(
                 title="모델 다운로드",
-                message=f"Whisper 모델 {model_name} ({quant})을 다운로드하시겠습니까?\n(수백 MB ~ 수 GB, 시간이 걸릴 수 있습니다)",
+                message=f"{backend_label} 모델 {model_label}을 다운로드하시겠습니까?\n(수백 MB ~ 수 GB, 시간이 걸릴 수 있습니다)",
                 ok="다운로드",
                 cancel="취소",
             )
@@ -275,17 +374,43 @@ class AutoMeetingNoteApp(rumps.App):
 
     def _notify(self, title: str, subtitle: str = "", message: str = ""):
         """rumps.notification 실패 시 osascript로 fallback."""
+        title = (title or "AutoMeetingNote").strip() or "AutoMeetingNote"
+        subtitle = (subtitle or "").strip()
+        message = (message or "").strip() or title
+
         try:
             rumps.notification(title=title, subtitle=subtitle, message=message)
+            return
         except Exception as e:
             logger.warning("rumps 알림 실패, osascript 사용: %s", e)
-            try:
-                parts = [f'display notification "{message}" with title "{title}"']
-                if subtitle:
-                    parts = [f'display notification "{message}" with title "{title}" subtitle "{subtitle}"']
-                subprocess.run(["osascript", "-e", parts[0]], timeout=5, check=False)
-            except Exception as e2:
-                logger.error("알림 전송 실패: %s", e2)
+
+        script = """
+        on run argv
+            set notificationTitle to item 1 of argv
+            set notificationSubtitle to item 2 of argv
+            set notificationMessage to item 3 of argv
+            if notificationSubtitle is "" then
+                display notification notificationMessage with title notificationTitle
+            else
+                display notification notificationMessage with title notificationTitle subtitle notificationSubtitle
+            end if
+        end run
+        """
+        try:
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-e", script, title, subtitle, message],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            if result.stderr and result.stderr.strip():
+                logger.warning("osascript 알림 경고: %s", result.stderr.strip())
+        except subprocess.CalledProcessError as e:
+            detail = (e.stderr or e.stdout or "").strip() or str(e)
+            logger.error("알림 전송 실패: %s", detail)
+        except Exception as e:
+            logger.error("알림 전송 실패: %s", e)
 
     def _cancel_download(self, _):
         self._download_stop_event.set()
@@ -307,30 +432,42 @@ class AutoMeetingNoteApp(rumps.App):
         logger.info("사용자가 처리를 중단했습니다")
 
     def _build_model_menu(self) -> rumps.MenuItem:
-        from transcriber import MODEL_REPOS
-        current_model = self._config.get("whisper_model", "small")
-        current_quant = self._config.get("whisper_quant", "4bit")
+        current_backend, current_model, current_quant = self._get_current_stt_selection()
 
-        model_menu = rumps.MenuItem(f"STT 모델: {current_model} ({current_quant})")
-        for model_name in MODEL_REPOS:
+        model_menu = rumps.MenuItem(self._get_model_menu_title())
+
+        whisper_menu = rumps.MenuItem("Whisper (MLX)")
+        for model_name in WHISPER_MODEL_REPOS:
             sub = rumps.MenuItem(model_name)
             for quant in ["4bit", "base", "8bit"]:
-                item = rumps.MenuItem(quant, callback=self._make_model_callback(model_name, quant))
-                item.state = 1 if (model_name == current_model and quant == current_quant) else 0
-                self._model_menu_items[(model_name, quant)] = item
+                item = rumps.MenuItem(quant, callback=self._make_model_callback("whisper", model_name, quant))
+                item.state = 1 if (
+                    current_backend == "whisper" and model_name == current_model and quant == current_quant
+                ) else 0
+                self._model_menu_items[("whisper", model_name, quant)] = item
                 sub.add(item)
-            model_menu.add(sub)
+            whisper_menu.add(sub)
+        model_menu.add(whisper_menu)
+
+        qwen_menu = rumps.MenuItem("Qwen3-ASR")
+        for label, repo in QWEN_MODEL_REPOS.items():
+            item = rumps.MenuItem(label, callback=self._make_model_callback("qwen3_asr", repo, None))
+            item.state = 1 if current_backend == "qwen3_asr" and current_model == repo else 0
+            self._model_menu_items[("qwen3_asr", repo, None)] = item
+            qwen_menu.add(item)
+        model_menu.add(qwen_menu)
+
         return model_menu
 
     def _toggle_mic(self, sender):
         sender.state = not sender.state
         self._config["mic_enabled"] = bool(sender.state)
-        CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
+        self._save_config()
 
     def _toggle_stt_skip(self, sender):
         sender.state = not sender.state
         self._config["stt_skip"] = bool(sender.state)
-        CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
+        self._save_config()
 
     def _build_preprocess_menu(self) -> rumps.MenuItem:
         menu = rumps.MenuItem("전처리 설정")
@@ -350,7 +487,7 @@ class AutoMeetingNoteApp(rumps.App):
             current = self._config.get(key, True)
             self._config[key] = not current
             sender.state = 1 if self._config[key] else 0
-            CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
+            self._save_config()
             logger.info("전처리 설정 변경: %s = %s", key, self._config[key])
         return _toggle
 
@@ -422,9 +559,7 @@ class AutoMeetingNoteApp(rumps.App):
                     from copy import deepcopy
                     self._config["hotkeys"] = deepcopy(DEFAULT_HOTKEYS)
                 self._config["hotkeys"][action] = {"mod": mod, "key": keycode}
-                CONFIG_PATH.write_text(
-                    yaml.dump(self._config, allow_unicode=True), encoding="utf-8"
-                )
+                self._save_config()
 
                 self._hotkey_manager.update_binding(action, mod, keycode)
                 self._hotkey_items[action].title = f"{label}: {display}"
@@ -450,9 +585,7 @@ class AutoMeetingNoteApp(rumps.App):
     def _reset_hotkeys(self, _sender):
         from copy import deepcopy
         self._config["hotkeys"] = deepcopy(DEFAULT_HOTKEYS)
-        CONFIG_PATH.write_text(
-            yaml.dump(self._config, allow_unicode=True), encoding="utf-8"
-        )
+        self._save_config()
 
         for action, hk in DEFAULT_HOTKEYS.items():
             self._hotkey_manager.update_binding(action, hk["mod"], hk["key"])
@@ -462,17 +595,25 @@ class AutoMeetingNoteApp(rumps.App):
         logger.info("단축키 초기화")
         rumps.alert(title="단축키 초기화", message="모든 단축키가 기본값으로 초기화되었습니다.")
 
-    def _make_model_callback(self, model_name: str, quant: str):
+    def _make_model_callback(self, backend: str, model_name: str, quant: Optional[str]):
         def _select(_sender):
             for item in self._model_menu_items.values():
                 item.state = 0
-            self._model_menu_items[(model_name, quant)].state = 1
-            self._model_menu.title = f"STT 모델: {model_name} ({quant})"
-            self._config["whisper_model"] = model_name
-            self._config["whisper_quant"] = quant
-            CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
-            logger.info("STT 모델 변경: %s (%s)", model_name, quant)
-            self._check_and_download_model(model_name, quant)
+            self._model_menu_items[(backend, model_name, quant)].state = 1
+            self._config["stt_backend"] = backend
+            if backend == "qwen3_asr":
+                self._config["qwen_model"] = model_name
+            else:
+                self._config["whisper_model"] = model_name
+                self._config["whisper_quant"] = quant or DEFAULT_WHISPER_QUANT
+            self._model_menu.title = self._get_model_menu_title()
+            self._save_config()
+            logger.info("STT 모델 변경: backend=%s, model=%s, quant=%s", backend, model_name, quant)
+            stt_dependency_error = self._get_stt_dependency_error(backend)
+            if stt_dependency_error:
+                rumps.alert(title="설정 오류", message=stt_dependency_error)
+                return
+            self._check_and_download_model(backend, model_name, quant)
         return _select
 
     def _download_model(self, repo: str, model_cache: Path, hf_home: Path, stop_event: threading.Event):
@@ -509,7 +650,7 @@ class AutoMeetingNoteApp(rumps.App):
 
             logger.info("모델 다운로드 완료: %s", repo)
             self._on_status(f"✅ 모델 다운로드 완료: {repo}")
-            self._notify("모델 다운로드 완료", repo, "Whisper 모델 준비가 완료되었습니다.")
+            self._notify("모델 다운로드 완료", repo, "STT 모델 준비가 완료되었습니다.")
         except Exception as e:
             logger.error("모델 다운로드 실패: %s — %s", repo, e)
             self._on_status(f"❌ 모델 다운로드 실패: {repo}")
@@ -795,13 +936,25 @@ class AutoMeetingNoteApp(rumps.App):
         stt_skip = self._config.get("stt_skip", False)
         try:
             if mode == "screen":
-                self._on_status("녹화 파일 압축 중...")
-                mp4_path = self._recorder.compress_and_merge(
-                    output_path, audio_path,
-                    mic_path=mic_path,
-                    audio_offset=audio_offset,
-                    progress_callback=self._on_status,
-                )
+                if Path(output_path).suffix.lower() == ".mp4":
+                    if audio_path or mic_path:
+                        self._on_status("녹화 오디오 병합 중...")
+                        mp4_path = self._recorder.merge_audio_into_mp4(
+                            Path(output_path),
+                            audio_path,
+                            mic_path=mic_path,
+                            audio_offset=audio_offset,
+                        )
+                    else:
+                        mp4_path = Path(output_path)
+                else:
+                    self._on_status("녹화 파일 압축 중...")
+                    mp4_path = self._recorder.compress_and_merge(
+                        output_path, audio_path,
+                        mic_path=mic_path,
+                        audio_offset=audio_offset,
+                        progress_callback=self._on_status,
+                    )
                 self._notify("AutoMeetingNote", "녹화 완료", mp4_path.name)
                 if stt_skip:
                     self._on_status(f"✅ 녹화 완료 (STT 건너뜀): {mp4_path.name}")
@@ -837,22 +990,36 @@ class AutoMeetingNoteApp(rumps.App):
             self._schedule_title_reset(5)
 
     def _confirm_on_main(self, message: str) -> bool:
-        """백그라운드 스레드에서 호출해도 메인 스레드에서 안전하게 dialog를 표시."""
-        result = [False]
-        done = threading.Event()
-
-        def _ask(_timer):
-            _timer.stop()  # 재진입 방지: alert 실행 전에 타이머 중단
-            try:
-                result[0] = rumps.alert(title="확인", message=message, ok="예", cancel="아니오") == 1
-            except Exception as e:
-                logger.error("confirm dialog 오류: %s", e)
-            finally:
-                done.set()
-
-        rumps.Timer(_ask, 0.0).start()
-        done.wait(timeout=60)  # 60초 타임아웃 (무한 블록 방지)
-        return result[0]
+        """회의록 생성 여부 확인. 메뉴바 앱에서는 osascript가 더 안정적이다."""
+        script = (
+            "on run argv\n"
+            "set dialogMessage to item 1 of argv\n"
+            "tell application \"System Events\"\n"
+            "activate\n"
+            "set dialogResult to display dialog dialogMessage with title \"확인\" "
+            "buttons {\"아니오\", \"예\"} default button \"예\" cancel button \"아니오\"\n"
+            "return button returned of dialogResult\n"
+            "end tell\n"
+            "end run"
+        )
+        try:
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-e", script, message],
+                capture_output=True,
+                text=True,
+            )
+            stdout = (result.stdout or "").strip()
+            stderr = (result.stderr or "").strip()
+            if result.returncode == 0:
+                return stdout == "예"
+            if stderr:
+                logger.warning("confirm dialog osascript 경고: %s", stderr)
+            else:
+                logger.warning("confirm dialog osascript 비정상 종료: rc=%s", result.returncode)
+            return False
+        except Exception as e:
+            logger.error("confirm dialog 오류: %s", e)
+            return False
 
     def _run_files_sequentially(self, paths: list):
         for path in paths:

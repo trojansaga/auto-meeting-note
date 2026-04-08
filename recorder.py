@@ -1,7 +1,6 @@
 import logging
 import os
 import re
-import signal
 import subprocess
 import threading
 import time
@@ -10,13 +9,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from audio_extractor import find_ffmpeg
+from live_screen_writer import LiveScreenWriter
 
 logger = logging.getLogger(__name__)
 
 
 class Recorder:
     def __init__(self):
-        self._screen_process: Optional[subprocess.Popen] = None  # screencapture
+        self._screen_writer: Optional[LiveScreenWriter] = None
         self._mic_process: Optional[subprocess.Popen] = None     # ffmpeg 마이크
         self._sys_audio = None                                    # SystemAudioCapture (화면 녹화 + 녹음 공용)
         self._mode: Optional[str] = None  # "screen" | "audio"
@@ -38,7 +38,7 @@ class Recorder:
     @property
     def is_recording(self) -> bool:
         if self._mode == "screen":
-            return self._screen_process is not None and self._screen_process.poll() is None
+            return self._screen_writer is not None and self._screen_writer.is_running
         if self._mode == "audio":
             return self._sys_audio is not None
         return False
@@ -116,7 +116,7 @@ class Recorder:
             self._mic_device_index = mic_device_index
             self._base_ts = ts
 
-            mov_path = output_dir / f"{ts}_녹화.mov"
+            mp4_path = output_dir / f"{ts}_녹화.mp4"
             audio_path = output_dir / f"{ts}_녹화_sys.wav"
 
             # 1) SCStream: 시스템 오디오 캡처 (블로킹, ~1초 소요)
@@ -133,26 +133,21 @@ class Recorder:
             else:
                 self._mic_path = None
 
-            # 3) screencapture: 영상 캡처 (stdin=PIPE 필수, DEVNULL이면 즉시 종료)
-            sc_cmd = ["/usr/sbin/screencapture", "-v", str(mov_path)]
+            # 3) SCStream + AVAssetWriter: 실시간 화면 인코딩
+            self._screen_writer = LiveScreenWriter()
             screen_start_time = time.time()
-            logger.info("화면 녹화 시작: %s", mov_path.name)
-            self._screen_process = subprocess.Popen(
-                sc_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            logger.info("화면 녹화 시작: %s", mp4_path.name)
+            self._screen_writer.start(mp4_path)
 
             # 오디오(sys_audio_ready_time)와 영상(screen_start_time)의 시작 차이만큼 trim
             # t_before_sys 기준이 아닌 실제 오디오 기록 시작 시점 기준
             self._audio_offset = screen_start_time - sys_audio_ready_time
 
             self._mode = "screen"
-            self._output_path = mov_path
+            self._output_path = mp4_path
             self._audio_path = audio_path
             self._start_time = screen_start_time
-            return mov_path
+            return mp4_path
 
     def start_audio_recording(
         self, output_dir: Path, mic_enabled: bool = True, mic_device_index: str = "0"
@@ -191,29 +186,12 @@ class Recorder:
     def _stop_current_processes(self) -> None:
         """현재 실행 중인 프로세스 중지. _lock 보유 상태에서 호출."""
         if self._mode == "screen":
-            if self._screen_process is not None:
+            if self._screen_writer is not None:
                 try:
-                    if self._screen_process.poll() is None:
-                        try:
-                            self._screen_process.stdin.write(b"\n")
-                            self._screen_process.stdin.flush()
-                        except OSError:
-                            os.kill(self._screen_process.pid, signal.SIGINT)
-                    self._screen_process.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    self._screen_process.kill()
-                    self._screen_process.wait()
+                    self._screen_writer.stop()
                 except Exception as e:
-                    logger.error("screencapture 중지 오류: %s", e)
-                sc_stderr = b""
-                try:
-                    sc_stderr = self._screen_process.stderr.read()
-                except Exception:
-                    pass
-                rc = self._screen_process.returncode
-                if rc != 0 or sc_stderr:
-                    logger.warning("screencapture 종료 (exit=%s) stderr: %s", rc, sc_stderr.decode(errors="replace").strip())
-                self._screen_process = None
+                    logger.error("화면 writer 중지 오류: %s", e)
+                self._screen_writer = None
 
             if self._sys_audio is not None:
                 try:
@@ -260,7 +238,7 @@ class Recorder:
             ts = self._base_ts
 
             if self._mode == "screen":
-                mov_path = self._output_dir / f"{ts}_녹화_seg{seg}.mov"
+                mp4_path = self._output_dir / f"{ts}_녹화_seg{seg}.mp4"
                 audio_path = self._output_dir / f"{ts}_녹화_sys_seg{seg}.wav"
 
                 self._sys_audio = SystemAudioCapture()
@@ -275,17 +253,12 @@ class Recorder:
                 else:
                     self._mic_path = None
 
-                sc_cmd = ["/usr/sbin/screencapture", "-v", str(mov_path)]
+                self._screen_writer = LiveScreenWriter()
                 screen_start_time = time.time()
-                logger.info("재개: 화면 녹화 시작: %s", mov_path.name)
-                self._screen_process = subprocess.Popen(
-                    sc_cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                logger.info("재개: 화면 녹화 시작: %s", mp4_path.name)
+                self._screen_writer.start(mp4_path)
                 self._audio_offset = screen_start_time - sys_audio_ready_time
-                self._output_path = mov_path
+                self._output_path = mp4_path
                 self._audio_path = audio_path
 
             elif self._mode == "audio":
@@ -366,6 +339,21 @@ class Recorder:
         if result.returncode != 0:
             raise RuntimeError(f"세그먼트 합치기 실패: {out_path.name}")
 
+    @staticmethod
+    def _software_video_codec_args() -> list[str]:
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+
+    def _with_software_video_encoder(self, cmd: list[str]) -> list[str]:
+        pattern = ["-c:v", "h264_videotoolbox", "-q:v", "60"]
+        for idx in range(len(cmd) - len(pattern) + 1):
+            if cmd[idx:idx + len(pattern)] == pattern:
+                return [
+                    *cmd[:idx],
+                    *self._software_video_codec_args(),
+                    *cmd[idx + len(pattern):],
+                ]
+        return cmd
+
     def _concat_segments(self, mode: str, segments: list) -> tuple:
         """여러 세그먼트 파일을 하나로 합쳐 (output_path, audio_path, mic_path, offset) 반환."""
         ffmpeg_bin = find_ffmpeg()
@@ -377,7 +365,8 @@ class Recorder:
         parent = segments[0][0].parent
 
         if mode == "screen":
-            final_mov = parent / f"{ts}_녹화.mov"
+            video_ext = segments[0][0].suffix if segments[0][0] else ".mov"
+            final_mov = parent / f"{ts}_녹화{video_ext}"
             final_sys = parent / f"{ts}_녹화_sys.wav"
             final_mic = parent / f"{ts}_녹화_mic.wav"
 
@@ -422,10 +411,11 @@ class Recorder:
             )
 
         elif mode == "audio":
+            parent = segments[0][0].parent
             final_sys = parent / f"{ts}_녹음_sys.wav"
             final_mic = parent / f"{ts}_녹음_mic.wav"
 
-            sys_paths = [seg[1] for seg in segments if seg[1] and seg[1].exists() and seg[1].stat().st_size > 44]
+            sys_paths = [seg[0] for seg in segments if seg[0] and seg[0].exists() and seg[0].stat().st_size > 44]
             mic_paths = [seg[2] for seg in segments if seg[2] and seg[2].exists() and seg[2].stat().st_size > 44]
 
             if sys_paths:
@@ -433,8 +423,8 @@ class Recorder:
             if mic_paths:
                 self._concat_files(ffmpeg_bin, mic_paths, final_mic)
 
-            for _, audio_path, mic_path, _ in segments:
-                for f in [audio_path, mic_path]:
+            for out_path, _, mic_path, _ in segments:
+                for f in [out_path, mic_path]:
                     if f and f.exists() and f not in (final_sys, final_mic):
                         try:
                             f.unlink()
@@ -442,8 +432,8 @@ class Recorder:
                             pass
 
             return (
-                None,
                 final_sys if sys_paths else None,
+                None,
                 final_mic if mic_paths else None,
                 0.0,
             )
@@ -578,42 +568,54 @@ class Recorder:
             ]
             logger.info("오디오 없음 — 무음 트랙으로 압축: %s", mov_path.name)
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
+        def _run_ffmpeg(ffmpeg_cmd: list[str]) -> tuple[int, list[str]]:
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
 
-        total_duration: Optional[float] = None
-        dur_pat = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
-        time_pat = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
-        stderr_lines: list = []
+            total_duration: Optional[float] = None
+            dur_pat = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
+            time_pat = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+            stderr_lines: list[str] = []
 
-        for line in process.stderr:
-            line = line.strip()
-            if not line:
-                continue
-            stderr_lines.append(line)
-            if len(stderr_lines) > 100:
-                stderr_lines.pop(0)
-            if total_duration is None:
-                m = dur_pat.search(line)
-                if m:
-                    total_duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-            if progress_callback and total_duration:
-                m = time_pat.search(line)
-                if m:
-                    t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-                    pct = min(t / total_duration * 100, 99)
-                    progress_callback(f"녹화 파일 압축 중... {pct:.0f}%")
+            for line in process.stderr:
+                line = line.strip()
+                if not line:
+                    continue
+                stderr_lines.append(line)
+                if len(stderr_lines) > 100:
+                    stderr_lines.pop(0)
+                if total_duration is None:
+                    m = dur_pat.search(line)
+                    if m:
+                        total_duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                if progress_callback and total_duration:
+                    m = time_pat.search(line)
+                    if m:
+                        t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                        pct = min(t / total_duration * 100, 99)
+                        progress_callback(f"녹화 파일 압축 중... {pct:.0f}%")
 
-        process.wait()
+            process.wait()
+            return process.returncode, stderr_lines
 
-        if process.returncode != 0:
-            logger.error("ffmpeg 실패 (exit=%d) 마지막 로그:\n%s", process.returncode, "\n".join(stderr_lines[-20:]))
-            raise RuntimeError(f"압축 실패 (exit code {process.returncode})")
+        returncode, stderr_lines = _run_ffmpeg(cmd)
+
+        if returncode != 0 and "h264_videotoolbox" in cmd:
+            logger.warning(
+                "videotoolbox 인코더 실패, libx264로 재시도합니다 (exit=%d)",
+                returncode,
+            )
+            fallback_cmd = self._with_software_video_encoder(cmd)
+            returncode, stderr_lines = _run_ffmpeg(fallback_cmd)
+
+        if returncode != 0:
+            logger.error("ffmpeg 실패 (exit=%d) 마지막 로그:\n%s", returncode, "\n".join(stderr_lines[-20:]))
+            raise RuntimeError(f"압축 실패 (exit code {returncode})")
 
         if progress_callback:
             progress_callback("녹화 파일 압축 완료 (100%)")
@@ -627,4 +629,66 @@ class Recorder:
                     logger.warning("임시 파일 삭제 실패: %s", e)
 
         logger.info("압축 완료: %s", mp4_path.name)
+        return mp4_path
+
+    def merge_audio_into_mp4(
+        self,
+        mp4_path: Path,
+        audio_path: Optional[Path],
+        mic_path: Optional[Path] = None,
+        audio_offset: float = 0.0,
+    ) -> Path:
+        ffmpeg_bin = find_ffmpeg()
+        if not ffmpeg_bin:
+            raise EnvironmentError("ffmpeg가 설치되어 있지 않습니다.")
+
+        has_sys = audio_path and audio_path.exists() and audio_path.stat().st_size > 44
+        has_mic = mic_path and mic_path.exists() and mic_path.stat().st_size > 44
+        if not has_sys and not has_mic:
+            return mp4_path
+        if not mp4_path.exists() or mp4_path.stat().st_size == 0:
+            raise RuntimeError(f"화면 녹화 파일이 비어 있습니다: {mp4_path.name}")
+
+        temp_path = mp4_path.with_name(mp4_path.stem + "_mux.mp4")
+        ss = ["-ss", f"{audio_offset:.3f}"] if audio_offset > 0.05 else []
+
+        if has_sys and has_mic:
+            cmd = [
+                ffmpeg_bin,
+                "-i", str(mp4_path),
+                *ss, "-i", str(audio_path),
+                *ss, "-i", str(mic_path),
+                "-filter_complex", "amix=inputs=2:duration=longest:normalize=0[aout]",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-map", "0:v:0", "-map", "[aout]",
+                "-shortest",
+                "-y", str(temp_path),
+            ]
+        else:
+            source = audio_path if has_sys else mic_path
+            cmd = [
+                ffmpeg_bin,
+                "-i", str(mp4_path),
+                *ss, "-i", str(source),
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-shortest",
+                "-y", str(temp_path),
+            ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            if stderr:
+                logger.error("오디오 병합 ffmpeg stderr:\n%s", stderr)
+            raise RuntimeError("오디오 병합 실패")
+
+        mp4_path.unlink(missing_ok=True)
+        temp_path.rename(mp4_path)
+        for path in (audio_path, mic_path):
+            if path and path.exists():
+                path.unlink(missing_ok=True)
+        logger.info("실시간 녹화 오디오 병합 완료: %s", mp4_path.name)
         return mp4_path

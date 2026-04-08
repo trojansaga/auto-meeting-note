@@ -4,7 +4,10 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from threading import Event
 from typing import Callable, Optional
+
+from cancellation import OperationCancelledError
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +47,7 @@ def extract_audio(
     mp4_path: str,
     output_path: str,
     progress_callback: Optional[Callable[[str], None]] = None,
+    stop_event: Optional[Event] = None,
 ) -> str:
     ffmpeg_bin = find_ffmpeg()
     if not ffmpeg_bin:
@@ -82,6 +86,18 @@ def extract_audio(
     total_duration: Optional[float] = None
 
     for line in process.stderr:
+        if stop_event is not None and stop_event.is_set():
+            logger.info("음성 추출 중단 요청: %s", mp4.name)
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            if output.exists():
+                output.unlink(missing_ok=True)
+            raise OperationCancelledError("음성 추출이 중단되었습니다.")
+
         line = line.strip()
         if not line:
             continue
@@ -98,6 +114,11 @@ def extract_audio(
                 progress_callback(f"[2/5] 음성 추출 중... {pct:.0f}%")
 
     process.wait()
+
+    if stop_event is not None and stop_event.is_set():
+        if output.exists():
+            output.unlink(missing_ok=True)
+        raise OperationCancelledError("음성 추출이 중단되었습니다.")
 
     if process.returncode != 0:
         raise RuntimeError(f"ffmpeg 실행 실패 (exit code {process.returncode})")

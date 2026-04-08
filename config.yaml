@@ -1,7 +1,17 @@
 watch_dir: "~/Desktop"
+stt_backend: "whisper"
 whisper_model: "small"
 whisper_quant: "4bit"
 whisper_batch_size: 4
+qwen_model: "Qwen/Qwen3-ASR-0.6B"
+qwen_dtype: null
+qwen_device_map: null
+qwen_attn_implementation: null
+qwen_forced_aligner: null
+qwen_return_timestamps: false
+qwen_max_new_tokens: 4096
+qwen_max_batch_size: 1
+qwen_chunk_seconds: 600
 language: "ko"
 openai_model: "gpt-5.4"
 export_dir: "~/Downloads"

@@ -20,6 +20,12 @@ mkdir -p "$MACOS" "$RESOURCES"
 
 VENV_REAL="$(cd "$SCRIPT_DIR/.venv" && pwd -P)"
 
+# 샌드박스/권한 이슈를 피하기 위해 Swift/Clang 모듈 캐시를 쓰기 가능한 임시 경로로 고정
+SWIFT_CACHE_DIR="${TMPDIR:-/tmp}/AutoMeetingNoteSwiftModuleCache"
+mkdir -p "$SWIFT_CACHE_DIR"
+export SWIFT_MODULECACHE_PATH="$SWIFT_CACHE_DIR"
+export CLANG_MODULE_CACHE_PATH="$SWIFT_CACHE_DIR"
+
 # Swift 런처 소스 작성
 SWIFT_SRC="$SCRIPT_DIR/.build_launcher.swift"
 cat > "$SWIFT_SRC" << 'SWIFT_EOF'
@@ -39,9 +45,29 @@ guard let resourcesPath = Bundle.main.resourcePath else {
 let venvFile = URL(fileURLWithPath: resourcesPath).appendingPathComponent(".venv_path").path
 var pythonPath = "/usr/bin/python3"
 if let venv = try? String(contentsOfFile: venvFile, encoding: .utf8) {
-    let candidate = URL(fileURLWithPath: venv.trimmingCharacters(in: .whitespacesAndNewlines))
-        .appendingPathComponent("bin/python3").path
-    if FileManager.default.isExecutableFile(atPath: candidate) { pythonPath = candidate }
+    let venvRoot = URL(fileURLWithPath: venv.trimmingCharacters(in: .whitespacesAndNewlines))
+    let candidates = [
+        venvRoot.appendingPathComponent("bin/python3.11").path,
+        venvRoot.appendingPathComponent("bin/python3").path,
+        venvRoot.appendingPathComponent("bin/python").path,
+    ]
+    if let realPythonPath = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+        let runtimeDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/AutoMeetingNote/runtime", isDirectory: true)
+        try? FileManager.default.createDirectory(at: runtimeDir, withIntermediateDirectories: true, attributes: nil)
+
+        let runtimePythonPath = runtimeDir.appendingPathComponent("AutoMeetingNote").path
+        if FileManager.default.fileExists(atPath: runtimePythonPath) {
+            try? FileManager.default.removeItem(atPath: runtimePythonPath)
+        }
+
+        let symlinkCreated = (try? FileManager.default.createSymbolicLink(atPath: runtimePythonPath, withDestinationPath: realPythonPath)) != nil
+        if symlinkCreated && FileManager.default.isExecutableFile(atPath: runtimePythonPath) {
+            pythonPath = runtimePythonPath
+        } else {
+            pythonPath = realPythonPath
+        }
+    }
 }
 
 let appScript = URL(fileURLWithPath: resourcesPath).appendingPathComponent("app.py").path
@@ -80,7 +106,7 @@ echo "컴파일 완료"
 
 echo "$VENV_REAL" > "$RESOURCES/.venv_path"
 
-for f in app.py hotkey_manager.py pipeline.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py config.yaml dictionary.txt; do
+for f in app.py hotkey_manager.py pipeline.py cancellation.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py live_screen_writer.py config.yaml dictionary.txt; do
     cp "$SCRIPT_DIR/$f" "$RESOURCES/"
 done
 
@@ -119,6 +145,8 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
+    <key>CFBundleIconName</key>
     <string>AppIcon</string>
     <key>NSUserNotificationAlertStyle</key>
     <string>alert</string>
@@ -129,6 +157,8 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
 </dict>
 </plist>
 PLIST
+
+touch "$CONTENTS/Info.plist" "$APP_DIR"
 
 echo ""
 echo "=== 빌드 완료 ==="

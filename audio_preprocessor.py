@@ -1,9 +1,12 @@
 import logging
 from pathlib import Path
+from threading import Event
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
+
+from cancellation import OperationCancelledError
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +94,7 @@ def preprocess_audio(
     noise_reduce: bool = True,
     vad: bool = True,
     normalize: bool = True,
+    stop_event: Optional[Event] = None,
 ) -> str:
     """
     오디오 전처리 파이프라인 (각 단계 개별 활성화 가능):
@@ -103,6 +107,10 @@ def preprocess_audio(
         if progress_callback:
             progress_callback(msg)
 
+    def _check_stop():
+        if stop_event is not None and stop_event.is_set():
+            raise OperationCancelledError("오디오 전처리가 중단되었습니다.")
+
     steps = []
     if noise_reduce:
         steps.append("노이즈 제거")
@@ -114,9 +122,11 @@ def preprocess_audio(
     if not steps:
         logger.info("전처리 비활성화 — 원본 파일 그대로 사용")
         import shutil
+        _check_stop()
         shutil.copy2(wav_path, output_path)
         return output_path
 
+    _check_stop()
     _notify(f"[3/6] 오디오 로드 중... ({', '.join(steps)})")
     audio, sr = sf.read(wav_path, dtype="float32")
     if audio.ndim > 1:
@@ -126,12 +136,14 @@ def preprocess_audio(
 
     # 1. 배경 노이즈 제거
     if noise_reduce:
+        _check_stop()
         import noisereduce as nr
         _notify("[3/6] 배경 노이즈 제거 중...")
         audio = nr.reduce_noise(y=audio, sr=sr, stationary=False, prop_decrease=0.75)
 
     # 2. 침묵 구간 제거 (VAD)
     if vad:
+        _check_stop()
         _notify("[3/6] 침묵 구간 감지 중...")
         segments = _energy_vad(audio, sr)
         logger.info("음성 구간 감지: %d개", len(segments))
@@ -147,10 +159,12 @@ def preprocess_audio(
 
         # 3. 음량 정규화
         if normalize:
+            _check_stop()
             _notify("[3/6] 화자 음량 정규화 중...")
             audio = _normalize_segments(audio, segments)
 
         # 음성 구간만 이어 붙이기 (구간 사이 0.3초 침묵 삽입 — Whisper 구간 인식 보조)
+        _check_stop()
         silence_gap = np.zeros(int(sr * 0.3), dtype=np.float32)
         parts = []
         for s, e in segments:
@@ -173,10 +187,12 @@ def preprocess_audio(
     else:
         # VAD 없이 음량 정규화만
         if normalize:
+            _check_stop()
             _notify("[3/6] 화자 음량 정규화 중...")
             full_seg = [(0, len(audio))]
             audio = _normalize_segments(audio, full_seg)
 
+        _check_stop()
         _notify(f"[3/6] 전처리 완료: {original_duration:.0f}초")
         sf.write(output_path, audio, sr)
 

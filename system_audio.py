@@ -85,6 +85,14 @@ _cm_lib.CMSampleBufferGetNumSamples.restype = ctypes.c_long
 _cm_lib.CMSampleBufferGetNumSamples.argtypes = [ctypes.c_void_p]
 
 
+def _sample_buffer_pointer(sample_buffer) -> int:
+    """PyObjC가 넘기는 CMSampleBuffer 표현을 raw 포인터로 정규화."""
+    ptr = getattr(sample_buffer, 'pointerAsInteger', None)
+    if ptr is not None:
+        return int(ptr() if callable(ptr) else ptr)
+    return int(objc.pyobjc_id(sample_buffer))
+
+
 class _AudioDelegate(objc.lookUpClass('NSObject')):
     __protocols__ = _DELEGATE_PROTOCOLS
     def init(self):
@@ -119,7 +127,10 @@ class _AudioDelegate(objc.lookUpClass('NSObject')):
 
         self._call_count += 1
         if self._call_count == 1:
-            _flog(f"delegate called! output_type={output_type}")
+            _flog(
+                f"delegate called! output_type={output_type}, "
+                f"sample_buffer_type={type(sample_buffer).__name__}"
+            )
 
         if output_type != _SCStreamOutputTypeAudio:
             return
@@ -127,8 +138,7 @@ class _AudioDelegate(objc.lookUpClass('NSObject')):
             return
 
         try:
-            # sample_buffer는 objc.PyObjCPointer → .pointerAsInteger로 raw 주소 획득
-            sb_ptr = sample_buffer.pointerAsInteger
+            sb_ptr = _sample_buffer_pointer(sample_buffer)
 
             num_samples = _cm_lib.CMSampleBufferGetNumSamples(sb_ptr)
             if self._call_count <= 3:
@@ -170,7 +180,7 @@ class _AudioDelegate(objc.lookUpClass('NSObject')):
                     self._bytes_written += len(interleaved)
 
         except Exception as e:
-            _flog(f"오디오 버퍼 처리 오류: {e}")
+            _flog(f"오디오 버퍼 처리 오류: {e} (sample_buffer_type={type(sample_buffer).__name__})")
             logger.debug("오디오 버퍼 처리 오류: %s", e)
 
     stream_didOutputSampleBuffer_ofType_ = objc.selector(
@@ -267,7 +277,10 @@ class SystemAudioCapture:
     def stop(self) -> None:
         self._delegate.closeFile()
         if self._stream:
-            self._stream.stopCaptureWithCompletionHandler_(lambda e: None)
+            try:
+                self._stream.stopCaptureWithCompletionHandler_(None)
+            except Exception as e:
+                _flog(f"stopCapture callback registration failed: {e}")
             self._stream = None
         logger.info("시스템 오디오 캡처 중지")
         _flog("SystemAudioCapture stopped")
