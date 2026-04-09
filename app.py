@@ -1035,6 +1035,7 @@ class AutoMeetingNoteApp(rumps.App):
         self._pipeline_step = (0, 0)
         self._pipeline_base_msg = ""
         self._pipeline_running = True
+        self._config = load_config()
         try:
             run_pipeline(
                 path,
