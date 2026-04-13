@@ -16,5 +16,6 @@ language: "ko"
 openai_model: "gpt-5.4"
 export_dir: "~/Downloads"
 mic_enabled: false       # 마이크 동시 녹음 여부 (시스템 오디오와 믹싱됨)
-mic_device_index: "0"   # 마이크 장치 인덱스 (0=기본 마이크, iPhone 연결 시 해당 인덱스)
-                         # 장치 목록 확인: ffmpeg -f avfoundation -list_devices true -i ""
+mic_device_index: "builtin"   # "builtin"이면 맥북 내장 마이크를 우선 사용
+                              # 이름/인덱스를 직접 넣을 수도 있음
+                              # 장치 목록 확인: ffmpeg -f avfoundation -list_devices true -i ""

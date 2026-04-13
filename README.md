@@ -69,7 +69,7 @@ language: "ko"                   # STT 언어
 openai_model: "gpt-5.4"         # 회의록 생성 모델
 export_dir: "~/Downloads"        # 회의록 내보내기 디렉토리
 mic_enabled: false               # 마이크 동시 녹음 여부
-mic_device_index: "0"            # 마이크 장치 인덱스
+mic_device_index: "builtin"      # 기본값: 맥북 내장 마이크 우선
 ```
 
 메뉴바의 `STT 모델` 메뉴에서 `Whisper (MLX)`와 `Qwen3-ASR`를 전환할 수 있습니다.  

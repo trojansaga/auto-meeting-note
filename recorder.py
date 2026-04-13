@@ -13,6 +13,18 @@ from live_screen_writer import LiveScreenWriter
 
 logger = logging.getLogger(__name__)
 
+_AUDIO_DEVICE_LINE_RE = re.compile(r"\[\s*(\d+)\s*\]\s+(.+?)\s*$")
+_AUTO_MIC_DEVICE_SPECS = {"", "0", "auto", "default", "builtin", "macbook"}
+_BUILTIN_MIC_HINTS = (
+    "macbook",
+    "built-in",
+    "built in",
+    "internal microphone",
+    "internal mic",
+    "내장",
+)
+_IPHONE_MIC_HINTS = ("iphone", "ipad", "continuity")
+
 
 class Recorder:
     def __init__(self):
@@ -32,7 +44,7 @@ class Recorder:
         self._seg_index: int = 0
         self._output_dir: Optional[Path] = None
         self._mic_enabled: bool = True
-        self._mic_device_index: str = "0"
+        self._mic_device_index: str = "builtin"
         self._base_ts: Optional[str] = None
 
     @property
@@ -57,16 +69,108 @@ class Recorder:
             return 0.0
         return time.time() - self._start_time
 
-    def _start_mic(self, mic_path: Path, mic_device_index: str) -> None:
+    @staticmethod
+    def _normalize_audio_device_spec(spec: Optional[str]) -> str:
+        return re.sub(r"\s+", " ", (spec or "").strip().lstrip(":")).casefold()
+
+    def _is_iphone_mic(self, device_name: str) -> bool:
+        normalized = self._normalize_audio_device_spec(device_name)
+        return any(token in normalized for token in _IPHONE_MIC_HINTS)
+
+    def _is_builtin_mic(self, device_name: str) -> bool:
+        normalized = self._normalize_audio_device_spec(device_name)
+        return any(token in normalized for token in _BUILTIN_MIC_HINTS)
+
+    def _list_audio_input_devices(self, ffmpeg_bin: str) -> list[tuple[str, str]]:
+        cmd = [ffmpeg_bin, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""]
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except Exception as e:
+            logger.warning("AVFoundation 오디오 장치 목록 조회 실패: %s", e)
+            return []
+
+        output = "\n".join(part for part in [result.stdout, result.stderr] if part)
+        devices: list[tuple[str, str]] = []
+        in_audio_section = False
+
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if "AVFoundation audio devices:" in line:
+                in_audio_section = True
+                continue
+            if not in_audio_section:
+                continue
+            match = _AUDIO_DEVICE_LINE_RE.search(line)
+            if match:
+                devices.append((match.group(1), match.group(2).strip()))
+
+        return devices
+
+    def _resolve_mic_device_spec(self, requested_spec: Optional[str]) -> str:
+        requested_spec = (requested_spec or "").strip().lstrip(":")
+        normalized_request = self._normalize_audio_device_spec(requested_spec)
+        fallback_spec = "0" if normalized_request in _AUTO_MIC_DEVICE_SPECS else (requested_spec or "0")
+        ffmpeg_bin = find_ffmpeg()
+        if not ffmpeg_bin:
+            return fallback_spec
+
+        devices = self._list_audio_input_devices(ffmpeg_bin)
+        if not devices:
+            logger.warning("오디오 입력 장치를 찾지 못해 마이크 설정값을 사용합니다: %s", fallback_spec)
+            return fallback_spec
+
+        matched_request_name = None
+        if normalized_request not in _AUTO_MIC_DEVICE_SPECS:
+            if requested_spec.isdigit():
+                matched_request_name = next((name for index, name in devices if index == requested_spec), None)
+            else:
+                matched_request_name = next(
+                    (name for _, name in devices if self._normalize_audio_device_spec(name) == normalized_request),
+                    None,
+                )
+
+            if matched_request_name and not self._is_iphone_mic(matched_request_name):
+                return requested_spec
+
+            if matched_request_name and self._is_iphone_mic(matched_request_name):
+                logger.warning(
+                    "설정된 마이크가 iPhone 계열이라 내장 마이크로 대체합니다: %s",
+                    matched_request_name,
+                )
+            elif not requested_spec.isdigit() and not self._is_iphone_mic(requested_spec):
+                return requested_spec
+
+        for _, device_name in devices:
+            if self._is_builtin_mic(device_name):
+                logger.info("내장 마이크 선택: %s", device_name)
+                return device_name
+
+        for _, device_name in devices:
+            if self._is_iphone_mic(device_name):
+                continue
+            logger.warning("내장 마이크를 찾지 못해 iPhone이 아닌 입력 장치를 사용합니다: %s", device_name)
+            return device_name
+
+        logger.warning("iPhone이 아닌 마이크를 찾지 못해 기존 설정을 유지합니다: %s", fallback_spec)
+        return fallback_spec
+
+    def _start_mic(self, mic_path: Path, mic_device_index: Optional[str]) -> None:
         """ffmpeg avfoundation으로 마이크 녹음 시작."""
         ffmpeg_bin = find_ffmpeg()
         if not ffmpeg_bin:
             logger.warning("ffmpeg 없음 — 마이크 녹음 건너뜀")
             return
+        mic_device_spec = (mic_device_index or "").strip().lstrip(":") or "0"
         cmd = [
             ffmpeg_bin,
             "-f", "avfoundation",
-            "-i", f":{mic_device_index}",
+            "-i", f":{mic_device_spec}",
             "-acodec", "pcm_s16le",
             "-ar", "48000",
             "-ac", "1",
@@ -78,7 +182,7 @@ class Recorder:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        logger.info("마이크 녹음 시작: %s", mic_path.name)
+        logger.info("마이크 녹음 시작: %s (입력=%s)", mic_path.name, mic_device_spec)
 
     def _stop_mic(self) -> None:
         """ffmpeg 마이크 녹음 중지."""
@@ -100,7 +204,7 @@ class Recorder:
         self._mic_process = None
 
     def start_screen_recording(
-        self, output_dir: Path, mic_enabled: bool = True, mic_device_index: str = "0"
+        self, output_dir: Path, mic_enabled: bool = True, mic_device_index: str = "builtin"
     ) -> Path:
         """화면 녹화 시작. SCStream 시스템 오디오 + 선택적 마이크 동시 캡처.
         SCStream 초기화가 블로킹이므로 반드시 백그라운드 스레드에서 호출해야 함."""
@@ -113,7 +217,7 @@ class Recorder:
             self._is_paused = False
             self._output_dir = output_dir
             self._mic_enabled = mic_enabled
-            self._mic_device_index = mic_device_index
+            self._mic_device_index = self._resolve_mic_device_spec(mic_device_index) if mic_enabled else "0"
             self._base_ts = ts
 
             mp4_path = output_dir / f"{ts}_녹화.mp4"
@@ -128,7 +232,7 @@ class Recorder:
             # 2) ffmpeg: 마이크 동시 캡처 (선택)
             if mic_enabled:
                 mic_path = output_dir / f"{ts}_녹화_mic.wav"
-                self._start_mic(mic_path, mic_device_index)
+                self._start_mic(mic_path, self._mic_device_index)
                 self._mic_path = mic_path if self._mic_process else None
             else:
                 self._mic_path = None
@@ -150,7 +254,7 @@ class Recorder:
             return mp4_path
 
     def start_audio_recording(
-        self, output_dir: Path, mic_enabled: bool = True, mic_device_index: str = "0"
+        self, output_dir: Path, mic_enabled: bool = True, mic_device_index: str = "builtin"
     ) -> Path:
         """녹음 시작. SCStream 시스템 오디오 + 선택적 마이크 동시 캡처.
         SCStream 초기화가 블로킹이므로 반드시 백그라운드 스레드에서 호출해야 함."""
@@ -163,7 +267,7 @@ class Recorder:
             self._is_paused = False
             self._output_dir = output_dir
             self._mic_enabled = mic_enabled
-            self._mic_device_index = mic_device_index
+            self._mic_device_index = self._resolve_mic_device_spec(mic_device_index) if mic_enabled else "0"
             self._base_ts = ts
 
             sys_path = output_dir / f"{ts}_녹음_sys.wav"
@@ -173,7 +277,7 @@ class Recorder:
 
             if mic_enabled:
                 mic_path = output_dir / f"{ts}_녹음_mic.wav"
-                self._start_mic(mic_path, mic_device_index)
+                self._start_mic(mic_path, self._mic_device_index)
                 self._mic_path = mic_path if self._mic_process else None
             else:
                 self._mic_path = None

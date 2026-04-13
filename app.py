@@ -23,13 +23,18 @@ os.environ.setdefault("HF_HOME", _HF_HOME)
 Path(_HF_HOME).mkdir(parents=True, exist_ok=True)
 
 # mlx, lightning_whisper_mlx 등 네이티브 패키지는 번들링 불가 → venv site-packages 참조
-# 번들 경로: .app/Contents/Resources/app.py → 5단계 위가 프로젝트 루트
+# venv 경로: Resources/.venv_path 파일 우선, 없으면 5단계 상위(dist 빌드 구조) 시도
 _APP_FILE = Path(__file__).resolve()
-_PROJECT_ROOT = _APP_FILE.parent.parent.parent.parent.parent  # dist/../ = 프로젝트 루트
 _PY_VER = f"python{sys.version_info.major}.{sys.version_info.minor}"
-_VENV_SITE = _PROJECT_ROOT / ".venv" / "lib" / _PY_VER / "site-packages"
-if not _VENV_SITE.exists():
-    _VENV_SITE = _APP_FILE.parent / ".venv" / "lib" / _PY_VER / "site-packages"
+
+_venv_root = None
+_venv_path_file = _APP_FILE.parent / ".venv_path"
+if _venv_path_file.exists():
+    _venv_root = Path(_venv_path_file.read_text(encoding="utf-8").strip())
+if not _venv_root or not _venv_root.exists():
+    _venv_root = _APP_FILE.parent.parent.parent.parent.parent / ".venv"  # dist/../.venv
+
+_VENV_SITE = _venv_root / "lib" / _PY_VER / "site-packages"
 if _VENV_SITE.exists() and str(_VENV_SITE) not in sys.path:
     sys.path.insert(0, str(_VENV_SITE))
 
@@ -97,7 +102,7 @@ DEFAULT_CONFIG = {
     "openai_model": "gpt-5.4",
     "export_dir": "~/Downloads",
     "mic_enabled": False,
-    "mic_device_index": "0",
+    "mic_device_index": "builtin",
     "stt_skip": False,
 }
 
@@ -817,7 +822,7 @@ class AutoMeetingNoteApp(rumps.App):
 
             def _start_bg():
                 mic_enabled = bool(self._config.get("mic_enabled", True))
-                mic_index = str(self._config.get("mic_device_index", "0"))
+                mic_index = str(self._config.get("mic_device_index") or "builtin")
                 try:
                     self._recorder.start_screen_recording(watch_dir, mic_enabled=mic_enabled, mic_device_index=mic_index)
                 except Exception as e:
@@ -874,7 +879,7 @@ class AutoMeetingNoteApp(rumps.App):
 
             def _start_bg():
                 mic_enabled = bool(self._config.get("mic_enabled", True))
-                mic_index = str(self._config.get("mic_device_index", "0"))
+                mic_index = str(self._config.get("mic_device_index") or "builtin")
                 try:
                     self._recorder.start_audio_recording(watch_dir, mic_enabled=mic_enabled, mic_device_index=mic_index)
                 except Exception as e:
