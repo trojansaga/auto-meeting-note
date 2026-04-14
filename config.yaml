@@ -4,6 +4,7 @@ whisper_model: "small"
 whisper_quant: "4bit"
 whisper_batch_size: 4
 qwen_model: "Qwen/Qwen3-ASR-0.6B"
+apple_speech_model: "speech_transcriber"
 qwen_dtype: null
 qwen_device_map: null
 qwen_attn_implementation: null

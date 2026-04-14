@@ -3,6 +3,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="AutoMeetingNote"
+APP_VERSION="$(tr -d '\n' < "$SCRIPT_DIR/VERSION")"
 APP_DIR="$SCRIPT_DIR/dist/$APP_NAME.app"
 CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
@@ -104,9 +105,17 @@ swiftc -O -o "$MACOS/$APP_NAME" "$SWIFT_SRC"
 rm -f "$SWIFT_SRC"
 echo "컴파일 완료"
 
+echo "Apple Speech probe 컴파일 중..."
+swiftc -parse-as-library -O -o "$MACOS/${APP_NAME}SpeechProbe" "$SCRIPT_DIR/apple_speech_probe.swift"
+echo "컴파일 완료"
+
+echo "Apple Speech transcriber 컴파일 중..."
+swiftc -parse-as-library -O -o "$MACOS/${APP_NAME}AppleSpeech" "$SCRIPT_DIR/apple_speech_transcriber.swift"
+echo "컴파일 완료"
+
 echo "$VENV_REAL" > "$RESOURCES/.venv_path"
 
-for f in app.py hotkey_manager.py pipeline.py cancellation.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py live_screen_writer.py config.yaml dictionary.txt; do
+for f in app.py hotkey_manager.py pipeline.py cancellation.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py live_screen_writer.py config.yaml dictionary.txt VERSION RELEASE_NOTES.md; do
     cp "$SCRIPT_DIR/$f" "$RESOURCES/"
 done
 
@@ -119,7 +128,7 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     cp "$SCRIPT_DIR/.env" "$RESOURCES/"
 fi
 
-cat > "$CONTENTS/Info.plist" << 'PLIST'
+cat > "$CONTENTS/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -131,9 +140,9 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
     <key>CFBundleIdentifier</key>
     <string>com.automeetingnote.app</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleExecutable</key>
     <string>AutoMeetingNote</string>
     <key>CFBundlePackageType</key>
@@ -152,6 +161,8 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
     <string>alert</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>회의 음성을 녹음하기 위해 마이크 접근이 필요합니다.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>로컬 음성 인식을 사용해 회의 내용을 전사하기 위해 음성 인식 접근이 필요합니다.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>회의 화면 녹화 및 시스템 오디오 녹음을 위해 화면 녹화 접근이 필요합니다.</string>
 </dict>
@@ -159,6 +170,10 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
 PLIST
 
 touch "$CONTENTS/Info.plist" "$APP_DIR"
+
+echo "앱 코드 서명 중..."
+codesign --force --deep --sign - "$APP_DIR"
+echo "코드 서명 완료"
 
 echo ""
 echo "=== 빌드 완료 ==="

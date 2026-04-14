@@ -48,6 +48,8 @@ def extract_audio(
     output_path: str,
     progress_callback: Optional[Callable[[str], None]] = None,
     stop_event: Optional[Event] = None,
+    sample_rate: Optional[int] = 16000,
+    channels: Optional[int] = 1,
 ) -> str:
     ffmpeg_bin = find_ffmpeg()
     if not ffmpeg_bin:
@@ -67,11 +69,15 @@ def extract_audio(
         "-i", str(mp4),
         "-vn",
         "-acodec", "pcm_s16le",
-        "-ar", "16000",
-        "-ac", "1",
+    ]
+    if sample_rate is not None:
+        cmd.extend(["-ar", str(sample_rate)])
+    if channels is not None:
+        cmd.extend(["-ac", str(channels)])
+    cmd.extend([
         "-y",
         str(output),
-    ]
+    ])
 
     logger.info("음성 추출 시작: %s → %s", mp4.name, output.name)
 

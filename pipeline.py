@@ -16,6 +16,7 @@ from audio_extractor import extract_audio
 from audio_preprocessor import preprocess_audio
 from note_generator import generate_note
 from transcriber import (
+    DEFAULT_APPLE_SPEECH_MODEL,
     DEFAULT_QWEN_MODEL,
     DEFAULT_STT_BACKEND,
     DEFAULT_WHISPER_MODEL,
@@ -75,6 +76,8 @@ def run_pipeline(
     whisper_quant = config.get("whisper_quant", DEFAULT_WHISPER_QUANT)
     whisper_batch_size = config.get("whisper_batch_size", 4)
     qwen_model = config.get("qwen_model", DEFAULT_QWEN_MODEL)
+    apple_speech_model = config.get("apple_speech_model", DEFAULT_APPLE_SPEECH_MODEL)
+    use_apple_speech = stt_backend == "apple_speech"
     qwen_dtype = config.get("qwen_dtype")
     qwen_device_map = config.get("qwen_device_map")
     qwen_attn_implementation = config.get("qwen_attn_implementation")
@@ -138,22 +141,28 @@ def run_pipeline(
                     wav_path,
                     progress_callback=_notify,
                     stop_event=stop_event,
+                    sample_rate=None if use_apple_speech else 16000,
+                    channels=None if use_apple_speech else 1,
                 )
 
         _check_pause()
         # 3. 음성 전처리
-        preprocessed_wav_path = str(work_dir / "audio_preprocessed.wav")
-        _notify(f"[3/6] {STEP_NAMES[2]}")
-        preprocess_audio(
-            wav_path,
-            preprocessed_wav_path,
-            progress_callback=_notify,
-            noise_reduce=config.get("preprocess_noise_reduce", True),
-            vad=config.get("preprocess_vad", True),
-            normalize=config.get("preprocess_normalize", True),
-            stop_event=stop_event,
-        )
-        stt_input_path = preprocessed_wav_path
+        if use_apple_speech:
+            _notify("[3/6] 음성 전처리 건너뜀 (Apple Speech는 추출 오디오를 직접 사용)")
+            stt_input_path = wav_path
+        else:
+            preprocessed_wav_path = str(work_dir / "audio_preprocessed.wav")
+            _notify(f"[3/6] {STEP_NAMES[2]}")
+            preprocess_audio(
+                wav_path,
+                preprocessed_wav_path,
+                progress_callback=_notify,
+                noise_reduce=config.get("preprocess_noise_reduce", True),
+                vad=config.get("preprocess_vad", True),
+                normalize=config.get("preprocess_normalize", True),
+                stop_event=stop_event,
+            )
+            stt_input_path = preprocessed_wav_path
 
         _check_pause()
         # 4. STT 처리
@@ -178,9 +187,18 @@ def run_pipeline(
                 initial_prompt = prompt or None
                 if initial_prompt:
                     logger.info("STT 컨텍스트 힌트 로드: %d개 단어 (dictionary.txt)", initial_prompt.count(",") + 1)
-            stt_model_name = qwen_model if stt_backend == "qwen3_asr" else whisper_model
-            stt_batch_size = qwen_max_batch_size if stt_backend == "qwen3_asr" else whisper_batch_size
-            stt_quant = None if stt_backend == "qwen3_asr" else whisper_quant
+            if stt_backend == "qwen3_asr":
+                stt_model_name = qwen_model
+                stt_batch_size = qwen_max_batch_size
+                stt_quant = None
+            elif use_apple_speech:
+                stt_model_name = apple_speech_model
+                stt_batch_size = 1
+                stt_quant = None
+            else:
+                stt_model_name = whisper_model
+                stt_batch_size = whisper_batch_size
+                stt_quant = whisper_quant
             transcribe(
                 stt_input_path,
                 script_path,

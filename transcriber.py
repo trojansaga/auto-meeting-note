@@ -1,7 +1,13 @@
 import gc
+import json
 import logging
 import multiprocessing as mp
+import os
+import platform
 import queue
+import shutil
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -21,10 +27,13 @@ DEFAULT_WHISPER_MODEL = "small"
 DEFAULT_WHISPER_QUANT = "4bit"
 DEFAULT_QWEN_MODEL = "Qwen/Qwen3-ASR-0.6B"
 DEFAULT_QWEN_CHUNK_SECONDS = 600
+DEFAULT_APPLE_SPEECH_MODEL = "speech_transcriber"
+APPLE_SPEECH_BINARY_NAME = "AutoMeetingNoteAppleSpeech"
 
 STT_BACKENDS = {
     "whisper": "Whisper (MLX)",
     "qwen3_asr": "Qwen3-ASR",
+    "apple_speech": "Apple Speech",
 }
 
 WHISPER_MODEL_REPOS = {
@@ -37,6 +46,11 @@ WHISPER_MODEL_REPOS = {
 QWEN_MODEL_REPOS = {
     "Qwen3-ASR-0.6B": "Qwen/Qwen3-ASR-0.6B",
     "Qwen3-ASR-1.7B": "Qwen/Qwen3-ASR-1.7B",
+}
+
+APPLE_SPEECH_MODELS = {
+    "speech_transcriber": "SpeechTranscriber",
+    "dictation_transcriber": "DictationTranscriber",
 }
 
 QWEN_LANGUAGE_MAP = {
@@ -80,18 +94,149 @@ def get_backend_label(backend: str) -> str:
 def get_model_display_name(backend: str, model_name: str, quant: Optional[str] = None) -> str:
     if backend == "whisper":
         return f"{model_name} ({quant or 'base'})"
+    if backend == "apple_speech":
+        return APPLE_SPEECH_MODELS.get(model_name, model_name)
     return Path(model_name).name or model_name
 
 
 def get_model_download_repo(backend: str, model_name: str, quant: Optional[str] = None) -> Optional[str]:
     if backend == "whisper":
         return _get_whisper_repo(model_name, quant)
+    if backend == "apple_speech":
+        return None
 
     model_path = Path(model_name).expanduser()
     if model_path.exists():
         return None
 
     return model_name
+
+
+def _macos_major_version() -> Optional[int]:
+    if sys.platform != "darwin":
+        return None
+    version = platform.mac_ver()[0]
+    if not version:
+        return None
+    try:
+        return int(version.split(".")[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _runtime_dir() -> Path:
+    path = Path.home() / "Library" / "Application Support" / "AutoMeetingNote" / "runtime"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _resource_root() -> Optional[Path]:
+    resource_path = os.environ.get("RESOURCEPATH")
+    if resource_path:
+        candidate = Path(resource_path)
+        if candidate.exists():
+            return candidate
+
+    local_parent = Path(__file__).resolve().parent
+    if (local_parent / "config.yaml").exists():
+        return local_parent
+    return None
+
+
+def _apple_speech_source_path() -> Optional[Path]:
+    candidates = [
+        Path(__file__).resolve().parent / "apple_speech_transcriber.swift",
+    ]
+    resource_root = _resource_root()
+    if resource_root is not None:
+        candidates.append(resource_root / "apple_speech_transcriber.swift")
+
+    for source in candidates:
+        if source.exists():
+            return source
+    return None
+
+
+def _bundled_apple_speech_binary_path() -> Optional[Path]:
+    candidates = []
+    resource_root = _resource_root()
+    if resource_root is not None:
+        candidates.append(resource_root.parent / "MacOS" / APPLE_SPEECH_BINARY_NAME)
+
+    base = Path(__file__).resolve().parent
+    candidates.append(base.parent / "MacOS" / APPLE_SPEECH_BINARY_NAME)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _runtime_apple_speech_binary_path() -> Path:
+    return _runtime_dir() / APPLE_SPEECH_BINARY_NAME
+
+
+def get_apple_speech_dependency_error() -> Optional[str]:
+    major = _macos_major_version()
+    if major is None:
+        return "Apple Speech 백엔드는 macOS에서만 사용할 수 있습니다."
+    if major < 26:
+        return "Apple Speech 백엔드는 macOS 26 이상이 필요합니다."
+    if _bundled_apple_speech_binary_path() is not None:
+        return None
+    if shutil.which("xcrun") is None:
+        return "xcrun을 찾을 수 없습니다. Xcode 또는 Command Line Tools를 설치하세요."
+    if _apple_speech_source_path() is None:
+        return "apple_speech_transcriber.swift 파일이 없어 Apple Speech helper를 준비할 수 없습니다."
+    return None
+
+
+def _ensure_apple_speech_binary() -> Path:
+    bundled = _bundled_apple_speech_binary_path()
+    if bundled is not None:
+        return bundled
+
+    source = _apple_speech_source_path()
+    if source is None:
+        raise RuntimeError("apple_speech_transcriber.swift 파일을 찾을 수 없습니다.")
+    if shutil.which("xcrun") is None:
+        raise RuntimeError("xcrun을 찾을 수 없습니다. Xcode 또는 Command Line Tools를 설치하세요.")
+
+    binary = _runtime_apple_speech_binary_path()
+    if binary.exists() and binary.stat().st_mtime >= source.stat().st_mtime:
+        return binary
+
+    env = os.environ.copy()
+    swift_cache_dir = Path(env.get("TMPDIR", "/tmp")) / "AutoMeetingNoteSwiftModuleCache"
+    swift_cache_dir.mkdir(parents=True, exist_ok=True)
+    env["SWIFT_MODULECACHE_PATH"] = str(swift_cache_dir)
+    env["CLANG_MODULE_CACHE_PATH"] = str(swift_cache_dir)
+
+    cmd = [
+        "xcrun",
+        "swiftc",
+        "-parse-as-library",
+        "-O",
+        "-o",
+        str(binary),
+        str(source),
+    ]
+    logger.info("Apple Speech helper 컴파일: %s", binary)
+    try:
+        subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip() or str(exc)
+        raise RuntimeError(f"Apple Speech helper 컴파일 실패:\n{detail}") from exc
+
+    if not binary.exists():
+        raise RuntimeError("Apple Speech helper 생성에 실패했습니다.")
+    return binary
 
 
 def _get_whisper_repo(model_name: str, quant: Optional[str]) -> str:
@@ -336,6 +481,8 @@ def _get_expected_secs(backend: str, wav: Path) -> float:
     audio_duration = _get_audio_duration_seconds(wav)
     if backend == "whisper":
         return audio_duration / 10.0
+    if backend == "apple_speech":
+        return audio_duration / 20.0
     return audio_duration
 
 
@@ -592,6 +739,98 @@ def _transcribe_with_qwen(
     return output
 
 
+def _transcribe_with_apple_speech(
+    wav: Path,
+    output_path: str,
+    original_filename: str,
+    model_name: str,
+    language: str,
+    progress_callback: Optional[Callable[[str], None]],
+    context_hint: Optional[str],
+) -> str:
+    helper = _ensure_apple_speech_binary()
+    logger.info("STT 처리 시작: %s (backend=apple_speech, model=%s)", wav.name, model_name)
+
+    expected_secs = _get_expected_secs("apple_speech", wav)
+    stop_event = threading.Event()
+    progress_thread = _run_progress_loop(expected_secs, stop_event, progress_callback)
+
+    def _run_helper(selected_model: str) -> subprocess.CompletedProcess[str]:
+        cmd = [
+            str(helper),
+            "--audio-path",
+            str(wav),
+            "--locale",
+            language,
+            "--model",
+            selected_model,
+        ]
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    try:
+        try:
+            completed = _run_helper(model_name)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip() or str(exc)
+            crash_like = exc.returncode < 0 or "SIGTRAP" in detail or "EXC_BREAKPOINT" in detail
+            permission_like = "권한" in detail or "permission" in detail.lower()
+            unsupported_like = "지원하지 않는" in detail or "지원하지 않습니다" in detail
+
+            if exc is not None and model_name == "speech_transcriber" and not permission_like:
+                if crash_like or not unsupported_like:
+                    fallback_model = "dictation_transcriber"
+                    logger.warning("SpeechTranscriber 실패로 DictationTranscriber로 재시도합니다: %s", detail)
+                    if progress_callback:
+                        progress_callback("[4/6] DictationTranscriber로 재시도 중...")
+                    try:
+                        completed = _run_helper(fallback_model)
+                    except subprocess.CalledProcessError as fallback_exc:
+                        fallback_detail = (fallback_exc.stderr or fallback_exc.stdout or "").strip() or str(fallback_exc)
+                        raise RuntimeError(
+                            "Apple Speech STT 실패:\n"
+                            f"SpeechTranscriber: {detail}\n"
+                            f"DictationTranscriber: {fallback_detail}"
+                        ) from fallback_exc
+                else:
+                    raise RuntimeError(f"Apple Speech STT 실패:\n{detail}") from exc
+            elif exc is not None:
+                raise RuntimeError(f"Apple Speech STT 실패:\n{detail}") from exc
+    finally:
+        stop_event.set()
+        if progress_thread is not None:
+            progress_thread.join(timeout=1)
+
+    if progress_callback:
+        progress_callback("[4/6] STT 처리 완료 (100%)")
+
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Apple Speech 결과 파싱 실패:\n{completed.stdout}") from exc
+
+    transcript_lines = []
+    for segment in payload.get("segments", []):
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        start_sec = float(segment.get("startSeconds", 0) or 0)
+        transcript_lines.append(f"{_format_timestamp(start_sec)} {text}")
+
+    lines = _build_output_lines(
+        original_filename=original_filename,
+        recognized_language=payload.get("recognizedLanguage"),
+        transcript_lines=transcript_lines,
+    )
+    output = _write_output(output_path, lines)
+    logger.info("STT 처리 완료 → %s", Path(output).name)
+    return output
+
+
 def _transcribe_impl(
     wav_path: str,
     output_path: str,
@@ -645,6 +884,17 @@ def _transcribe_impl(
             qwen_return_timestamps=qwen_return_timestamps,
             qwen_max_new_tokens=qwen_max_new_tokens,
             qwen_chunk_seconds=qwen_chunk_seconds,
+        )
+
+    if backend == "apple_speech":
+        return _transcribe_with_apple_speech(
+            wav=wav,
+            output_path=output_path,
+            original_filename=original_filename,
+            model_name=model_name,
+            language=language,
+            progress_callback=progress_callback,
+            context_hint=initial_prompt,
         )
 
     raise ValueError(f"지원하지 않는 STT 백엔드: {backend}")
@@ -811,6 +1061,13 @@ def transcribe(
         "qwen_max_new_tokens": qwen_max_new_tokens,
         "qwen_chunk_seconds": qwen_chunk_seconds,
     }
+    if backend == "apple_speech":
+        if stop_event is not None and stop_event.is_set():
+            raise OperationCancelledError("STT 처리가 중단되었습니다.")
+        return _transcribe_impl(
+            progress_callback=progress_callback,
+            **kwargs,
+        )
     if stop_event is not None:
         return _transcribe_cancellable(
             stop_event=stop_event,

@@ -1,6 +1,7 @@
 import logging
 import os
 import plistlib
+import json
 import re
 import shutil
 import subprocess
@@ -52,12 +53,15 @@ from hotkey_manager import HotkeyManager, format_hotkey, DEFAULT_HOTKEYS, HOTKEY
 from pipeline import run_pipeline, PipelineCancelledError
 from recorder import Recorder
 from transcriber import (
+    APPLE_SPEECH_MODELS,
+    DEFAULT_APPLE_SPEECH_MODEL,
     DEFAULT_QWEN_MODEL,
     DEFAULT_STT_BACKEND,
     DEFAULT_WHISPER_MODEL,
     DEFAULT_WHISPER_QUANT,
     QWEN_MODEL_REPOS,
     WHISPER_MODEL_REPOS,
+    get_apple_speech_dependency_error,
     get_backend_label,
     get_model_display_name,
     get_model_download_repo,
@@ -82,6 +86,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 RUNTIME_NOTIFICATION_BUNDLE_ID = "com.automeetingnote.runtime"
+VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "1.1.8"
 
 DEFAULT_CONFIG = {
     "watch_dir": "~/Desktop",
@@ -90,6 +96,7 @@ DEFAULT_CONFIG = {
     "whisper_quant": DEFAULT_WHISPER_QUANT,
     "whisper_batch_size": 4,
     "qwen_model": DEFAULT_QWEN_MODEL,
+    "apple_speech_model": DEFAULT_APPLE_SPEECH_MODEL,
     "qwen_dtype": None,
     "qwen_device_map": None,
     "qwen_attn_implementation": None,
@@ -215,6 +222,7 @@ class AutoMeetingNoteApp(rumps.App):
         self._open_config_item = rumps.MenuItem("설정 파일 열기", callback=self._open_config)
         self._open_prompt_item = rumps.MenuItem("STT 용어 사전 열기", callback=self._open_prompt)
         self._open_log_item = rumps.MenuItem("로그 파일 열기", callback=self._open_log)
+        self._release_notes_item = rumps.MenuItem(f"릴리즈 노트 (v{APP_VERSION})", callback=self._open_release_notes)
         self._quit_item = rumps.MenuItem("종료", callback=self._quit)
 
         self._model_menu_items: dict = {}
@@ -249,6 +257,7 @@ class AutoMeetingNoteApp(rumps.App):
             self._open_config_item,
             self._open_prompt_item,
             self._open_log_item,
+            self._release_notes_item,
             None,
             self._quit_item,
         ]
@@ -280,7 +289,80 @@ class AutoMeetingNoteApp(rumps.App):
         backend, model_name, quant = self._get_current_stt_selection()
         self._check_and_download_model(backend, model_name, quant)
 
+    def _apple_speech_probe_path(self) -> Optional[Path]:
+        candidates = [
+            _resource_path().parent / "MacOS" / "AutoMeetingNoteSpeechProbe",
+            Path(__file__).resolve().parent.parent / "MacOS" / "AutoMeetingNoteSpeechProbe",
+            Path(__file__).resolve().parent / "dist" / "AutoMeetingNote.app" / "Contents" / "MacOS" / "AutoMeetingNoteSpeechProbe",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _run_apple_speech_probe(self, request_auth: bool = False) -> dict:
+        probe = self._apple_speech_probe_path()
+        if probe is None:
+            raise RuntimeError("Apple Speech 권한 확인 helper를 찾을 수 없습니다. 앱을 다시 빌드하세요.")
+
+        cmd = [str(probe)]
+        if request_auth:
+            cmd.append("--request-auth")
+
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        try:
+            return json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Apple Speech 권한 상태 파싱 실패:\n{completed.stdout}") from exc
+
+    def _ensure_apple_speech_authorization(self, request_if_needed: bool = True) -> tuple[bool, str]:
+        try:
+            payload = self._run_apple_speech_probe(request_auth=False)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip() or str(exc)
+            return False, f"Apple Speech 권한 상태 확인 실패:\n{detail}"
+        except Exception as exc:
+            return False, str(exc)
+
+        recognizer_payload = payload.get("sfspeechRecognizer", {})
+        status = recognizer_payload.get("authorizationStatus", "unknown")
+
+        if status == "authorized":
+            return True, ""
+
+        if request_if_needed and status == "notDetermined":
+            try:
+                payload = self._run_apple_speech_probe(request_auth=True)
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or exc.stdout or "").strip() or str(exc)
+                return False, f"Apple Speech 권한 요청 실패:\n{detail}"
+            except Exception as exc:
+                return False, str(exc)
+            recognizer_payload = payload.get("sfspeechRecognizer", {})
+            status = recognizer_payload.get("authorizationStatus", "unknown")
+            if status == "authorized":
+                return True, ""
+
+        if status == "denied":
+            return False, (
+                "음성 인식 권한이 거부되었습니다.\n\n"
+                "시스템 설정 → 개인 정보 보호 및 보안 → 음성 인식에서 "
+                "AutoMeetingNote를 허용한 뒤 다시 시도하세요."
+            )
+        if status == "restricted":
+            return False, "이 Mac에서는 음성 인식 권한이 제한되어 Apple Speech를 사용할 수 없습니다."
+        if status == "notDetermined":
+            return False, "음성 인식 권한 요청이 완료되지 않았습니다. 다시 시도하세요."
+        return False, f"Apple Speech 권한 상태를 확인할 수 없습니다: {status}"
+
     def _get_stt_dependency_error(self, backend: str) -> Optional[str]:
+        if backend == "apple_speech":
+            return get_apple_speech_dependency_error()
         if backend == "qwen3_asr":
             try:
                 import qwen_asr  # noqa: F401
@@ -325,6 +407,8 @@ class AutoMeetingNoteApp(rumps.App):
 
     def _get_current_stt_selection(self) -> tuple[str, str, Optional[str]]:
         backend = self._config.get("stt_backend", DEFAULT_STT_BACKEND)
+        if backend == "apple_speech":
+            return backend, self._config.get("apple_speech_model", DEFAULT_APPLE_SPEECH_MODEL), None
         if backend == "qwen3_asr":
             return backend, self._config.get("qwen_model", DEFAULT_QWEN_MODEL), None
         return (
@@ -461,6 +545,14 @@ class AutoMeetingNoteApp(rumps.App):
             self._model_menu_items[("qwen3_asr", repo, None)] = item
             qwen_menu.add(item)
         model_menu.add(qwen_menu)
+
+        apple_menu = rumps.MenuItem("Apple Speech")
+        for model_key, label in APPLE_SPEECH_MODELS.items():
+            item = rumps.MenuItem(label, callback=self._make_model_callback("apple_speech", model_key, None))
+            item.state = 1 if current_backend == "apple_speech" and current_model == model_key else 0
+            self._model_menu_items[("apple_speech", model_key, None)] = item
+            apple_menu.add(item)
+        model_menu.add(apple_menu)
 
         return model_menu
 
@@ -606,7 +698,9 @@ class AutoMeetingNoteApp(rumps.App):
                 item.state = 0
             self._model_menu_items[(backend, model_name, quant)].state = 1
             self._config["stt_backend"] = backend
-            if backend == "qwen3_asr":
+            if backend == "apple_speech":
+                self._config["apple_speech_model"] = model_name
+            elif backend == "qwen3_asr":
                 self._config["qwen_model"] = model_name
             else:
                 self._config["whisper_model"] = model_name
@@ -618,6 +712,10 @@ class AutoMeetingNoteApp(rumps.App):
             if stt_dependency_error:
                 rumps.alert(title="설정 오류", message=stt_dependency_error)
                 return
+            if backend == "apple_speech":
+                authorized, detail = self._ensure_apple_speech_authorization(request_if_needed=True)
+                if not authorized:
+                    rumps.alert(title="Apple Speech 권한 필요", message=detail)
             self._check_and_download_model(backend, model_name, quant)
         return _select
 
@@ -1042,6 +1140,10 @@ class AutoMeetingNoteApp(rumps.App):
         self._pipeline_running = True
         self._config = load_config()
         try:
+            if self._config.get("stt_backend", DEFAULT_STT_BACKEND) == "apple_speech":
+                authorized, detail = self._ensure_apple_speech_authorization(request_if_needed=True)
+                if not authorized:
+                    raise RuntimeError(detail)
             run_pipeline(
                 path,
                 self._config,
@@ -1079,6 +1181,13 @@ class AutoMeetingNoteApp(rumps.App):
 
     def _open_log(self, _):
         subprocess.Popen(["open", str(LOG_FILE)])
+
+    def _open_release_notes(self, _):
+        release_notes_path = _resource_path() / "RELEASE_NOTES.md"
+        if not release_notes_path.exists():
+            rumps.alert(title="릴리즈 노트", message="RELEASE_NOTES.md 파일이 없습니다.")
+            return
+        subprocess.Popen(["open", str(release_notes_path)])
 
     def _quit(self, _):
         if self._is_recording:
