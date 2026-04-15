@@ -237,9 +237,9 @@ def run_pipeline(
         # 폴더명 예: "2026-03-20 15-03-21_회의내용"
         m = re.match(r'(\d{4}-\d{2}-\d{2})[\s_-](\d{2})', stem)
         if m:
-            note_filename = f"{m.group(1)}_{m.group(2)}_{title}.md"
+            note_filename = f"(자동회의록){m.group(1)}_{m.group(2)}_{title}.md"
         else:
-            note_filename = f"{stem}_{title}.md"
+            note_filename = f"(자동회의록){stem}_{title}.md"
         note_path = work_dir / note_filename
         Path(note_tmp).rename(note_path)
 

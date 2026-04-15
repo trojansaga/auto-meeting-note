@@ -87,7 +87,7 @@ logger = logging.getLogger(__name__)
 
 RUNTIME_NOTIFICATION_BUNDLE_ID = "com.automeetingnote.runtime"
 VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
-APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "1.1.8"
+APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "1.1.9"
 
 DEFAULT_CONFIG = {
     "watch_dir": "~/Desktop",

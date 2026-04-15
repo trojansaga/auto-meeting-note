@@ -1,5 +1,9 @@
 # Release Notes
 
+## 1.1.9
+
+- 최종 회의록 Markdown 파일명 맨 앞에 `(자동회의록)` 접두사를 붙이도록 변경
+
 ## 1.1.8
 
 - Apple Speech 실행 전에 compatible audio format을 선검사하고 `prepareToAnalyze`를 먼저 수행하도록 변경
