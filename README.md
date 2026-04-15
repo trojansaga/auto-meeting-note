@@ -71,9 +71,10 @@ language: "ko"                   # STT 언어
 openai_model: "gpt-5.4"         # 회의록 생성 모델
 export_dir: "~/Downloads"        # 회의록 내보내기 디렉토리
 mic_enabled: false               # 마이크 동시 녹음 여부
-mic_device_index: "builtin"      # 기본값: 맥북 내장 마이크 우선
+mic_device_index: "macbook"      # macbook 또는 iphone
 ```
 
+메뉴바의 `녹화/녹음 옵션 > 마이크 입력`에서 맥북/현재 디바이스와 iPhone 마이크를 선택할 수 있습니다.  
 메뉴바의 `STT 모델` 메뉴에서 `Whisper (MLX)`, `Qwen3-ASR`, `Apple Speech`를 전환할 수 있습니다.  
 Qwen3-ASR는 `qwen-asr` 패키지가 필요하며, `qwen_model`에는 Hugging Face 모델 ID 대신 로컬 디렉토리 경로도 지정할 수 있습니다.  
 Apple Speech는 macOS 26 이상과 Speech 권한이 필요하며, `speech_transcriber`와 `dictation_transcriber` 중 선택할 수 있습니다.  

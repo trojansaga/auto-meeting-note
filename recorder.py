@@ -14,7 +14,9 @@ from live_screen_writer import LiveScreenWriter
 logger = logging.getLogger(__name__)
 
 _AUDIO_DEVICE_LINE_RE = re.compile(r"\[\s*(\d+)\s*\]\s+(.+?)\s*$")
-_AUTO_MIC_DEVICE_SPECS = {"", "0", "auto", "default", "builtin", "macbook"}
+_AUTO_MIC_DEVICE_SPECS = {"", "0", "auto", "default"}
+_MACBOOK_MIC_DEVICE_SPECS = {"builtin", "macbook", "current", "local"}
+_IPHONE_MIC_DEVICE_SPECS = {"iphone", "ipad", "ios", "continuity"}
 _BUILTIN_MIC_HINTS = (
     "macbook",
     "built-in",
@@ -44,7 +46,7 @@ class Recorder:
         self._seg_index: int = 0
         self._output_dir: Optional[Path] = None
         self._mic_enabled: bool = True
-        self._mic_device_index: str = "builtin"
+        self._mic_device_index: str = "macbook"
         self._base_ts: Optional[str] = None
 
     @property
@@ -115,7 +117,10 @@ class Recorder:
     def _resolve_mic_device_spec(self, requested_spec: Optional[str]) -> str:
         requested_spec = (requested_spec or "").strip().lstrip(":")
         normalized_request = self._normalize_audio_device_spec(requested_spec)
-        fallback_spec = "0" if normalized_request in _AUTO_MIC_DEVICE_SPECS else (requested_spec or "0")
+        auto_like = normalized_request in _AUTO_MIC_DEVICE_SPECS
+        macbook_like = normalized_request in _MACBOOK_MIC_DEVICE_SPECS
+        iphone_like = normalized_request in _IPHONE_MIC_DEVICE_SPECS
+        fallback_spec = "0" if (auto_like or macbook_like or iphone_like) else (requested_spec or "0")
         ffmpeg_bin = find_ffmpeg()
         if not ffmpeg_bin:
             return fallback_spec
@@ -125,8 +130,14 @@ class Recorder:
             logger.warning("오디오 입력 장치를 찾지 못해 마이크 설정값을 사용합니다: %s", fallback_spec)
             return fallback_spec
 
-        matched_request_name = None
-        if normalized_request not in _AUTO_MIC_DEVICE_SPECS:
+        if iphone_like:
+            for _, device_name in devices:
+                if self._is_iphone_mic(device_name):
+                    logger.info("iPhone 마이크 선택: %s", device_name)
+                    return device_name
+            logger.warning("iPhone 마이크를 찾지 못해 내장/현재 마이크로 대체합니다.")
+
+        if not (auto_like or macbook_like or iphone_like):
             if requested_spec.isdigit():
                 matched_request_name = next((name for index, name in devices if index == requested_spec), None)
             else:
@@ -135,15 +146,10 @@ class Recorder:
                     None,
                 )
 
-            if matched_request_name and not self._is_iphone_mic(matched_request_name):
+            if matched_request_name:
                 return requested_spec
 
-            if matched_request_name and self._is_iphone_mic(matched_request_name):
-                logger.warning(
-                    "설정된 마이크가 iPhone 계열이라 내장 마이크로 대체합니다: %s",
-                    matched_request_name,
-                )
-            elif not requested_spec.isdigit() and not self._is_iphone_mic(requested_spec):
+            if not requested_spec.isdigit():
                 return requested_spec
 
         for _, device_name in devices:

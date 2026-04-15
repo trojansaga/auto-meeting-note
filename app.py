@@ -85,9 +85,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-RUNTIME_NOTIFICATION_BUNDLE_ID = "com.automeetingnote.runtime"
+APP_BUNDLE_IDENTIFIER = "com.automeetingnote.app"
+APP_DISPLAY_NAME = "AutoMeetingNote"
 VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
-APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "1.1.9"
+APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "1.1.11"
+
+MIC_DEVICE_CHOICES = {
+    "macbook": "맥북/현재 디바이스",
+    "iphone": "아이폰 마이크",
+}
+MIC_DEVICE_ALIASES = {
+    "": "macbook",
+    "0": "macbook",
+    "auto": "macbook",
+    "default": "macbook",
+    "builtin": "macbook",
+    "macbook": "macbook",
+    "current": "macbook",
+    "local": "macbook",
+    "iphone": "iphone",
+    "ipad": "iphone",
+    "ios": "iphone",
+    "continuity": "iphone",
+}
 
 DEFAULT_CONFIG = {
     "watch_dir": "~/Desktop",
@@ -109,18 +129,18 @@ DEFAULT_CONFIG = {
     "openai_model": "gpt-5.4",
     "export_dir": "~/Downloads",
     "mic_enabled": False,
-    "mic_device_index": "builtin",
+    "mic_device_index": "macbook",
     "stt_skip": False,
 }
 
 
 def _ensure_notification_runtime_plist():
     """rumps가 찾는 python 실행 디렉터리의 Info.plist를 보정한다."""
-    plist_path = Path(sys.executable).resolve().parent / "Info.plist"
+    plist_path = Path(sys.executable).parent / "Info.plist"
     desired = {
-        "CFBundleIdentifier": RUNTIME_NOTIFICATION_BUNDLE_ID,
-        "CFBundleName": "AutoMeetingNote",
-        "CFBundleDisplayName": "AutoMeetingNote",
+        "CFBundleIdentifier": APP_BUNDLE_IDENTIFIER,
+        "CFBundleName": APP_DISPLAY_NAME,
+        "CFBundleDisplayName": APP_DISPLAY_NAME,
     }
 
     try:
@@ -213,10 +233,13 @@ class AutoMeetingNoteApp(rumps.App):
         self._pause_item = rumps.MenuItem("일시 정지", callback=None)
         self._mic_item = rumps.MenuItem("마이크 녹음 포함", callback=self._toggle_mic)
         self._mic_item.state = 1 if self._config.get("mic_enabled", False) else 0
+        self._mic_device_items: dict = {}
+        self._mic_device_menu = self._build_mic_device_menu()
         self._stt_skip_item = rumps.MenuItem("녹화/녹음만 (STT 건너뛰기)", callback=self._toggle_stt_skip)
         self._stt_skip_item.state = 1 if self._config.get("stt_skip", False) else 0
         self._flags_menu = rumps.MenuItem("녹화/녹음 옵션")
         self._flags_menu.add(self._mic_item)
+        self._flags_menu.add(self._mic_device_menu)
         self._flags_menu.add(self._stt_skip_item)
         self._status_item = rumps.MenuItem("처리 현황: 대기 중", callback=self._show_status_detail)
         self._open_config_item = rumps.MenuItem("설정 파일 열기", callback=self._open_config)
@@ -462,8 +485,8 @@ class AutoMeetingNoteApp(rumps.App):
         rumps.Timer(_remove, 0.0).start()
 
     def _notify(self, title: str, subtitle: str = "", message: str = ""):
-        """rumps.notification 실패 시 osascript로 fallback."""
-        title = (title or "AutoMeetingNote").strip() or "AutoMeetingNote"
+        """가능하면 AutoMeetingNote 이름으로 네이티브 알림을 보낸다."""
+        title = (title or APP_DISPLAY_NAME).strip() or APP_DISPLAY_NAME
         subtitle = (subtitle or "").strip()
         message = (message or "").strip() or title
 
@@ -471,7 +494,20 @@ class AutoMeetingNoteApp(rumps.App):
             rumps.notification(title=title, subtitle=subtitle, message=message)
             return
         except Exception as e:
-            logger.warning("rumps 알림 실패, osascript 사용: %s", e)
+            logger.warning("rumps 알림 실패, AppKit 알림으로 재시도: %s", e)
+
+        try:
+            from AppKit import NSUserNotification, NSUserNotificationCenter
+
+            notification = NSUserNotification.alloc().init()
+            notification.setTitle_(title)
+            if subtitle:
+                notification.setSubtitle_(subtitle)
+            notification.setInformativeText_(message)
+            NSUserNotificationCenter.defaultUserNotificationCenter().deliverNotification_(notification)
+            return
+        except Exception as e:
+            logger.warning("AppKit 알림 실패, osascript 사용: %s", e)
 
         script = """
         on run argv
@@ -560,6 +596,35 @@ class AutoMeetingNoteApp(rumps.App):
         sender.state = not sender.state
         self._config["mic_enabled"] = bool(sender.state)
         self._save_config()
+
+    def _normalize_mic_device_choice(self, value: Optional[str]) -> str:
+        normalized = str(value or "").strip().lstrip(":").casefold()
+        return MIC_DEVICE_ALIASES.get(normalized, "macbook")
+
+    def _get_mic_device_menu_title(self) -> str:
+        choice = self._normalize_mic_device_choice(self._config.get("mic_device_index"))
+        return f"마이크 입력: {MIC_DEVICE_CHOICES.get(choice, MIC_DEVICE_CHOICES['macbook'])}"
+
+    def _build_mic_device_menu(self) -> rumps.MenuItem:
+        menu = rumps.MenuItem(self._get_mic_device_menu_title())
+        current_choice = self._normalize_mic_device_choice(self._config.get("mic_device_index"))
+        for choice, label in MIC_DEVICE_CHOICES.items():
+            item = rumps.MenuItem(label, callback=self._make_mic_device_callback(choice))
+            item.state = 1 if choice == current_choice else 0
+            self._mic_device_items[choice] = item
+            menu.add(item)
+        return menu
+
+    def _make_mic_device_callback(self, choice: str):
+        def _select(_sender):
+            for item in self._mic_device_items.values():
+                item.state = 0
+            self._mic_device_items[choice].state = 1
+            self._config["mic_device_index"] = choice
+            self._mic_device_menu.title = self._get_mic_device_menu_title()
+            self._save_config()
+            logger.info("마이크 입력 변경: %s", choice)
+        return _select
 
     def _toggle_stt_skip(self, sender):
         sender.state = not sender.state
