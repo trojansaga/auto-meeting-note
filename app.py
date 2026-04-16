@@ -1128,6 +1128,9 @@ class AutoMeetingNoteApp(rumps.App):
                     self._on_status(f"✅ 녹화 완료 (STT 건너뜀): {mp4_path.name}")
                     self._schedule_title_reset(5)
                     return
+                if self._pipeline_running:
+                    self._finish_recording_while_processing()
+                    return
                 if not self._confirm_on_main(f"녹화 파일이 준비되었습니다.\n({mp4_path.name})\n\n회의록 생성을 시작할까요?"):
                     self._on_status(f"회의록 생성 취소됨: {mp4_path.name}")
                     self._schedule_title_reset(5)
@@ -1145,6 +1148,9 @@ class AutoMeetingNoteApp(rumps.App):
                     self._on_status(f"✅ 녹음 완료 (STT 건너뜀): {final_path.name}")
                     self._schedule_title_reset(5)
                     return
+                if self._pipeline_running:
+                    self._finish_recording_while_processing()
+                    return
                 if not self._confirm_on_main(f"녹음 파일이 준비되었습니다.\n({final_path.name})\n\n회의록 생성을 시작할까요?"):
                     self._on_status(f"회의록 생성 취소됨: {final_path.name}")
                     self._schedule_title_reset(5)
@@ -1156,6 +1162,19 @@ class AutoMeetingNoteApp(rumps.App):
             self._status_log.append(err_msg)
             self._pending_status_title = f"처리 현황: {err_msg}"
             self._schedule_title_reset(5)
+
+    def _finish_recording_while_processing(self):
+        message = "처리중이므로 회의록 생성이 불가능하여 여기서 종료합니다."
+        self._on_status(message)
+        self._alert_on_main("회의록 생성 불가", message)
+        self._schedule_title_reset(5)
+
+    def _alert_on_main(self, title: str, message: str):
+        def _alert(timer):
+            timer.stop()
+            rumps.alert(title=title, message=message)
+
+        rumps.Timer(_alert, 0.0).start()
 
     def _confirm_on_main(self, message: str) -> bool:
         """회의록 생성 여부 확인. 메뉴바 앱에서는 osascript가 더 안정적이다."""
