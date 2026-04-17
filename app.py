@@ -52,6 +52,7 @@ from dotenv import load_dotenv
 from hotkey_manager import HotkeyManager, format_hotkey, DEFAULT_HOTKEYS, HOTKEY_LABELS
 from pipeline import run_pipeline, PipelineCancelledError
 from recorder import Recorder
+from sync_diagnostics import SyncDiagnosticSession, analyze_session, emit_screen_flash, play_probe_click
 from transcriber import (
     APPLE_SPEECH_MODELS,
     DEFAULT_APPLE_SPEECH_MODEL,
@@ -130,6 +131,9 @@ DEFAULT_CONFIG = {
     "export_dir": "~/Downloads",
     "mic_enabled": False,
     "mic_device_index": "macbook",
+    "mic_latency_correction_seconds": 0.0,
+    "mic_latency_correction_source_session": "",
+    "sync_diagnostic_mode": False,
     "stt_skip": False,
 }
 
@@ -215,16 +219,21 @@ class AutoMeetingNoteApp(rumps.App):
         load_dotenv(env_path)
 
         self._config = load_config()
+        self._apply_latest_sync_diagnostic_correction()
 
         self._recorder = Recorder()
         self._rec_timer: Optional[rumps.Timer] = None
         self._is_recording = False  # screencapture 프로세스 종료 여부와 무관한 앱 레벨 상태
         self._recording_mode = None  # 'screen' or 'audio'
+        self._sync_diagnostic_session: Optional[SyncDiagnosticSession] = None
 
         self._status_log: deque = deque(maxlen=50)
         self._pending_status_title = None
         self._pending_app_title = None
         self._reset_title_at: Optional[float] = None
+        self._sync_probe_session: Optional[SyncDiagnosticSession] = None
+        self._sync_probe_due_at: Optional[float] = None
+        self._sync_probe_include_flash: bool = False
         rumps.Timer(self._flush_ui, 0.3).start()
 
         self._select_file_item = rumps.MenuItem("파일 선택하여 처리...", callback=self._select_and_process)
@@ -235,11 +244,14 @@ class AutoMeetingNoteApp(rumps.App):
         self._mic_item.state = 1 if self._config.get("mic_enabled", False) else 0
         self._mic_device_items: dict = {}
         self._mic_device_menu = self._build_mic_device_menu()
+        self._sync_diagnostic_item = rumps.MenuItem("싱크 진단 모드", callback=self._toggle_sync_diagnostic)
+        self._sync_diagnostic_item.state = 1 if self._config.get("sync_diagnostic_mode", False) else 0
         self._stt_skip_item = rumps.MenuItem("녹화/녹음만 (STT 건너뛰기)", callback=self._toggle_stt_skip)
         self._stt_skip_item.state = 1 if self._config.get("stt_skip", False) else 0
         self._flags_menu = rumps.MenuItem("녹화/녹음 옵션")
         self._flags_menu.add(self._mic_item)
         self._flags_menu.add(self._mic_device_menu)
+        self._flags_menu.add(self._sync_diagnostic_item)
         self._flags_menu.add(self._stt_skip_item)
         self._status_item = rumps.MenuItem("처리 현황: 대기 중", callback=self._show_status_detail)
         self._open_config_item = rumps.MenuItem("설정 파일 열기", callback=self._open_config)
@@ -631,6 +643,127 @@ class AutoMeetingNoteApp(rumps.App):
         self._config["stt_skip"] = bool(sender.state)
         self._save_config()
 
+    def _toggle_sync_diagnostic(self, sender):
+        sender.state = not sender.state
+        self._config["sync_diagnostic_mode"] = bool(sender.state)
+        self._save_config()
+
+    def _create_sync_diagnostic_session(self, mode: str, output_dir: Path) -> Optional[SyncDiagnosticSession]:
+        recorder = getattr(self, "_recorder", None)
+        if recorder is not None:
+            recorder.attach_sync_diagnostic_session(None)
+        self._sync_diagnostic_session = None
+
+        if not self._config.get("sync_diagnostic_mode", False):
+            return None
+
+        try:
+            session = SyncDiagnosticSession.create(
+                output_dir=output_dir,
+                mode=mode,
+                app_version=APP_VERSION,
+                mic_enabled=bool(self._config.get("mic_enabled", False)),
+            )
+            if hasattr(session, "record_runtime_context"):
+                session.record_runtime_context(
+                    resource_path=str(_resource_path()),
+                    app_file=str(_APP_FILE),
+                    mic_latency_correction_seconds=float(self._config.get("mic_latency_correction_seconds", 0.0)),
+                )
+            self._sync_diagnostic_session = session
+            if recorder is not None:
+                recorder.attach_sync_diagnostic_session(session)
+            logger.info("싱크 진단 세션 생성: %s", getattr(session, "session_dir", session))
+            return session
+        except Exception as e:
+            logger.warning("싱크 진단 세션 생성 실패: %s", e)
+            return None
+
+    def _latest_sync_diagnostic_dir(self) -> Optional[Path]:
+        watch_dir = Path(self._config.get("watch_dir", "~/Desktop")).expanduser()
+        diagnostic_root = watch_dir / "_sync_diagnostics"
+        if not diagnostic_root.exists():
+            return None
+        candidates = sorted(path for path in diagnostic_root.iterdir() if path.is_dir())
+        if not candidates:
+            return None
+        return candidates[-1]
+
+    def _apply_latest_sync_diagnostic_correction(self) -> bool:
+        latest = self._latest_sync_diagnostic_dir()
+        if latest is None:
+            return False
+
+        if self._config.get("mic_latency_correction_source_session") == latest.name:
+            return False
+
+        try:
+            report = analyze_session(
+                latest,
+                fallback_current_mic_latency_correction=float(
+                    self._config.get("mic_latency_correction_seconds", 0.0)
+                ),
+            )
+        except Exception as e:
+            logger.warning("싱크 진단 분석 실패: %s", e)
+            return False
+
+        correction = report.get("recommendations", {}).get("mic_latency_correction_seconds")
+        if not isinstance(correction, (int, float)):
+            return False
+
+        self._config["mic_latency_correction_seconds"] = round(float(correction), 3)
+        self._config["mic_latency_correction_source_session"] = latest.name
+        self._save_config()
+        logger.info(
+            "마이크 싱크 보정값 업데이트: %.3fs (session=%s)",
+            self._config["mic_latency_correction_seconds"],
+            latest.name,
+        )
+        return True
+
+    def _clear_sync_diagnostic_session(self):
+        recorder = getattr(self, "_recorder", None)
+        if recorder is not None:
+            recorder.attach_sync_diagnostic_session(None)
+        self._sync_diagnostic_session = None
+        self._sync_probe_session = None
+        self._sync_probe_due_at = None
+        self._sync_probe_include_flash = False
+
+    def _schedule_sync_diagnostic_probe(self, session: Optional[SyncDiagnosticSession], include_flash: bool) -> None:
+        if session is None:
+            return
+
+        logger.info("싱크 진단 프로브 예약: session=%s, include_flash=%s", session.session_dir.name, include_flash)
+        self._sync_probe_session = session
+        self._sync_probe_due_at = time.time() + 0.8
+        self._sync_probe_include_flash = include_flash
+
+    def _emit_pending_sync_probe(self):
+        session = getattr(self, "_sync_probe_session", None)
+        due_at = getattr(self, "_sync_probe_due_at", None)
+        if session is None or due_at is None:
+            return
+        if time.time() < due_at:
+            return
+        if self._sync_diagnostic_session is not session or not self._is_recording:
+            self._sync_probe_session = None
+            self._sync_probe_due_at = None
+            self._sync_probe_include_flash = False
+            return
+
+        flash_started_at = emit_screen_flash() if self._sync_probe_include_flash else None
+        click_started_at = play_probe_click(session.probe_audio_path)
+        session.record_probe_emission(
+            include_flash=self._sync_probe_include_flash,
+            flash_started_at=flash_started_at,
+            click_started_at=click_started_at,
+        )
+        self._sync_probe_session = None
+        self._sync_probe_due_at = None
+        self._sync_probe_include_flash = False
+
     def _build_preprocess_menu(self) -> rumps.MenuItem:
         menu = rumps.MenuItem("전처리 설정")
         steps = [
@@ -833,7 +966,8 @@ class AutoMeetingNoteApp(rumps.App):
         if self._reset_title_at is not None and time.time() >= self._reset_title_at:
             self.title = "MN"
             self._reset_title_at = None
-        if self._pipeline_running:
+        self._emit_pending_sync_probe()
+        if getattr(self, "_pipeline_running", False):
             if "⏹ 처리 중단" not in self.menu:
                 self.menu.add(rumps.MenuItem("⏹ 처리 중단", callback=self._cancel_pipeline))
             is_paused = not self._pipeline_pause_event.is_set()
@@ -851,7 +985,7 @@ class AutoMeetingNoteApp(rumps.App):
             for label in ["⏹ 처리 중단", "⏸ 처리 일시중단", "▶ 처리 재개"]:
                 if label in self.menu:
                     del self.menu[label]
-        if self._pipeline_start_time is not None:
+        if getattr(self, "_pipeline_start_time", None) is not None:
             self._status_item.title = self._build_pipeline_status()
         elif self._pending_status_title is not None:
             self._status_item.title = self._pending_status_title
@@ -935,6 +1069,64 @@ class AutoMeetingNoteApp(rumps.App):
             return True  # 확인 불가 시 허용으로 간주
 
     @staticmethod
+    def _request_screen_permission() -> bool:
+        try:
+            import Quartz
+            request_access = getattr(Quartz, "CGRequestScreenCaptureAccess", None)
+            if request_access is None:
+                logger.warning("CGRequestScreenCaptureAccess를 사용할 수 없습니다.")
+                return False
+            granted = bool(request_access())
+            logger.info("화면 녹화 권한 요청 결과: %s", granted)
+            return granted
+        except Exception as e:
+            logger.warning("화면 녹화 권한 요청 실패: %s", e)
+            return False
+
+    @staticmethod
+    def _open_screen_recording_settings() -> bool:
+        commands = [
+            ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"],
+            ["open", "-a", "System Settings"],
+        ]
+        for cmd in commands:
+            try:
+                subprocess.Popen(cmd)
+                logger.info("화면 녹화 권한 설정 열기: %s", cmd)
+                return True
+            except Exception as e:
+                logger.warning("권한 설정 열기 실패 (%s): %s", cmd, e)
+        return False
+
+    def _ensure_screen_permission(self, purpose: str) -> bool:
+        if self._check_screen_permission():
+            return True
+
+        self._request_screen_permission()
+        if self._check_screen_permission():
+            rumps.alert(
+                title="화면 녹화 권한 허용 완료",
+                message=f"{purpose} 권한이 허용되었습니다.\n\n"
+                        "macOS 정책상 앱을 완전히 종료했다가 다시 실행한 뒤 사용하세요.",
+            )
+            return False
+
+        settings_opened = self._open_screen_recording_settings()
+        settings_message = (
+            "권한 설정 화면을 열었습니다.\n"
+            if settings_opened
+            else "시스템 설정을 직접 열어 주세요.\n"
+        )
+        rumps.alert(
+            title="화면 녹화 권한 필요",
+            message=f"{purpose}에는 화면 녹화 권한이 필요합니다.\n\n"
+                    f"{settings_message}"
+                    "시스템 설정 → 개인 정보 보호 및 보안 → 화면 및 시스템 오디오 녹음\n"
+                    "에서 AutoMeetingNote를 허용한 후 앱을 재시작하세요.",
+        )
+        return False
+
+    @staticmethod
     def _check_mic_permission() -> bool:
         try:
             import AVFoundation
@@ -944,6 +1136,69 @@ class AutoMeetingNoteApp(rumps.App):
             return status == 3  # AVAuthorizationStatusAuthorized
         except Exception:
             return True
+
+    @staticmethod
+    def _request_mic_permission() -> bool:
+        try:
+            import AVFoundation
+
+            request_access = getattr(AVFoundation.AVCaptureDevice, "requestAccessForMediaType_completionHandler_", None)
+            if request_access is None:
+                logger.warning("마이크 권한 요청 API를 사용할 수 없습니다.")
+                return False
+
+            granted = {"value": False}
+            ready = threading.Event()
+
+            def _completion_handler(allowed):
+                granted["value"] = bool(allowed)
+                ready.set()
+
+            request_access(AVFoundation.AVMediaTypeAudio, _completion_handler)
+            ready.wait(timeout=10)
+            logger.info("마이크 권한 요청 결과: %s", granted["value"])
+            return bool(granted["value"])
+        except Exception as e:
+            logger.warning("마이크 권한 요청 실패: %s", e)
+            return False
+
+    @staticmethod
+    def _open_microphone_settings() -> bool:
+        commands = [
+            ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"],
+            ["open", "-a", "System Settings"],
+        ]
+        for cmd in commands:
+            try:
+                subprocess.Popen(cmd)
+                logger.info("마이크 권한 설정 열기: %s", cmd)
+                return True
+            except Exception as e:
+                logger.warning("마이크 설정 열기 실패 (%s): %s", cmd, e)
+        return False
+
+    def _ensure_mic_permission(self, purpose: str) -> bool:
+        if self._check_mic_permission():
+            return True
+
+        self._request_mic_permission()
+        if self._check_mic_permission():
+            return True
+
+        settings_opened = self._open_microphone_settings()
+        settings_message = (
+            "권한 설정 화면을 열었습니다.\n"
+            if settings_opened
+            else "시스템 설정을 직접 열어 주세요.\n"
+        )
+        rumps.alert(
+            title="마이크 권한 필요",
+            message=f"{purpose}에는 마이크 권한이 필요합니다.\n\n"
+                    f"{settings_message}"
+                    "시스템 설정 → 개인 정보 보호 및 보안 → 마이크\n"
+                    "에서 AutoMeetingNote를 허용한 후 다시 시도하세요.",
+        )
+        return False
 
     def _toggle_screen_rec(self, sender):
         if self._is_recording:
@@ -955,26 +1210,23 @@ class AutoMeetingNoteApp(rumps.App):
             self._pause_item.title = "일시 정지"
             self._pause_item.set_callback(None)
             self._stop_rec_timer()
-            mode, output_path, audio_path, mic_path, audio_offset = self._recorder.stop()
+            mode, output_path, audio_path, mic_path, audio_offset, mic_audio_offset = self._recorder.stop()
             threading.Thread(
                 target=self._on_recording_stopped,
-                args=(mode, output_path, audio_path, mic_path, audio_offset),
+                args=(mode, output_path, audio_path, mic_path, audio_offset, mic_audio_offset),
                 daemon=True,
             ).start()
         else:
             # 권한 확인
-            if not self._check_screen_permission():
-                rumps.alert(
-                    title="화면 녹화 권한 필요",
-                    message="화면 녹화 권한이 없습니다.\n\n"
-                            "시스템 설정 → 개인 정보 보호 및 보안 → 화면 및 시스템 오디오 녹음\n"
-                            "에서 AutoMeetingNote를 허용한 후 앱을 재시작하세요.",
-                )
+            if not self._ensure_screen_permission("화면 녹화"):
+                return
+            if bool(self._config.get("mic_enabled", True)) and not self._ensure_mic_permission("마이크 녹음"):
                 return
             # UI 먼저 업데이트 후 백그라운드에서 SCStream + screencapture 시작
             # (SCShareableContent 콜백이 메인 스레드 필요 → 메인 스레드 블록 시 데드락)
             self._is_recording = True
             self._recording_mode = 'screen'
+            self._recorder.set_mic_latency_correction(float(self._config.get("mic_latency_correction_seconds", 0.0)))
             sender.title = "녹화 중지"
             self._audio_rec_item.set_callback(None)
             self._pause_item.set_callback(self._toggle_pause)
@@ -982,14 +1234,19 @@ class AutoMeetingNoteApp(rumps.App):
 
             watch_dir = Path(self._config.get("watch_dir", "~/Desktop")).expanduser()
             watch_dir.mkdir(parents=True, exist_ok=True)
+            sync_session = self._create_sync_diagnostic_session("screen", watch_dir)
 
             def _start_bg():
                 mic_enabled = bool(self._config.get("mic_enabled", True))
                 mic_index = str(self._config.get("mic_device_index") or "builtin")
                 try:
                     self._recorder.start_screen_recording(watch_dir, mic_enabled=mic_enabled, mic_device_index=mic_index)
+                    self._schedule_sync_diagnostic_probe(sync_session, include_flash=True)
                 except Exception as e:
                     logger.error("화면 녹화 시작 실패: %s", e)
+                    if sync_session is not None:
+                        sync_session.finalize("start_failed", error=str(e))
+                    self._clear_sync_diagnostic_session()
                     self._is_recording = False
                     self._stop_rec_timer()
                     def _revert(t):
@@ -1012,26 +1269,23 @@ class AutoMeetingNoteApp(rumps.App):
             self._pause_item.title = "일시 정지"
             self._pause_item.set_callback(None)
             self._stop_rec_timer()
-            mode, output_path, audio_path, mic_path, audio_offset = self._recorder.stop()
+            mode, output_path, audio_path, mic_path, audio_offset, mic_audio_offset = self._recorder.stop()
             threading.Thread(
                 target=self._on_recording_stopped,
-                args=(mode, output_path, audio_path, mic_path, audio_offset),
+                args=(mode, output_path, audio_path, mic_path, audio_offset, mic_audio_offset),
                 daemon=True,
             ).start()
         else:
             # 권한 확인 (시스템 오디오는 화면 녹화 권한 필요)
-            if not self._check_screen_permission():
-                rumps.alert(
-                    title="화면 녹화 권한 필요",
-                    message="시스템 오디오 녹음에는 화면 녹화 권한이 필요합니다.\n\n"
-                            "시스템 설정 → 개인 정보 보호 및 보안 → 화면 및 시스템 오디오 녹음\n"
-                            "에서 AutoMeetingNote를 허용한 후 앱을 재시작하세요.",
-                )
+            if not self._ensure_screen_permission("시스템 오디오 녹음"):
+                return
+            if bool(self._config.get("mic_enabled", True)) and not self._ensure_mic_permission("마이크 녹음"):
                 return
             # UI 먼저 업데이트 후 백그라운드에서 SCStream 시작
             # (SCShareableContent 콜백이 메인 스레드 필요 → 메인 스레드 블록 시 데드락)
             self._is_recording = True
             self._recording_mode = 'audio'
+            self._recorder.set_mic_latency_correction(float(self._config.get("mic_latency_correction_seconds", 0.0)))
             sender.title = "녹음 중지"
             self._screen_rec_item.set_callback(None)
             self._pause_item.set_callback(self._toggle_pause)
@@ -1039,14 +1293,19 @@ class AutoMeetingNoteApp(rumps.App):
 
             watch_dir = Path(self._config.get("watch_dir", "~/Desktop")).expanduser()
             watch_dir.mkdir(parents=True, exist_ok=True)
+            sync_session = self._create_sync_diagnostic_session("audio", watch_dir)
 
             def _start_bg():
                 mic_enabled = bool(self._config.get("mic_enabled", True))
                 mic_index = str(self._config.get("mic_device_index") or "builtin")
                 try:
                     self._recorder.start_audio_recording(watch_dir, mic_enabled=mic_enabled, mic_device_index=mic_index)
+                    self._schedule_sync_diagnostic_probe(sync_session, include_flash=False)
                 except Exception as e:
                     logger.error("녹음 시작 실패: %s", e)
+                    if sync_session is not None:
+                        sync_session.finalize("start_failed", error=str(e))
+                    self._clear_sync_diagnostic_session()
                     self._is_recording = False
                     self._stop_rec_timer()
                     def _revert(t):
@@ -1097,13 +1356,28 @@ class AutoMeetingNoteApp(rumps.App):
             self._rec_timer = None
         self._pending_app_title = "MN"
 
-    def _on_recording_stopped(self, mode: str, output_path, audio_path=None, mic_path=None, audio_offset=0.0):
+    def _on_recording_stopped(
+        self,
+        mode: str,
+        output_path,
+        audio_path=None,
+        mic_path=None,
+        audio_offset=0.0,
+        mic_audio_offset=0.0,
+    ):
         """녹화/녹음 종료 후 후처리 (백그라운드 스레드에서 실행)."""
         if output_path is None:
             return
         stt_skip = self._config.get("stt_skip", False)
+        sync_session = getattr(self, "_sync_diagnostic_session", None)
         try:
             if mode == "screen":
+                if sync_session is not None:
+                    sync_session.preserve_artifact("raw_video", Path(output_path), group="raw")
+                    if audio_path:
+                        sync_session.preserve_artifact("raw_system_audio", Path(audio_path), group="raw")
+                    if mic_path:
+                        sync_session.preserve_artifact("raw_mic_audio", Path(mic_path), group="raw")
                 if Path(output_path).suffix.lower() == ".mp4":
                     if audio_path or mic_path:
                         self._on_status("녹화 오디오 병합 중...")
@@ -1112,6 +1386,7 @@ class AutoMeetingNoteApp(rumps.App):
                             audio_path,
                             mic_path=mic_path,
                             audio_offset=audio_offset,
+                            mic_audio_offset=mic_audio_offset,
                         )
                     else:
                         mp4_path = Path(output_path)
@@ -1121,9 +1396,13 @@ class AutoMeetingNoteApp(rumps.App):
                         output_path, audio_path,
                         mic_path=mic_path,
                         audio_offset=audio_offset,
+                        mic_audio_offset=mic_audio_offset,
                         progress_callback=self._on_status,
                     )
                 self._notify("AutoMeetingNote", "녹화 완료", mp4_path.name)
+                if sync_session is not None:
+                    sync_session.preserve_artifact("final_video", mp4_path, group="final")
+                    sync_session.finalize("completed")
                 if stt_skip:
                     self._on_status(f"✅ 녹화 완료 (STT 건너뜀): {mp4_path.name}")
                     self._schedule_title_reset(5)
@@ -1138,12 +1417,24 @@ class AutoMeetingNoteApp(rumps.App):
                 self._run_single_file(str(mp4_path))
             elif mode == "audio":
                 # 시스템 오디오 + 마이크 믹싱
+                if sync_session is not None:
+                    sync_session.preserve_artifact("raw_system_audio", Path(output_path), group="raw")
+                    if mic_path:
+                        sync_session.preserve_artifact("raw_mic_audio", Path(mic_path), group="raw")
                 if mic_path:
                     self._on_status("오디오 믹싱 중...")
-                    final_path = self._recorder.mix_wav(output_path, mic_path)
+                    final_path = self._recorder.mix_wav(
+                        output_path,
+                        mic_path,
+                        audio_offset=audio_offset,
+                        mic_audio_offset=mic_audio_offset,
+                    )
                 else:
                     final_path = output_path
                 self._notify("AutoMeetingNote", "녹음 완료", final_path.name)
+                if sync_session is not None:
+                    sync_session.preserve_artifact("final_audio", Path(final_path), group="final")
+                    sync_session.finalize("completed")
                 if stt_skip:
                     self._on_status(f"✅ 녹음 완료 (STT 건너뜀): {final_path.name}")
                     self._schedule_title_reset(5)
@@ -1158,10 +1449,14 @@ class AutoMeetingNoteApp(rumps.App):
                 self._run_single_file(str(final_path))
         except Exception as e:
             logger.error("녹화 후처리 실패: %s", e)
+            if sync_session is not None:
+                sync_session.finalize("processing_failed", error=str(e))
             err_msg = f"❌ 녹화 후처리 오류: {e}"
             self._status_log.append(err_msg)
             self._pending_status_title = f"처리 현황: {err_msg}"
             self._schedule_title_reset(5)
+        finally:
+            self._clear_sync_diagnostic_session()
 
     def _finish_recording_while_processing(self):
         message = "처리중이므로 회의록 생성이 불가능하여 여기서 종료합니다."
@@ -1286,6 +1581,12 @@ class AutoMeetingNoteApp(rumps.App):
 def main():
     logger.info("=" * 60)
     logger.info("AutoMeetingNote 앱 시작")
+    logger.info(
+        "앱 정보: version=%s, resource_path=%s, app_file=%s",
+        APP_VERSION,
+        _resource_path(),
+        _APP_FILE,
+    )
 
     # exec으로 프로세스 교체 시 .app 번들 연결이 끊겨 LSUIElement가 적용 안 됨
     # rumps.App 생성 전에 먼저 Accessory 정책 설정 → 독 아이콘 숨김

@@ -37,17 +37,22 @@ class Recorder:
         self._output_path: Optional[Path] = None
         self._audio_path: Optional[Path] = None   # 시스템 오디오 WAV
         self._mic_path: Optional[Path] = None     # 마이크 오디오 WAV
-        self._audio_offset: float = 0.0           # 화면 녹화 시 오디오 선행 시간(초)
+        self._audio_offset: float = 0.0           # 시스템 오디오 선행 시간(초)
+        self._mic_audio_offset: float = 0.0       # 마이크 오디오 선행 시간(초)
         self._start_time: Optional[float] = None
         self._lock = threading.Lock()
         # pause/resume 세그먼트 지원
-        self._segments: list = []          # (output_path, audio_path, mic_path, audio_offset) 목록
+        self._segments: list = []          # (output_path, audio_path, mic_path, sys_offset, mic_offset) 목록
         self._is_paused: bool = False
         self._seg_index: int = 0
         self._output_dir: Optional[Path] = None
         self._mic_enabled: bool = True
         self._mic_device_index: str = "macbook"
         self._base_ts: Optional[str] = None
+        self._mic_started_at: Optional[float] = None
+        self._sync_diagnostic_session = None
+        self._mic_latency_correction_seconds: float = 0.0
+        self._using_stream_microphone: bool = False
 
     @property
     def is_recording(self) -> bool:
@@ -70,6 +75,12 @@ class Recorder:
         if self._start_time is None:
             return 0.0
         return time.time() - self._start_time
+
+    def attach_sync_diagnostic_session(self, session) -> None:
+        self._sync_diagnostic_session = session
+
+    def set_mic_latency_correction(self, seconds: float) -> None:
+        self._mic_latency_correction_seconds = float(seconds)
 
     @staticmethod
     def _normalize_audio_device_spec(spec: Optional[str]) -> str:
@@ -166,12 +177,11 @@ class Recorder:
         logger.warning("iPhone이 아닌 마이크를 찾지 못해 기존 설정을 유지합니다: %s", fallback_spec)
         return fallback_spec
 
-    def _start_mic(self, mic_path: Path, mic_device_index: Optional[str]) -> None:
+    def _start_mic(self, mic_path: Path, mic_device_index: Optional[str]) -> float:
         """ffmpeg avfoundation으로 마이크 녹음 시작."""
         ffmpeg_bin = find_ffmpeg()
         if not ffmpeg_bin:
-            logger.warning("ffmpeg 없음 — 마이크 녹음 건너뜀")
-            return
+            raise RuntimeError("ffmpeg가 없어 마이크 녹음을 시작할 수 없습니다.")
         mic_device_spec = (mic_device_index or "").strip().lstrip(":") or "0"
         cmd = [
             ffmpeg_bin,
@@ -182,13 +192,185 @@ class Recorder:
             "-ac", "1",
             "-y", str(mic_path),
         ]
-        self._mic_process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except Exception as e:
+            raise RuntimeError(f"마이크 녹음 시작 실패: {e}") from e
+
+        started_at = time.time()
+        time.sleep(0.2)
+        if process.poll() is not None:
+            stderr_text = ""
+            try:
+                _, stderr_output = process.communicate(timeout=1)
+            except Exception:
+                stderr_output = b""
+            if isinstance(stderr_output, bytes):
+                stderr_text = stderr_output.decode("utf-8", errors="ignore").strip()
+            elif isinstance(stderr_output, str):
+                stderr_text = stderr_output.strip()
+            detail = stderr_text.splitlines()[-1] if stderr_text else f"입력 장치={mic_device_spec}"
+            logger.error("마이크 녹음 시작 실패: %s", detail)
+            self._mic_process = None
+            raise RuntimeError(f"마이크 녹음 시작 실패: {detail}")
+
+        self._mic_process = process
         logger.info("마이크 녹음 시작: %s (입력=%s)", mic_path.name, mic_device_spec)
+        return started_at
+
+    @staticmethod
+    def _capture_started_info(capture, fallback: float, *attr_names: str) -> tuple[float, str]:
+        names = attr_names or ("started_at",)
+        for attr_name in names:
+            started_at = getattr(capture, attr_name, None)
+            if isinstance(started_at, (int, float)):
+                return float(started_at), attr_name
+        return fallback, "fallback"
+
+    @classmethod
+    def _capture_started_at(cls, capture, fallback: float, *attr_names: str) -> float:
+        started_at, _ = cls._capture_started_info(capture, fallback, *attr_names)
+        return started_at
+
+    @staticmethod
+    def _amix_filter() -> str:
+        return "amix=inputs=2:duration=longest:dropout_transition=0:normalize=1"
+
+    @staticmethod
+    def _audio_input_args(path: Path, audio_offset: float) -> list[str]:
+        if audio_offset > 0.05:
+            return ["-ss", f"{audio_offset:.3f}", "-i", str(path)]
+        if audio_offset < -0.05:
+            return ["-itsoffset", f"{abs(audio_offset):.3f}", "-i", str(path)]
+        return ["-i", str(path)]
+
+    @staticmethod
+    def _offset_from_anchor(anchor: float, started_at: Optional[float]) -> float:
+        if isinstance(started_at, (int, float)):
+            return anchor - float(started_at)
+        return 0.0
+
+    def _mic_offset_from_anchor(self, anchor: float) -> float:
+        if self._using_stream_microphone:
+            return self._offset_from_anchor(anchor, self._mic_started_at)
+        return self._offset_from_anchor(anchor, self._mic_started_at) - self._mic_latency_correction_seconds
+
+    @staticmethod
+    def _format_debug_time(value: Optional[float]) -> str:
+        if isinstance(value, (int, float)):
+            return f"{float(value):.3f}"
+        return "-"
+
+    def _log_screen_sync_debug(
+        self,
+        sys_capture,
+        screen_writer,
+        sys_started_at: float,
+        sys_source: str,
+        mic_started_at: Optional[float],
+        screen_started_at: float,
+        screen_source: str,
+        sys_offset: float,
+        mic_offset: float,
+    ) -> None:
+        sys_first_sample = getattr(sys_capture, "first_sample_at", None)
+        screen_capture_started = getattr(screen_writer, "capture_started_at", None)
+        screen_recording_started = getattr(screen_writer, "started_at", None)
+        alt_first_sample_offset = None
+        if isinstance(sys_first_sample, (int, float)):
+            alt_first_sample_offset = screen_started_at - float(sys_first_sample)
+
+        logger.info(
+            "화면 녹화 싱크 로그: "
+            "sys.started_at=%s(%s), sys.first_sample_at=%s, "
+            "mic.started_at=%s, screen.capture_started_at=%s, screen.started_at=%s, "
+            "sys_offset=%.3f(screen:%s-sys:%s), mic_offset=%.3f, alt_first_sample_offset=%s",
+            self._format_debug_time(sys_started_at),
+            sys_source,
+            self._format_debug_time(sys_first_sample),
+            self._format_debug_time(mic_started_at),
+            self._format_debug_time(screen_capture_started),
+            self._format_debug_time(screen_recording_started),
+            sys_offset,
+            screen_source,
+            sys_source,
+            mic_offset,
+            self._format_debug_time(alt_first_sample_offset),
+        )
+        if self._sync_diagnostic_session is not None:
+            self._sync_diagnostic_session.record_sync_snapshot(
+                "screen_start",
+                {
+                    "sys.started_at": sys_started_at,
+                    "sys.source": sys_source,
+                    "sys.first_sample_at": sys_first_sample,
+                    "mic.started_at": mic_started_at,
+                    "screen.capture_started_at": screen_capture_started,
+                    "screen.started_at": screen_recording_started,
+                    "screen.source": screen_source,
+                    "sys_offset": sys_offset,
+                    "mic_offset": mic_offset,
+                    "alt_first_sample_offset": alt_first_sample_offset,
+                },
+            )
+
+    def _log_audio_merge_debug(
+        self,
+        stage: str,
+        media_path: Path,
+        sys_offset: float,
+        mic_offset: float,
+        sys_args: Optional[list[str]],
+        mic_args: Optional[list[str]],
+    ) -> None:
+        logger.info(
+            "%s 싱크 로그: media=%s, sys_offset=%.3f, mic_offset=%.3f, sys_args=%s, mic_args=%s",
+            stage,
+            media_path.name,
+            sys_offset,
+            mic_offset,
+            sys_args if sys_args is not None else "-",
+            mic_args if mic_args is not None else "-",
+        )
+        if self._sync_diagnostic_session is not None:
+            self._sync_diagnostic_session.record_merge_stage(
+                stage,
+                media_name=media_path.name,
+                sys_offset=sys_offset,
+                mic_offset=mic_offset,
+                sys_args=sys_args,
+                mic_args=mic_args,
+            )
+
+    def _log_audio_recording_sync_debug(
+        self,
+        sys_started_at: float,
+        mic_started_at: Optional[float],
+        sys_offset: float,
+        mic_offset: float,
+    ) -> None:
+        logger.info(
+            "오디오 녹음 싱크 로그: sys.started_at=%s, mic.started_at=%s, sys_offset=%.3f, mic_offset=%.3f",
+            self._format_debug_time(sys_started_at),
+            self._format_debug_time(mic_started_at),
+            sys_offset,
+            mic_offset,
+        )
+        if self._sync_diagnostic_session is not None:
+            self._sync_diagnostic_session.record_sync_snapshot(
+                "audio_start",
+                {
+                    "sys.started_at": sys_started_at,
+                    "mic.started_at": mic_started_at,
+                    "sys_offset": sys_offset,
+                    "mic_offset": mic_offset,
+                },
+            )
 
     def _stop_mic(self) -> None:
         """ffmpeg 마이크 녹음 중지."""
@@ -231,27 +413,65 @@ class Recorder:
 
             # 1) SCStream: 시스템 오디오 캡처 (블로킹, ~1초 소요)
             self._sys_audio = SystemAudioCapture()
-            self._sys_audio.start(audio_path)
-            sys_audio_ready_time = time.time()  # 이 시점부터 오디오 기록 시작
+            mic_path = output_dir / f"{ts}_녹화_mic.wav" if mic_enabled else None
+            self._sys_audio.start(
+                audio_path,
+                mic_output_path=mic_path if mic_enabled else None,
+                mic_device_spec=self._mic_device_index if mic_enabled else None,
+            )
+            sys_audio_ready_time, sys_audio_source = self._capture_started_info(
+                self._sys_audio,
+                time.time(),
+                "started_at",
+            )
             logger.info("시스템 오디오 캡처 시작: %s", audio_path.name)
 
-            # 2) ffmpeg: 마이크 동시 캡처 (선택)
-            if mic_enabled:
-                mic_path = output_dir / f"{ts}_녹화_mic.wav"
-                self._start_mic(mic_path, self._mic_device_index)
-                self._mic_path = mic_path if self._mic_process else None
+            # 2) ScreenCaptureKit 마이크 또는 ffmpeg 마이크 동시 캡처 (선택)
+            self._using_stream_microphone = False
+            if mic_enabled and getattr(self._sys_audio, "mic_capture_active", False):
+                self._mic_started_at = getattr(self._sys_audio, "mic_started_at", sys_audio_ready_time)
+                self._mic_path = mic_path
+                self._using_stream_microphone = True
+            elif mic_enabled:
+                try:
+                    self._mic_started_at = self._start_mic(mic_path, self._mic_device_index)
+                    self._mic_path = mic_path if self._mic_process else None
+                except Exception:
+                    try:
+                        self._sys_audio.stop()
+                    except Exception as e:
+                        logger.warning("마이크 실패 후 시스템 오디오 중지 오류: %s", e)
+                    self._sys_audio = None
+                    raise
             else:
                 self._mic_path = None
 
             # 3) SCStream + AVAssetWriter: 실시간 화면 인코딩
             self._screen_writer = LiveScreenWriter()
-            screen_start_time = time.time()
             logger.info("화면 녹화 시작: %s", mp4_path.name)
             self._screen_writer.start(mp4_path)
+            screen_start_time, screen_source = self._capture_started_info(
+                self._screen_writer,
+                time.time(),
+                "capture_started_at",
+                "started_at",
+            )
 
             # 오디오(sys_audio_ready_time)와 영상(screen_start_time)의 시작 차이만큼 trim
             # t_before_sys 기준이 아닌 실제 오디오 기록 시작 시점 기준
-            self._audio_offset = screen_start_time - sys_audio_ready_time
+            self._audio_offset = self._offset_from_anchor(screen_start_time, sys_audio_ready_time)
+            self._mic_audio_offset = self._mic_offset_from_anchor(screen_start_time)
+            self._log_screen_sync_debug(
+                self._sys_audio,
+                self._screen_writer,
+                sys_audio_ready_time,
+                sys_audio_source,
+                self._mic_started_at,
+                screen_start_time,
+                screen_source,
+                self._audio_offset,
+                self._mic_audio_offset,
+            )
 
             self._mode = "screen"
             self._output_path = mp4_path
@@ -279,15 +499,46 @@ class Recorder:
             sys_path = output_dir / f"{ts}_녹음_sys.wav"
 
             self._sys_audio = SystemAudioCapture()
-            self._sys_audio.start(sys_path)
+            mic_path = output_dir / f"{ts}_녹음_mic.wav" if mic_enabled else None
+            self._sys_audio.start(
+                sys_path,
+                mic_output_path=mic_path if mic_enabled else None,
+                mic_device_spec=self._mic_device_index if mic_enabled else None,
+            )
+            sys_audio_ready_time, _ = self._capture_started_info(
+                self._sys_audio,
+                time.time(),
+                "started_at",
+            )
 
-            if mic_enabled:
-                mic_path = output_dir / f"{ts}_녹음_mic.wav"
-                self._start_mic(mic_path, self._mic_device_index)
-                self._mic_path = mic_path if self._mic_process else None
+            self._using_stream_microphone = False
+            if mic_enabled and getattr(self._sys_audio, "mic_capture_active", False):
+                self._mic_started_at = getattr(self._sys_audio, "mic_started_at", sys_audio_ready_time)
+                self._mic_path = mic_path
+                self._using_stream_microphone = True
+            elif mic_enabled:
+                try:
+                    self._mic_started_at = self._start_mic(mic_path, self._mic_device_index)
+                    self._mic_path = mic_path if self._mic_process else None
+                except Exception:
+                    try:
+                        self._sys_audio.stop()
+                    except Exception as e:
+                        logger.warning("마이크 실패 후 시스템 오디오 중지 오류: %s", e)
+                    self._sys_audio = None
+                    raise
             else:
                 self._mic_path = None
 
+            anchor_time = max(sys_audio_ready_time, self._mic_started_at or sys_audio_ready_time)
+            self._audio_offset = self._offset_from_anchor(anchor_time, sys_audio_ready_time)
+            self._mic_audio_offset = self._mic_offset_from_anchor(anchor_time)
+            self._log_audio_recording_sync_debug(
+                sys_audio_ready_time,
+                self._mic_started_at,
+                self._audio_offset,
+                self._mic_audio_offset,
+            )
             self._mode = "audio"
             self._output_path = sys_path
             self._start_time = time.time()
@@ -310,7 +561,9 @@ class Recorder:
                     logger.error("시스템 오디오 중지 오류: %s", e)
                 self._sys_audio = None
 
-            self._stop_mic()
+            if not self._using_stream_microphone:
+                self._stop_mic()
+            self._mic_started_at = None
 
         elif self._mode == "audio":
             if self._sys_audio is not None:
@@ -320,7 +573,9 @@ class Recorder:
                     logger.error("시스템 오디오 중지 오류: %s", e)
                 self._sys_audio = None
 
-            self._stop_mic()
+            if not self._using_stream_microphone:
+                self._stop_mic()
+            self._mic_started_at = None
 
     def pause(self) -> None:
         """녹화/녹음 일시 정지. 현재 세그먼트를 저장하고 프로세스 중지."""
@@ -328,11 +583,14 @@ class Recorder:
             if self._mode is None or self._is_paused:
                 return
             self._stop_current_processes()
-            self._segments.append((self._output_path, self._audio_path, self._mic_path, self._audio_offset))
+            self._segments.append(
+                (self._output_path, self._audio_path, self._mic_path, self._audio_offset, self._mic_audio_offset)
+            )
             self._output_path = None
             self._audio_path = None
             self._mic_path = None
             self._audio_offset = 0.0
+            self._mic_audio_offset = 0.0
             self._is_paused = True
             logger.info("일시 정지 (세그먼트 %d 저장)", self._seg_index)
 
@@ -352,22 +610,60 @@ class Recorder:
                 audio_path = self._output_dir / f"{ts}_녹화_sys_seg{seg}.wav"
 
                 self._sys_audio = SystemAudioCapture()
-                self._sys_audio.start(audio_path)
-                sys_audio_ready_time = time.time()
+                mic_path = self._output_dir / f"{ts}_녹화_mic_seg{seg}.wav" if self._mic_enabled else None
+                self._sys_audio.start(
+                    audio_path,
+                    mic_output_path=mic_path if self._mic_enabled else None,
+                    mic_device_spec=self._mic_device_index if self._mic_enabled else None,
+                )
+                sys_audio_ready_time, sys_audio_source = self._capture_started_info(
+                    self._sys_audio,
+                    time.time(),
+                    "started_at",
+                )
                 logger.info("재개: 시스템 오디오 시작: %s", audio_path.name)
 
-                if self._mic_enabled:
-                    mic_path = self._output_dir / f"{ts}_녹화_mic_seg{seg}.wav"
-                    self._start_mic(mic_path, self._mic_device_index)
-                    self._mic_path = mic_path if self._mic_process else None
+                self._using_stream_microphone = False
+                if self._mic_enabled and getattr(self._sys_audio, "mic_capture_active", False):
+                    self._mic_started_at = getattr(self._sys_audio, "mic_started_at", sys_audio_ready_time)
+                    self._mic_path = mic_path
+                    self._using_stream_microphone = True
+                elif self._mic_enabled:
+                    try:
+                        self._mic_started_at = self._start_mic(mic_path, self._mic_device_index)
+                        self._mic_path = mic_path if self._mic_process else None
+                    except Exception:
+                        try:
+                            self._sys_audio.stop()
+                        except Exception as e:
+                            logger.warning("재개 중 마이크 실패 후 시스템 오디오 중지 오류: %s", e)
+                        self._sys_audio = None
+                        raise
                 else:
                     self._mic_path = None
 
                 self._screen_writer = LiveScreenWriter()
-                screen_start_time = time.time()
                 logger.info("재개: 화면 녹화 시작: %s", mp4_path.name)
                 self._screen_writer.start(mp4_path)
-                self._audio_offset = screen_start_time - sys_audio_ready_time
+                screen_start_time, screen_source = self._capture_started_info(
+                    self._screen_writer,
+                    time.time(),
+                    "capture_started_at",
+                    "started_at",
+                )
+                self._audio_offset = self._offset_from_anchor(screen_start_time, sys_audio_ready_time)
+                self._mic_audio_offset = self._mic_offset_from_anchor(screen_start_time)
+                self._log_screen_sync_debug(
+                    self._sys_audio,
+                    self._screen_writer,
+                    sys_audio_ready_time,
+                    sys_audio_source,
+                    self._mic_started_at,
+                    screen_start_time,
+                    screen_source,
+                    self._audio_offset,
+                    self._mic_audio_offset,
+                )
                 self._output_path = mp4_path
                 self._audio_path = audio_path
 
@@ -375,23 +671,54 @@ class Recorder:
                 sys_path = self._output_dir / f"{ts}_녹음_sys_seg{seg}.wav"
 
                 self._sys_audio = SystemAudioCapture()
-                self._sys_audio.start(sys_path)
+                mic_path = self._output_dir / f"{ts}_녹음_mic_seg{seg}.wav" if self._mic_enabled else None
+                self._sys_audio.start(
+                    sys_path,
+                    mic_output_path=mic_path if self._mic_enabled else None,
+                    mic_device_spec=self._mic_device_index if self._mic_enabled else None,
+                )
+                sys_audio_ready_time, _ = self._capture_started_info(
+                    self._sys_audio,
+                    time.time(),
+                    "started_at",
+                )
                 logger.info("재개: 시스템 오디오 시작: %s", sys_path.name)
 
-                if self._mic_enabled:
-                    mic_path = self._output_dir / f"{ts}_녹음_mic_seg{seg}.wav"
-                    self._start_mic(mic_path, self._mic_device_index)
-                    self._mic_path = mic_path if self._mic_process else None
+                self._using_stream_microphone = False
+                if self._mic_enabled and getattr(self._sys_audio, "mic_capture_active", False):
+                    self._mic_started_at = getattr(self._sys_audio, "mic_started_at", sys_audio_ready_time)
+                    self._mic_path = mic_path
+                    self._using_stream_microphone = True
+                elif self._mic_enabled:
+                    try:
+                        self._mic_started_at = self._start_mic(mic_path, self._mic_device_index)
+                        self._mic_path = mic_path if self._mic_process else None
+                    except Exception:
+                        try:
+                            self._sys_audio.stop()
+                        except Exception as e:
+                            logger.warning("재개 중 마이크 실패 후 시스템 오디오 중지 오류: %s", e)
+                        self._sys_audio = None
+                        raise
                 else:
                     self._mic_path = None
 
+                anchor_time = max(sys_audio_ready_time, self._mic_started_at or sys_audio_ready_time)
+                self._audio_offset = self._offset_from_anchor(anchor_time, sys_audio_ready_time)
+                self._mic_audio_offset = self._mic_offset_from_anchor(anchor_time)
+                self._log_audio_recording_sync_debug(
+                    sys_audio_ready_time,
+                    self._mic_started_at,
+                    self._audio_offset,
+                    self._mic_audio_offset,
+                )
                 self._output_path = sys_path
 
             self._is_paused = False
             logger.info("녹화/녹음 재개 (세그먼트 %d)", self._seg_index)
 
     def stop(self) -> tuple:
-        """녹화/녹음 중지. (mode, output_path, audio_path, mic_path, audio_offset) 반환."""
+        """녹화/녹음 중지. (mode, output_path, audio_path, mic_path, sys_offset, mic_offset) 반환."""
         with self._lock:
             mode = self._mode
 
@@ -399,31 +726,42 @@ class Recorder:
                 # 현재 녹화 중: 프로세스 중지 후 마지막 세그먼트 저장
                 self._stop_current_processes()
                 if self._output_path is not None:
-                    self._segments.append((self._output_path, self._audio_path, self._mic_path, self._audio_offset))
+                    self._segments.append(
+                        (
+                            self._output_path,
+                            self._audio_path,
+                            self._mic_path,
+                            self._audio_offset,
+                            self._mic_audio_offset,
+                        )
+                    )
             # 일시 정지 중이면 프로세스 없음, 세그먼트는 이미 pause()에서 저장됨
 
             segments = list(self._segments)
 
             if not segments:
                 output_path = audio_path = mic_path = None
-                audio_offset = 0.0
+                audio_offset = mic_audio_offset = 0.0
             elif len(segments) == 1:
-                output_path, audio_path, mic_path, audio_offset = segments[0]
+                output_path, audio_path, mic_path, audio_offset, mic_audio_offset = segments[0]
             else:
-                output_path, audio_path, mic_path, audio_offset = self._concat_segments(mode, segments)
+                output_path, audio_path, mic_path, audio_offset, mic_audio_offset = self._concat_segments(mode, segments)
 
             self._mode = None
             self._output_path = None
             self._audio_path = None
             self._mic_path = None
             self._audio_offset = 0.0
+            self._mic_audio_offset = 0.0
             self._start_time = None
             self._segments = []
             self._seg_index = 0
             self._is_paused = False
+            self._mic_started_at = None
+            self._using_stream_microphone = False
 
             logger.info("녹화/녹음 중지 완료")
-            return mode, output_path, audio_path, mic_path, audio_offset
+            return mode, output_path, audio_path, mic_path, audio_offset, mic_audio_offset
 
     def _trim_wav(self, ffmpeg_bin: str, in_path: Path, offset: float, out_path: Path) -> None:
         """오디오 앞부분을 offset초만큼 잘라 out_path에 저장."""
@@ -465,7 +803,7 @@ class Recorder:
         return cmd
 
     def _concat_segments(self, mode: str, segments: list) -> tuple:
-        """여러 세그먼트 파일을 하나로 합쳐 (output_path, audio_path, mic_path, offset) 반환."""
+        """여러 세그먼트 파일을 하나로 합쳐 (output_path, audio_path, mic_path, sys_offset, mic_offset) 반환."""
         ffmpeg_bin = find_ffmpeg()
         if not ffmpeg_bin:
             logger.warning("ffmpeg 없음 — 첫 세그먼트만 사용")
@@ -481,16 +819,16 @@ class Recorder:
             final_mic = parent / f"{ts}_녹화_mic.wav"
 
             mov_paths, trimmed_sys, trimmed_mic = [], [], []
-            for i, (out_path, audio_path, mic_path, offset) in enumerate(segments):
+            for i, (out_path, audio_path, mic_path, sys_offset, mic_offset) in enumerate(segments):
                 if out_path and out_path.exists():
                     mov_paths.append(out_path)
                 if audio_path and audio_path.exists() and audio_path.stat().st_size > 44:
                     trimmed = parent / f"_trim_sys_{i}.wav"
-                    self._trim_wav(ffmpeg_bin, audio_path, offset, trimmed)
+                    self._trim_wav(ffmpeg_bin, audio_path, sys_offset, trimmed)
                     trimmed_sys.append(trimmed)
                 if mic_path and mic_path.exists() and mic_path.stat().st_size > 44:
                     trimmed = parent / f"_trim_mic_{i}.wav"
-                    self._trim_wav(ffmpeg_bin, mic_path, offset, trimmed)
+                    self._trim_wav(ffmpeg_bin, mic_path, mic_offset, trimmed)
                     trimmed_mic.append(trimmed)
 
             if mov_paths:
@@ -505,7 +843,7 @@ class Recorder:
                     f.unlink(missing_ok=True)
 
             # 원본 세그먼트 파일 삭제
-            for out_path, audio_path, mic_path, _ in segments:
+            for out_path, audio_path, mic_path, _, _ in segments:
                 for f in [out_path, audio_path, mic_path]:
                     if f and f.exists() and f not in (final_mov, final_sys, final_mic):
                         try:
@@ -518,6 +856,7 @@ class Recorder:
                 final_sys if trimmed_sys else None,
                 final_mic if trimmed_mic else None,
                 0.0,
+                0.0,
             )
 
         elif mode == "audio":
@@ -525,15 +864,28 @@ class Recorder:
             final_sys = parent / f"{ts}_녹음_sys.wav"
             final_mic = parent / f"{ts}_녹음_mic.wav"
 
-            sys_paths = [seg[0] for seg in segments if seg[0] and seg[0].exists() and seg[0].stat().st_size > 44]
-            mic_paths = [seg[2] for seg in segments if seg[2] and seg[2].exists() and seg[2].stat().st_size > 44]
+            trimmed_sys: list[Path] = []
+            trimmed_mic: list[Path] = []
+            for i, (out_path, _, mic_path, sys_offset, mic_offset) in enumerate(segments):
+                if out_path and out_path.exists() and out_path.stat().st_size > 44:
+                    trimmed = parent / f"_trim_audio_sys_{i}.wav"
+                    self._trim_wav(ffmpeg_bin, out_path, sys_offset, trimmed)
+                    trimmed_sys.append(trimmed)
+                if mic_path and mic_path.exists() and mic_path.stat().st_size > 44:
+                    trimmed = parent / f"_trim_audio_mic_{i}.wav"
+                    self._trim_wav(ffmpeg_bin, mic_path, mic_offset, trimmed)
+                    trimmed_mic.append(trimmed)
 
-            if sys_paths:
-                self._concat_files(ffmpeg_bin, sys_paths, final_sys)
-            if mic_paths:
-                self._concat_files(ffmpeg_bin, mic_paths, final_mic)
+            if trimmed_sys:
+                self._concat_files(ffmpeg_bin, trimmed_sys, final_sys)
+                for f in trimmed_sys:
+                    f.unlink(missing_ok=True)
+            if trimmed_mic:
+                self._concat_files(ffmpeg_bin, trimmed_mic, final_mic)
+                for f in trimmed_mic:
+                    f.unlink(missing_ok=True)
 
-            for out_path, _, mic_path, _ in segments:
+            for out_path, _, mic_path, _, _ in segments:
                 for f in [out_path, mic_path]:
                     if f and f.exists() and f not in (final_sys, final_mic):
                         try:
@@ -542,15 +894,22 @@ class Recorder:
                             pass
 
             return (
-                final_sys if sys_paths else None,
+                final_sys if trimmed_sys else None,
                 None,
-                final_mic if mic_paths else None,
+                final_mic if trimmed_mic else None,
+                0.0,
                 0.0,
             )
 
         return segments[0]
 
-    def mix_wav(self, sys_path: Path, mic_path: Path) -> Path:
+    def mix_wav(
+        self,
+        sys_path: Path,
+        mic_path: Path,
+        audio_offset: float = 0.0,
+        mic_audio_offset: float = 0.0,
+    ) -> Path:
         """시스템 오디오 + 마이크 WAV를 amix로 믹싱 → 단일 WAV 반환. 원본 삭제."""
         ffmpeg_bin = find_ffmpeg()
         if not ffmpeg_bin:
@@ -559,15 +918,18 @@ class Recorder:
         out_path = sys_path.with_name(sys_path.stem.replace("_sys", "") + "_mixed.wav")
         has_sys = sys_path.exists() and sys_path.stat().st_size > 44
         has_mic = mic_path.exists() and mic_path.stat().st_size > 44
+        sys_args = self._audio_input_args(sys_path, audio_offset) if has_sys else None
+        mic_args = self._audio_input_args(mic_path, mic_audio_offset) if has_mic else None
 
         if has_sys and has_mic:
             cmd = [
                 ffmpeg_bin,
-                "-i", str(sys_path),
-                "-i", str(mic_path),
-                "-filter_complex", "amix=inputs=2:duration=longest:normalize=0",
+                *sys_args,
+                *mic_args,
+                "-filter_complex", self._amix_filter(),
                 "-y", str(out_path),
             ]
+            self._log_audio_merge_debug("오디오 믹싱", sys_path, audio_offset, mic_audio_offset, sys_args, mic_args)
             logger.info("오디오 믹싱: %s + %s → %s", sys_path.name, mic_path.name, out_path.name)
         elif has_sys:
             out_path = sys_path
@@ -599,6 +961,7 @@ class Recorder:
         audio_path: Optional[Path],
         mic_path: Optional[Path] = None,
         audio_offset: float = 0.0,
+        mic_audio_offset: float = 0.0,
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> Path:
         """MOV + 시스템 오디오 WAV [+ 마이크 WAV] → H.264 MP4로 병합 압축. 원본 파일 삭제.
@@ -620,17 +983,19 @@ class Recorder:
         has_mic = mic_path and mic_path.exists() and mic_path.stat().st_size > 44
 
         # 오디오 싱크 보정: 오디오가 영상보다 먼저 시작된 경우 앞부분 skip
-        ss = ["-ss", f"{audio_offset:.3f}"] if audio_offset > 0.05 else []
-        logger.info("오디오 싱크 오프셋: %.3fs", audio_offset)
+        logger.info("오디오 싱크 오프셋: sys=%.3fs, mic=%.3fs", audio_offset, mic_audio_offset)
+        sys_args = self._audio_input_args(audio_path, audio_offset) if has_sys else None
+        mic_args = self._audio_input_args(mic_path, mic_audio_offset) if has_mic else None
+        self._log_audio_merge_debug("녹화 압축/병합", mov_path, audio_offset, mic_audio_offset, sys_args, mic_args)
 
         if has_sys and has_mic:
             # 영상 + 시스템 오디오 + 마이크 (amix)
             cmd = [
                 ffmpeg_bin,
                 "-i", str(mov_path),
-                *ss, "-i", str(audio_path),
-                *ss, "-i", str(mic_path),
-                "-filter_complex", "amix=inputs=2:duration=longest:normalize=0[aout]",
+                *sys_args,
+                *mic_args,
+                "-filter_complex", f"{self._amix_filter()}[aout]",
                 "-c:v", "h264_videotoolbox", "-q:v", "60",
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "[aout]",
@@ -643,7 +1008,7 @@ class Recorder:
             cmd = [
                 ffmpeg_bin,
                 "-i", str(mov_path),
-                *ss, "-i", str(audio_path),
+                *sys_args,
                 "-c:v", "h264_videotoolbox", "-q:v", "60",
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0",
@@ -656,7 +1021,7 @@ class Recorder:
             cmd = [
                 ffmpeg_bin,
                 "-i", str(mov_path),
-                *ss, "-i", str(mic_path),
+                *mic_args,
                 "-c:v", "h264_videotoolbox", "-q:v", "60",
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0",
@@ -747,6 +1112,7 @@ class Recorder:
         audio_path: Optional[Path],
         mic_path: Optional[Path] = None,
         audio_offset: float = 0.0,
+        mic_audio_offset: float = 0.0,
     ) -> Path:
         ffmpeg_bin = find_ffmpeg()
         if not ffmpeg_bin:
@@ -760,15 +1126,16 @@ class Recorder:
             raise RuntimeError(f"화면 녹화 파일이 비어 있습니다: {mp4_path.name}")
 
         temp_path = mp4_path.with_name(mp4_path.stem + "_mux.mp4")
-        ss = ["-ss", f"{audio_offset:.3f}"] if audio_offset > 0.05 else []
-
+        sys_args = self._audio_input_args(audio_path, audio_offset) if has_sys else None
+        mic_args = self._audio_input_args(mic_path, mic_audio_offset) if has_mic else None
+        self._log_audio_merge_debug("실시간 오디오 병합", mp4_path, audio_offset, mic_audio_offset, sys_args, mic_args)
         if has_sys and has_mic:
             cmd = [
                 ffmpeg_bin,
                 "-i", str(mp4_path),
-                *ss, "-i", str(audio_path),
-                *ss, "-i", str(mic_path),
-                "-filter_complex", "amix=inputs=2:duration=longest:normalize=0[aout]",
+                *sys_args,
+                *mic_args,
+                "-filter_complex", f"{self._amix_filter()}[aout]",
                 "-c:v", "copy",
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "[aout]",
@@ -780,7 +1147,7 @@ class Recorder:
             cmd = [
                 ffmpeg_bin,
                 "-i", str(mp4_path),
-                *ss, "-i", str(source),
+                *(sys_args if has_sys else mic_args),
                 "-c:v", "copy",
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0",

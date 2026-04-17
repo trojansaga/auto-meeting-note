@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from pathlib import Path
 
 import CoreMedia
@@ -50,10 +51,20 @@ class LiveScreenWriter:
         self._output_path: Path | None = None
         self._display_width = 0
         self._display_height = 0
+        self._capture_started_at: float | None = None
+        self._started_at: float | None = None
 
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def started_at(self) -> float | None:
+        return self._started_at
+
+    @property
+    def capture_started_at(self) -> float | None:
+        return self._capture_started_at
 
     def _recording_info(self) -> str:
         if self._recording_output is None:
@@ -69,6 +80,7 @@ class LiveScreenWriter:
         return f"duration={duration}, size={file_size}"
 
     def _handle_recording_started(self, recording_output) -> None:
+        self._started_at = time.time()
         logger.info(
             "SCRecordingOutput 시작: path=%s, %s",
             self._output_path,
@@ -101,6 +113,8 @@ class LiveScreenWriter:
         self._finished.clear()
         self._error = None
         self._running = False
+        self._capture_started_at = None
+        self._started_at = None
 
         if output_path.exists():
             output_path.unlink(missing_ok=True)
@@ -129,6 +143,8 @@ class LiveScreenWriter:
                 config.setHeight_(height)
                 if hasattr(config, "setShowsCursor_"):
                     config.setShowsCursor_(True)
+                if hasattr(config, "setQueueDepth_"):
+                    config.setQueueDepth_(8)
                 config.setMinimumFrameInterval_(CoreMedia.CMTimeMake(1, 30))
 
                 recording_config = SCK.SCRecordingOutputConfiguration.alloc().init()
@@ -159,6 +175,7 @@ class LiveScreenWriter:
                     if err:
                         self._error = RuntimeError(f"화면 스트림 시작 실패: {err}")
                     else:
+                        self._capture_started_at = time.time()
                         self._running = True
                     self._ready.set()
 
