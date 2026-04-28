@@ -11,6 +11,13 @@ from cancellation import OperationCancelledError
 
 logger = logging.getLogger(__name__)
 
+NOTE_PROVIDERS = {
+    "openai": "OpenAI",
+    "naver": "Naver AI Gateway",
+}
+
+NAVER_DEFAULT_BASE_URL = "https://namc-aigw.io.naver.com"
+
 SYSTEM_PROMPT = (
     "당신은 회의록 작성 전문가입니다. 주어진 회의 대본을 분석하여 구조화된 회의록을 작성하세요.\n"
     "반드시 한국어로 작성하세요."
@@ -51,6 +58,21 @@ BASE_DELAY = 2
 _INVALID_CHARS = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
 
 
+def _create_client(
+    provider: str,
+    naver_api_key: str = "",
+    naver_api_base_url: str = NAVER_DEFAULT_BASE_URL,
+) -> openai.OpenAI:
+    if provider == "naver":
+        if not naver_api_key:
+            raise RuntimeError("Naver API 키가 설정되지 않았습니다. config.yaml의 naver_api_key를 확인하세요.")
+        return openai.OpenAI(
+            base_url=naver_api_base_url.rstrip("/"),
+            api_key=naver_api_key,
+        )
+    return openai.OpenAI()
+
+
 def _extract_title(content: str) -> str:
     """생성된 회의록 첫 번째 H1에서 제목 추출. 파일명에 사용 가능한 형태로 반환."""
     m = re.search(r'^#\s+(.+)', content, re.MULTILINE)
@@ -66,6 +88,9 @@ def generate_note(
     original_filename: str,
     created_at: str,
     model: str = "gpt-5.4",
+    provider: str = "openai",
+    naver_api_key: str = "",
+    naver_api_base_url: str = NAVER_DEFAULT_BASE_URL,
     progress_callback: Optional[Callable[[str], None]] = None,
     stop_event: Optional[Event] = None,
 ) -> str:
@@ -87,7 +112,9 @@ def generate_note(
         {"role": "user", "content": user_prompt},
     ]
 
-    client = openai.OpenAI()
+    client = _create_client(provider, naver_api_key, naver_api_base_url)
+    # temperature를 지원하지 않는 모델(Bedrock Claude 등)을 위해 provider별로 분리
+    extra_kwargs = {"temperature": 0.3} if provider == "openai" else {}
     last_error = None
 
     def _check_stop():
@@ -97,7 +124,7 @@ def generate_note(
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             _check_stop()
-            logger.info("회의록 생성 API 호출 (시도 %d/%d, 모델: %s)", attempt, MAX_RETRIES, model)
+            logger.info("회의록 생성 API 호출 (시도 %d/%d, provider: %s, 모델: %s)", attempt, MAX_RETRIES, provider, model)
 
             if progress_callback or stop_event is not None:
                 content_parts = []
@@ -106,8 +133,8 @@ def generate_note(
                 with client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    temperature=0.3,
                     stream=True,
+                    **extra_kwargs,
                 ) as stream:
                     for chunk in stream:
                         _check_stop()
@@ -125,7 +152,7 @@ def generate_note(
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    temperature=0.3,
+                    **extra_kwargs,
                 )
                 content = response.choices[0].message.content
 
@@ -133,9 +160,9 @@ def generate_note(
 
         except OperationCancelledError:
             raise
-        except (openai.NotFoundError, openai.AuthenticationError) as e:
+        except (openai.NotFoundError, openai.AuthenticationError, openai.BadRequestError) as e:
             logger.error("재시도 불가 오류: %s", e)
-            raise RuntimeError(f"OpenAI API 오류: {e}") from e
+            raise RuntimeError(f"API 오류: {e}") from e
         except (openai.APIConnectionError, openai.RateLimitError, openai.APIError) as e:
             last_error = e
             if attempt < MAX_RETRIES:
@@ -145,7 +172,7 @@ def generate_note(
                 time.sleep(delay)
             else:
                 logger.error("API 호출 최종 실패: %s", e)
-                raise RuntimeError(f"OpenAI API 호출 {MAX_RETRIES}회 실패: {last_error}") from e
+                raise RuntimeError(f"API 호출 {MAX_RETRIES}회 실패: {last_error}") from e
 
     _check_stop()
     title = _extract_title(content)

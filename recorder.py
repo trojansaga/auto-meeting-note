@@ -102,6 +102,7 @@ class Recorder:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 timeout=5,
             )
         except Exception as e:

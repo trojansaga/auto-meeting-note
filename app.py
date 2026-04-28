@@ -50,6 +50,7 @@ import yaml
 from dotenv import load_dotenv
 
 from hotkey_manager import HotkeyManager, format_hotkey, DEFAULT_HOTKEYS, HOTKEY_LABELS
+from note_generator import NOTE_PROVIDERS, NAVER_DEFAULT_BASE_URL
 from pipeline import run_pipeline, PipelineCancelledError
 from recorder import Recorder
 from sync_diagnostics import SyncDiagnosticSession, analyze_session, emit_screen_flash, play_probe_click
@@ -127,7 +128,11 @@ DEFAULT_CONFIG = {
     "qwen_max_batch_size": 1,
     "qwen_chunk_seconds": 600,
     "language": "ko",
+    "note_provider": "openai",
     "openai_model": "gpt-5.4",
+    "naver_model": "gpt-4o",
+    "naver_api_key": "",
+    "naver_api_base_url": "https://namc-aigw.io.naver.com",
     "export_dir": "~/Downloads",
     "mic_enabled": False,
     "mic_device_index": "macbook",
@@ -262,6 +267,8 @@ class AutoMeetingNoteApp(rumps.App):
 
         self._model_menu_items: dict = {}
         self._model_menu = self._build_model_menu()
+        self._note_provider_menu_items: dict = {}
+        self._note_provider_menu = self._build_note_provider_menu()
         self._preprocess_menu = self._build_preprocess_menu()
         self._hotkey_menu = self._build_hotkey_menu()
 
@@ -286,6 +293,7 @@ class AutoMeetingNoteApp(rumps.App):
             self._status_item,
             None,
             self._model_menu,
+            self._note_provider_menu,
             self._preprocess_menu,
             self._hotkey_menu,
             None,
@@ -418,6 +426,10 @@ class AutoMeetingNoteApp(rumps.App):
             )
 
     def _validate_openai_model(self):
+        note_provider = self._config.get("note_provider", "openai")
+        if note_provider != "openai":
+            logger.info("회의록 provider: %s — OpenAI 모델 검증 건너뜀", note_provider)
+            return
         import openai
         model = self._config.get("openai_model", "gpt-5.4")
         try:
@@ -603,6 +615,113 @@ class AutoMeetingNoteApp(rumps.App):
         model_menu.add(apple_menu)
 
         return model_menu
+
+    def _get_note_provider_menu_title(self) -> str:
+        provider = self._config.get("note_provider", "openai")
+        label = NOTE_PROVIDERS.get(provider, provider)
+        model = self._config.get("naver_model", "gpt-4o") if provider == "naver" else self._config.get("openai_model", "gpt-5.4")
+        return f"회의록 AI: {label} / {model}"
+
+    def _get_naver_key_display(self) -> str:
+        key = self._config.get("naver_api_key", "")
+        if not key:
+            return "미설정"
+        return "****" + key[-4:] if len(key) > 4 else "****"
+
+    def _build_note_provider_menu(self) -> rumps.MenuItem:
+        menu = rumps.MenuItem(self._get_note_provider_menu_title())
+        current = self._config.get("note_provider", "openai")
+        for provider_key, provider_label in NOTE_PROVIDERS.items():
+            item = rumps.MenuItem(provider_label, callback=self._make_note_provider_callback(provider_key))
+            item.state = 1 if provider_key == current else 0
+            self._note_provider_menu_items[provider_key] = item
+            menu.add(item)
+
+        menu.add(None)
+
+        self._openai_model_item = rumps.MenuItem(
+            f"OpenAI 모델: {self._config.get('openai_model', 'gpt-5.4')}",
+            callback=self._change_openai_model,
+        )
+        menu.add(self._openai_model_item)
+
+        self._naver_model_item = rumps.MenuItem(
+            f"Naver 모델: {self._config.get('naver_model', 'gpt-4o')}",
+            callback=self._change_naver_model,
+        )
+        menu.add(self._naver_model_item)
+
+        self._naver_key_item = rumps.MenuItem(
+            f"Naver API 키: {self._get_naver_key_display()}",
+            callback=self._change_naver_api_key,
+        )
+        menu.add(self._naver_key_item)
+
+        return menu
+
+    def _make_note_provider_callback(self, provider: str):
+        def _select(_sender):
+            for item in self._note_provider_menu_items.values():
+                item.state = 0
+            self._note_provider_menu_items[provider].state = 1
+            self._config["note_provider"] = provider
+            self._note_provider_menu.title = self._get_note_provider_menu_title()
+            self._save_config()
+            logger.info("회의록 AI provider 변경: %s", provider)
+        return _select
+
+    def _change_openai_model(self, _):
+        current = self._config.get("openai_model", "gpt-5.4")
+        window = rumps.Window(
+            message="OpenAI 모델명을 입력하세요.",
+            title="OpenAI 모델 변경",
+            default_text=current,
+            ok="저장",
+            cancel="취소",
+        )
+        response = window.run()
+        if response.clicked and response.text.strip():
+            model = response.text.strip()
+            self._config["openai_model"] = model
+            self._save_config()
+            self._openai_model_item.title = f"OpenAI 모델: {model}"
+            self._note_provider_menu.title = self._get_note_provider_menu_title()
+            logger.info("OpenAI 모델 변경: %s", model)
+
+    def _change_naver_model(self, _):
+        current = self._config.get("naver_model", "gpt-4o")
+        window = rumps.Window(
+            message="Naver AI Gateway 모델명을 입력하세요.",
+            title="Naver 모델 변경",
+            default_text=current,
+            ok="저장",
+            cancel="취소",
+        )
+        response = window.run()
+        if response.clicked and response.text.strip():
+            model = response.text.strip()
+            self._config["naver_model"] = model
+            self._save_config()
+            self._naver_model_item.title = f"Naver 모델: {model}"
+            self._note_provider_menu.title = self._get_note_provider_menu_title()
+            logger.info("Naver 모델 변경: %s", model)
+
+    def _change_naver_api_key(self, _):
+        window = rumps.Window(
+            message="Naver AI Gateway API 키를 입력하세요.",
+            title="Naver API 키 변경",
+            default_text=self._config.get("naver_api_key", ""),
+            ok="저장",
+            cancel="취소",
+            dimensions=(400, 20),
+        )
+        response = window.run()
+        if response.clicked:
+            key = response.text.strip()
+            self._config["naver_api_key"] = key
+            self._save_config()
+            self._naver_key_item.title = f"Naver API 키: {self._get_naver_key_display()}"
+            logger.info("Naver API 키 변경 완료")
 
     def _toggle_mic(self, sender):
         sender.state = not sender.state
