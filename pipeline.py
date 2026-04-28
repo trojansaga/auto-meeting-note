@@ -266,6 +266,7 @@ def run_pipeline(
         export_dir_raw = config.get("export_dir", "~/Downloads")
         if export_dir_raw:
             try:
+                export_dir_raw = export_dir_raw.replace("\\ ", " ").replace("\\~", "~")
                 export_dir = Path(export_dir_raw).expanduser()
                 export_dir.mkdir(parents=True, exist_ok=True)
                 export_dest = export_dir / note_path.name
