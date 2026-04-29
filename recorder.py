@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from audio_extractor import find_ffmpeg
-from live_screen_writer import LiveScreenWriter
+from continuous_screen_recorder import ContinuousScreenRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +30,10 @@ _IPHONE_MIC_HINTS = ("iphone", "ipad", "continuity")
 
 class Recorder:
     def __init__(self):
-        self._screen_writer: Optional[LiveScreenWriter] = None
+        self._screen_recorder: Optional[ContinuousScreenRecorder] = None
+        self._screen_mic_segments: list = []  # screen mode: [(mic_path, mic_offset), ...]
         self._mic_process: Optional[subprocess.Popen] = None     # ffmpeg 마이크
-        self._sys_audio = None                                    # SystemAudioCapture (화면 녹화 + 녹음 공용)
+        self._sys_audio = None                                    # SystemAudioCapture (녹음 모드 전용)
         self._mode: Optional[str] = None  # "screen" | "audio"
         self._output_path: Optional[Path] = None
         self._audio_path: Optional[Path] = None   # 시스템 오디오 WAV
@@ -59,7 +60,7 @@ class Recorder:
     @property
     def is_recording(self) -> bool:
         if self._mode == "screen":
-            return self._screen_writer is not None and self._screen_writer.is_running
+            return self._screen_recorder is not None and self._screen_recorder.is_running
         if self._mode == "audio":
             return self._sys_audio is not None
         return False
@@ -400,90 +401,58 @@ class Recorder:
     def start_screen_recording(
         self, output_dir: Path, mic_enabled: bool = True, mic_device_index: str = "builtin"
     ) -> Path:
-        """화면 녹화 시작. SCStream 시스템 오디오 + 선택적 마이크 동시 캡처.
+        """화면 녹화 시작. ContinuousScreenRecorder(SCRecordingOutput)로 영상+시스템오디오 캡처.
         SCStream 초기화가 블로킹이므로 반드시 백그라운드 스레드에서 호출해야 함."""
         with self._lock:
-            from system_audio import SystemAudioCapture
-
             ts = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
             self._segments = []
             self._seg_index = 0
+            self._screen_mic_segments = []
             self._is_paused = False
             self._output_dir = output_dir
             self._mic_enabled = mic_enabled
             self._mic_device_index = self._resolve_mic_device_spec(mic_device_index) if mic_enabled else "0"
             self._base_ts = ts
-
-            mp4_path = output_dir / f"{ts}_녹화.mp4"
-            audio_path = output_dir / f"{ts}_녹화_sys.wav"
-
-            # 1) SCStream: 시스템 오디오 캡처 (블로킹, ~1초 소요)
-            self._sys_audio = SystemAudioCapture()
-            mic_path = output_dir / f"{ts}_녹화_mic.wav" if mic_enabled else None
-            self._sys_audio.start(
-                audio_path,
-                mic_output_path=mic_path if mic_enabled else None,
-                mic_device_spec=self._mic_device_index if mic_enabled else None,
-            )
-            sys_audio_ready_time, sys_audio_source = self._capture_started_info(
-                self._sys_audio,
-                time.time(),
-                "started_at",
-            )
-            logger.info("시스템 오디오 캡처 시작: %s", audio_path.name)
-
-            # 2) ScreenCaptureKit 마이크 또는 ffmpeg 마이크 동시 캡처 (선택)
             self._using_stream_microphone = False
-            if mic_enabled and getattr(self._sys_audio, "mic_capture_active", False):
-                self._mic_started_at = getattr(self._sys_audio, "mic_started_at", sys_audio_ready_time)
-                self._mic_path = mic_path
-                self._using_stream_microphone = True
-            elif mic_enabled:
+
+            # 1) ContinuousScreenRecorder: 영상 + 시스템 오디오를 mp4 세그먼트로 캡처
+            screen_recorder = ContinuousScreenRecorder(output_dir, f"{ts}_녹화")
+            first_segment = screen_recorder.start()
+            stream_start_time = time.time()
+            self._screen_recorder = screen_recorder
+            logger.info("화면 녹화 시작: %s", first_segment.name)
+
+            # 2) 마이크: ffmpeg 별도 캡처 (선택)
+            if mic_enabled:
+                mic_path = output_dir / f"{ts}_녹화_mic.wav"
                 try:
                     self._mic_started_at = self._start_mic(mic_path, self._mic_device_index)
                     self._mic_path = mic_path if self._mic_process else None
                 except Exception:
                     try:
-                        self._sys_audio.stop()
+                        screen_recorder.stop()
                     except Exception as e:
-                        logger.warning("마이크 실패 후 시스템 오디오 중지 오류: %s", e)
-                    self._sys_audio = None
+                        logger.warning("마이크 실패 후 화면 녹화 중지 오류: %s", e)
+                    self._screen_recorder = None
                     raise
             else:
                 self._mic_path = None
+                self._mic_started_at = None
 
-            # 3) SCStream + AVAssetWriter: 실시간 화면 인코딩
-            self._screen_writer = LiveScreenWriter()
-            logger.info("화면 녹화 시작: %s", mp4_path.name)
-            self._screen_writer.start(mp4_path)
-            screen_start_time, screen_source = self._capture_started_info(
-                self._screen_writer,
-                time.time(),
-                "capture_started_at",
-                "started_at",
-            )
-
-            # 오디오(sys_audio_ready_time)와 영상(screen_start_time)의 시작 차이만큼 trim
-            # t_before_sys 기준이 아닌 실제 오디오 기록 시작 시점 기준
-            self._audio_offset = self._offset_from_anchor(screen_start_time, sys_audio_ready_time)
-            self._mic_audio_offset = self._mic_offset_from_anchor(screen_start_time)
-            self._log_screen_sync_debug(
-                self._sys_audio,
-                self._screen_writer,
-                sys_audio_ready_time,
-                sys_audio_source,
-                self._mic_started_at,
-                screen_start_time,
-                screen_source,
-                self._audio_offset,
+            self._audio_offset = 0.0  # 시스템 오디오는 mp4에 내장 — 별도 offset 불필요
+            self._mic_audio_offset = self._mic_offset_from_anchor(stream_start_time)
+            logger.info(
+                "화면 녹화 시작 완료: stream_start=%.3f mic_started=%.3f mic_offset=%.3f",
+                stream_start_time,
+                self._mic_started_at or 0.0,
                 self._mic_audio_offset,
             )
 
             self._mode = "screen"
-            self._output_path = mp4_path
-            self._audio_path = audio_path
-            self._start_time = screen_start_time
-            return mp4_path
+            self._output_path = first_segment
+            self._audio_path = None  # 시스템 오디오는 mp4에 내장
+            self._start_time = stream_start_time
+            return first_segment
 
     def start_audio_recording(
         self, output_dir: Path, mic_enabled: bool = True, mic_device_index: str = "builtin"
@@ -551,22 +520,11 @@ class Recorder:
             return sys_path
 
     def _stop_current_processes(self) -> None:
-        """현재 실행 중인 프로세스 중지. _lock 보유 상태에서 호출."""
+        """현재 실행 중인 프로세스 중지. _lock 보유 상태에서 호출.
+        screen 모드: 마이크만 중지 (ContinuousScreenRecorder는 pause/stop에서 직접 제어).
+        audio 모드: SystemAudioCapture + 마이크 중지.
+        """
         if self._mode == "screen":
-            if self._screen_writer is not None:
-                try:
-                    self._screen_writer.stop()
-                except Exception as e:
-                    logger.error("화면 writer 중지 오류: %s", e)
-                self._screen_writer = None
-
-            if self._sys_audio is not None:
-                try:
-                    self._sys_audio.stop()
-                except Exception as e:
-                    logger.error("시스템 오디오 중지 오류: %s", e)
-                self._sys_audio = None
-
             if not self._using_stream_microphone:
                 self._stop_mic()
             self._mic_started_at = None
@@ -584,19 +542,30 @@ class Recorder:
             self._mic_started_at = None
 
     def pause(self) -> None:
-        """녹화/녹음 일시 정지. 현재 세그먼트를 저장하고 프로세스 중지."""
+        """녹화/녹음 일시 정지."""
         with self._lock:
             if self._mode is None or self._is_paused:
                 return
-            self._stop_current_processes()
-            self._segments.append(
-                (self._output_path, self._audio_path, self._mic_path, self._audio_offset, self._mic_audio_offset)
-            )
-            self._output_path = None
-            self._audio_path = None
-            self._mic_path = None
-            self._audio_offset = 0.0
-            self._mic_audio_offset = 0.0
+            if self._mode == "screen":
+                # 마이크 중지 후 세그먼트 저장, ContinuousScreenRecorder pause
+                self._stop_mic()
+                self._mic_started_at = None
+                if self._mic_path is not None:
+                    self._screen_mic_segments.append((self._mic_path, self._mic_audio_offset))
+                self._mic_path = None
+                self._mic_audio_offset = 0.0
+                self._screen_recorder.pause()
+            else:
+                # audio 모드: 기존 세그먼트 기반 처리
+                self._stop_current_processes()
+                self._segments.append(
+                    (self._output_path, self._audio_path, self._mic_path, self._audio_offset, self._mic_audio_offset)
+                )
+                self._output_path = None
+                self._audio_path = None
+                self._mic_path = None
+                self._audio_offset = 0.0
+                self._mic_audio_offset = 0.0
             self._is_paused = True
             self._pause_start = time.time()
             logger.info("일시 정지 (세그먼트 %d 저장)", self._seg_index)
@@ -616,68 +585,34 @@ class Recorder:
             ts = self._base_ts
 
             if self._mode == "screen":
-                mp4_path = self._output_dir / f"{ts}_녹화_seg{seg}.mp4"
-                audio_path = self._output_dir / f"{ts}_녹화_sys_seg{seg}.wav"
-
-                self._sys_audio = SystemAudioCapture()
-                mic_path = self._output_dir / f"{ts}_녹화_mic_seg{seg}.wav" if self._mic_enabled else None
-                self._sys_audio.start(
-                    audio_path,
-                    mic_output_path=mic_path if self._mic_enabled else None,
-                    mic_device_spec=self._mic_device_index if self._mic_enabled else None,
-                )
-                sys_audio_ready_time, sys_audio_source = self._capture_started_info(
-                    self._sys_audio,
-                    time.time(),
-                    "started_at",
-                )
-                logger.info("재개: 시스템 오디오 시작: %s", audio_path.name)
+                # ContinuousScreenRecorder가 SCStream 위에서 새 RecordingOutput 시작
+                new_segment = self._screen_recorder.resume()
+                resume_time = time.time()
+                logger.info("재개: 화면 녹화 세그먼트 시작: %s", new_segment.name)
 
                 self._using_stream_microphone = False
-                if self._mic_enabled and getattr(self._sys_audio, "mic_capture_active", False):
-                    self._mic_started_at = getattr(self._sys_audio, "mic_started_at", sys_audio_ready_time)
-                    self._mic_path = mic_path
-                    self._using_stream_microphone = True
-                elif self._mic_enabled:
+                if self._mic_enabled:
+                    mic_path = self._output_dir / f"{ts}_녹화_mic_seg{seg}.wav"
                     try:
                         self._mic_started_at = self._start_mic(mic_path, self._mic_device_index)
                         self._mic_path = mic_path if self._mic_process else None
                     except Exception:
                         try:
-                            self._sys_audio.stop()
+                            self._screen_recorder.pause()
                         except Exception as e:
-                            logger.warning("재개 중 마이크 실패 후 시스템 오디오 중지 오류: %s", e)
-                        self._sys_audio = None
+                            logger.warning("재개 중 마이크 실패 후 화면 녹화 일시정지 오류: %s", e)
                         raise
                 else:
                     self._mic_path = None
+                    self._mic_started_at = None
 
-                self._screen_writer = LiveScreenWriter()
-                logger.info("재개: 화면 녹화 시작: %s", mp4_path.name)
-                self._screen_writer.start(mp4_path)
-                screen_start_time, screen_source = self._capture_started_info(
-                    self._screen_writer,
-                    time.time(),
-                    "capture_started_at",
-                    "started_at",
-                )
-                self._audio_offset = self._offset_from_anchor(screen_start_time, sys_audio_ready_time)
-                self._mic_audio_offset = self._mic_offset_from_anchor(screen_start_time)
-                self._log_screen_sync_debug(
-                    self._sys_audio,
-                    self._screen_writer,
-                    sys_audio_ready_time,
-                    sys_audio_source,
-                    self._mic_started_at,
-                    screen_start_time,
-                    screen_source,
-                    self._audio_offset,
-                    self._mic_audio_offset,
-                )
-                self._output_path = mp4_path
-                self._audio_path = audio_path
+                self._audio_offset = 0.0
+                self._mic_audio_offset = self._mic_offset_from_anchor(resume_time)
+                self._output_path = new_segment
+                self._audio_path = None
 
             elif self._mode == "audio":
+                from system_audio import SystemAudioCapture
                 sys_path = self._output_dir / f"{ts}_녹음_sys_seg{seg}.wav"
 
                 self._sys_audio = SystemAudioCapture()
@@ -732,37 +667,67 @@ class Recorder:
         with self._lock:
             mode = self._mode
 
-            if not self._is_paused:
-                # 현재 녹화 중: 프로세스 중지 후 마지막 세그먼트 저장
-                self._stop_current_processes()
-                if self._output_path is not None:
-                    self._segments.append(
-                        (
-                            self._output_path,
-                            self._audio_path,
-                            self._mic_path,
-                            self._audio_offset,
-                            self._mic_audio_offset,
-                        )
-                    )
-            # 일시 정지 중이면 프로세스 없음, 세그먼트는 이미 pause()에서 저장됨
-
-            segments = list(self._segments)
-
-            output_path = audio_path = mic_path = None
-            audio_offset = mic_audio_offset = 0.0
             try:
-                if not segments:
-                    pass
-                elif len(segments) == 1:
-                    output_path, audio_path, mic_path, audio_offset, mic_audio_offset = segments[0]
+                if mode == "screen":
+                    # 마지막 마이크 세그먼트 저장
+                    if not self._is_paused:
+                        self._stop_mic()
+                        self._mic_started_at = None
+                        if self._mic_path is not None:
+                            self._screen_mic_segments.append((self._mic_path, self._mic_audio_offset))
+
+                    # ContinuousScreenRecorder가 모든 영상 세그먼트를 하나의 mp4로 통합
+                    try:
+                        mp4_path = self._screen_recorder.stop() if self._screen_recorder else None
+                    except Exception as exc:
+                        logger.error("화면 녹화 중지 오류: %s", exc)
+                        mp4_path = None
+
+                    # 마이크 세그먼트 통합
+                    try:
+                        final_mic = self._concat_screen_mic_segments()
+                    except Exception as exc:
+                        logger.error("마이크 세그먼트 통합 실패: %s", exc)
+                        final_mic = self._screen_mic_segments[0][0] if self._screen_mic_segments else None
+
+                    first_mic_offset = self._screen_mic_segments[0][1] if self._screen_mic_segments else 0.0
+                    output_path = mp4_path
+                    audio_path = None
+                    mic_path = final_mic
+                    audio_offset = 0.0
+                    mic_audio_offset = first_mic_offset
+
                 else:
-                    output_path, audio_path, mic_path, audio_offset, mic_audio_offset = self._concat_segments(mode, segments)
-            except Exception as concat_err:
-                logger.error("세그먼트 합치기 실패 (다음 녹화는 정상 동작): %s", concat_err)
-                # 합치기 실패 시 첫 세그먼트라도 반환해 후속 파이프라인이 진행 가능하게 한다.
-                if segments:
-                    output_path, audio_path, mic_path, audio_offset, mic_audio_offset = segments[0]
+                    # audio 모드: 기존 세그먼트 기반 처리
+                    if not self._is_paused:
+                        self._stop_current_processes()
+                        if self._output_path is not None:
+                            self._segments.append(
+                                (
+                                    self._output_path,
+                                    self._audio_path,
+                                    self._mic_path,
+                                    self._audio_offset,
+                                    self._mic_audio_offset,
+                                )
+                            )
+
+                    segments = list(self._segments)
+                    if not segments:
+                        output_path = audio_path = mic_path = None
+                        audio_offset = mic_audio_offset = 0.0
+                    elif len(segments) == 1:
+                        output_path, audio_path, mic_path, audio_offset, mic_audio_offset = segments[0]
+                    else:
+                        try:
+                            output_path, audio_path, mic_path, audio_offset, mic_audio_offset = self._concat_segments(mode, segments)
+                        except Exception as exc:
+                            logger.error(
+                                "세그먼트 통합 실패 — 첫 세그먼트만 사용합니다: %s\n미통합 파일: %s",
+                                exc,
+                                [str(s[0]) for s in segments],
+                            )
+                            output_path, audio_path, mic_path, audio_offset, mic_audio_offset = segments[0]
             finally:
                 self._mode = None
                 self._output_path = None
@@ -778,6 +743,8 @@ class Recorder:
                 self._pause_start = None
                 self._mic_started_at = None
                 self._using_stream_microphone = False
+                self._screen_recorder = None
+                self._screen_mic_segments = []
 
             logger.info("녹화/녹음 중지 완료")
             return mode, output_path, audio_path, mic_path, audio_offset, mic_audio_offset
@@ -791,20 +758,63 @@ class Recorder:
         cmd = [ffmpeg_bin, "-ss", f"{offset:.3f}", "-i", str(in_path), "-c", "copy", "-y", str(out_path)]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def _concat_files(self, ffmpeg_bin: str, paths: list, out_path: Path) -> None:
-        """ffmpeg concat demuxer로 파일 목록을 하나로 합침."""
+    def _concat_files(
+        self, ffmpeg_bin: str, paths: list, out_path: Path, is_video: bool = False
+    ) -> None:
+        """ffmpeg concat demuxer로 파일 목록을 하나로 합침.
+
+        input 중 하나가 out_path와 경로가 같아도 안전하도록 임시 파일에 먼저 쓴 뒤 rename.
+        영상(-c copy 실패 시): h264_videotoolbox → libx264 순으로 fallback 재인코드.
+        """
+        tmp_path = out_path.with_name(f"~concat_{out_path.name}")
         list_file = out_path.with_suffix(".concat.txt")
-        with open(list_file, "w", encoding="utf-8") as f:
-            for p in paths:
-                f.write(f"file '{p}'\n")
-        cmd = [ffmpeg_bin, "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", "-y", str(out_path)]
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        renamed = False
         try:
-            list_file.unlink()
-        except OSError:
-            pass
-        if result.returncode != 0:
-            raise RuntimeError(f"세그먼트 합치기 실패: {out_path.name}")
+            with open(list_file, "w", encoding="utf-8") as f:
+                for p in paths:
+                    f.write(f"file '{p}'\n")
+
+            def _run(extra: list) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [ffmpeg_bin, "-f", "concat", "-safe", "0", "-i", str(list_file),
+                     *extra, "-y", str(tmp_path)],
+                    capture_output=True,
+                )
+
+            result = _run(["-c", "copy"])
+            if result.returncode != 0:
+                if not is_video:
+                    logger.error(
+                        "오디오 세그먼트 합치기 실패: %s\n%s",
+                        out_path.name, result.stderr.decode(errors="replace"),
+                    )
+                    raise RuntimeError(f"세그먼트 합치기 실패: {out_path.name}")
+
+                logger.warning(
+                    "영상 concat -c copy 실패, h264_videotoolbox로 재시도: %s\n%s",
+                    out_path.name, result.stderr.decode(errors="replace"),
+                )
+                result = _run(["-c:v", "h264_videotoolbox", "-q:v", "60", "-c:a", "aac", "-b:a", "256k"])
+                if result.returncode != 0:
+                    logger.warning(
+                        "h264_videotoolbox 실패, libx264로 재시도: %s\n%s",
+                        out_path.name, result.stderr.decode(errors="replace"),
+                    )
+                    result = _run(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "256k"])
+                    if result.returncode != 0:
+                        logger.error(
+                            "영상 세그먼트 합치기 최종 실패: %s\n%s",
+                            out_path.name, result.stderr.decode(errors="replace"),
+                        )
+                        raise RuntimeError(f"세그먼트 합치기 실패: {out_path.name}")
+
+            out_path.unlink(missing_ok=True)
+            tmp_path.rename(out_path)
+            renamed = True
+        finally:
+            list_file.unlink(missing_ok=True)
+            if not renamed:
+                tmp_path.unlink(missing_ok=True)
 
     def _concat_videos_normalized(self, ffmpeg_bin: str, paths: list, out_path: Path) -> None:
         """비디오 세그먼트의 PTS를 0부터 다시 매기며 재인코딩으로 합친다.
@@ -857,6 +867,44 @@ class Recorder:
                 ]
         return cmd
 
+    def _concat_screen_mic_segments(self) -> Optional[Path]:
+        """screen 모드 마이크 세그먼트들을 단일 WAV로 통합. 세그먼트 없으면 None 반환."""
+        segments = self._screen_mic_segments
+        if not segments:
+            return None
+        if len(segments) == 1:
+            return segments[0][0]
+
+        ffmpeg_bin = find_ffmpeg()
+        if not ffmpeg_bin:
+            logger.warning("ffmpeg 없음 — 첫 마이크 세그먼트만 사용")
+            return segments[0][0]
+
+        ts = self._base_ts
+        parent = segments[0][0].parent
+        final_mic = parent / f"{ts}_녹화_mic.wav"
+        trimmed: list[Path] = []
+        try:
+            for i, (mic_path, mic_offset) in enumerate(segments):
+                if mic_path and mic_path.exists() and mic_path.stat().st_size > 44:
+                    trimmed_path = parent / f"_trim_screen_mic_{i}.wav"
+                    self._trim_wav(ffmpeg_bin, mic_path, mic_offset, trimmed_path)
+                    trimmed.append(trimmed_path)
+            if trimmed:
+                self._concat_files(ffmpeg_bin, trimmed, final_mic)
+        finally:
+            for f in trimmed:
+                f.unlink(missing_ok=True)
+
+        for mic_path, _ in segments:
+            if mic_path and mic_path.exists() and mic_path != final_mic:
+                try:
+                    mic_path.unlink()
+                except OSError:
+                    pass
+
+        return final_mic if trimmed else None
+
     def _concat_segments(self, mode: str, segments: list) -> tuple:
         """여러 세그먼트 파일을 하나로 합쳐 (output_path, audio_path, mic_path, sys_offset, mic_offset) 반환."""
         ffmpeg_bin = find_ffmpeg()
@@ -868,37 +916,37 @@ class Recorder:
         parent = segments[0][0].parent
 
         if mode == "screen":
-            video_ext = segments[0][0].suffix if segments[0][0] else ".mov"
+            video_ext = segments[0][0].suffix if segments[0][0] else ".mp4"
             final_mov = parent / f"{ts}_녹화{video_ext}"
             final_sys = parent / f"{ts}_녹화_sys.wav"
             final_mic = parent / f"{ts}_녹화_mic.wav"
 
             mov_paths, trimmed_sys, trimmed_mic = [], [], []
-            for i, (out_path, audio_path, mic_path, sys_offset, mic_offset) in enumerate(segments):
-                if out_path and out_path.exists():
-                    mov_paths.append(out_path)
-                if audio_path and audio_path.exists() and audio_path.stat().st_size > 44:
-                    trimmed = parent / f"_trim_sys_{i}.wav"
-                    self._trim_wav(ffmpeg_bin, audio_path, sys_offset, trimmed)
-                    trimmed_sys.append(trimmed)
-                if mic_path and mic_path.exists() and mic_path.stat().st_size > 44:
-                    trimmed = parent / f"_trim_mic_{i}.wav"
-                    self._trim_wav(ffmpeg_bin, mic_path, mic_offset, trimmed)
-                    trimmed_mic.append(trimmed)
+            try:
+                for i, (out_path, audio_path, mic_path, sys_offset, mic_offset) in enumerate(segments):
+                    if out_path and out_path.exists():
+                        mov_paths.append(out_path)
+                    if audio_path and audio_path.exists() and audio_path.stat().st_size > 44:
+                        trimmed = parent / f"_trim_sys_{i}.wav"
+                        self._trim_wav(ffmpeg_bin, audio_path, sys_offset, trimmed)
+                        trimmed_sys.append(trimmed)
+                    if mic_path and mic_path.exists() and mic_path.stat().st_size > 44:
+                        trimmed = parent / f"_trim_mic_{i}.wav"
+                        self._trim_wav(ffmpeg_bin, mic_path, mic_offset, trimmed)
+                        trimmed_mic.append(trimmed)
 
-            if mov_paths:
-                try:
-                    self._concat_videos_normalized(ffmpeg_bin, mov_paths, final_mov)
-                except Exception as norm_err:
-                    logger.warning("정규화 concat 실패, 단순 concat으로 폴백: %s", norm_err)
-                    self._concat_files(ffmpeg_bin, mov_paths, final_mov)
-            if trimmed_sys:
-                self._concat_files(ffmpeg_bin, trimmed_sys, final_sys)
-                for f in trimmed_sys:
-                    f.unlink(missing_ok=True)
-            if trimmed_mic:
-                self._concat_files(ffmpeg_bin, trimmed_mic, final_mic)
-                for f in trimmed_mic:
+                if mov_paths:
+                    try:
+                        self._concat_videos_normalized(ffmpeg_bin, mov_paths, final_mov)
+                    except Exception as norm_err:
+                        logger.warning("정규화 concat 실패, 단순 concat으로 폴백: %s", norm_err)
+                        self._concat_files(ffmpeg_bin, mov_paths, final_mov)
+                if trimmed_sys:
+                    self._concat_files(ffmpeg_bin, trimmed_sys, final_sys)
+                if trimmed_mic:
+                    self._concat_files(ffmpeg_bin, trimmed_mic, final_mic)
+            finally:
+                for f in trimmed_sys + trimmed_mic:
                     f.unlink(missing_ok=True)
 
             # 원본 세그먼트 파일 삭제
@@ -925,23 +973,23 @@ class Recorder:
 
             trimmed_sys: list[Path] = []
             trimmed_mic: list[Path] = []
-            for i, (out_path, _, mic_path, sys_offset, mic_offset) in enumerate(segments):
-                if out_path and out_path.exists() and out_path.stat().st_size > 44:
-                    trimmed = parent / f"_trim_audio_sys_{i}.wav"
-                    self._trim_wav(ffmpeg_bin, out_path, sys_offset, trimmed)
-                    trimmed_sys.append(trimmed)
-                if mic_path and mic_path.exists() and mic_path.stat().st_size > 44:
-                    trimmed = parent / f"_trim_audio_mic_{i}.wav"
-                    self._trim_wav(ffmpeg_bin, mic_path, mic_offset, trimmed)
-                    trimmed_mic.append(trimmed)
+            try:
+                for i, (out_path, _, mic_path, sys_offset, mic_offset) in enumerate(segments):
+                    if out_path and out_path.exists() and out_path.stat().st_size > 44:
+                        trimmed = parent / f"_trim_audio_sys_{i}.wav"
+                        self._trim_wav(ffmpeg_bin, out_path, sys_offset, trimmed)
+                        trimmed_sys.append(trimmed)
+                    if mic_path and mic_path.exists() and mic_path.stat().st_size > 44:
+                        trimmed = parent / f"_trim_audio_mic_{i}.wav"
+                        self._trim_wav(ffmpeg_bin, mic_path, mic_offset, trimmed)
+                        trimmed_mic.append(trimmed)
 
-            if trimmed_sys:
-                self._concat_files(ffmpeg_bin, trimmed_sys, final_sys)
-                for f in trimmed_sys:
-                    f.unlink(missing_ok=True)
-            if trimmed_mic:
-                self._concat_files(ffmpeg_bin, trimmed_mic, final_mic)
-                for f in trimmed_mic:
+                if trimmed_sys:
+                    self._concat_files(ffmpeg_bin, trimmed_sys, final_sys)
+                if trimmed_mic:
+                    self._concat_files(ffmpeg_bin, trimmed_mic, final_mic)
+            finally:
+                for f in trimmed_sys + trimmed_mic:
                     f.unlink(missing_ok=True)
 
             for out_path, _, mic_path, _, _ in segments:
@@ -1201,12 +1249,24 @@ class Recorder:
                 "-shortest",
                 "-y", str(temp_path),
             ]
-        else:
-            source = audio_path if has_sys else mic_path
+        elif has_mic and not has_sys:
+            # mp4에 시스템 오디오가 이미 내장된 경우 — mic을 기존 오디오와 amix
             cmd = [
                 ffmpeg_bin,
                 "-i", str(mp4_path),
-                *(sys_args if has_sys else mic_args),
+                *mic_args,
+                "-filter_complex", "[0:a:0][1:a:0]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-map", "0:v:0", "-map", "[aout]",
+                "-shortest",
+                "-y", str(temp_path),
+            ]
+        else:
+            cmd = [
+                ffmpeg_bin,
+                "-i", str(mp4_path),
+                *sys_args,
                 "-c:v", "copy",
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0",
