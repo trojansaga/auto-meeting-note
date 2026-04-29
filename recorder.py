@@ -784,29 +784,35 @@ class Recorder:
             result = _run(["-c", "copy"])
             if result.returncode != 0:
                 if not is_video:
-                    logger.error(
-                        "오디오 세그먼트 합치기 실패: %s\n%s",
-                        out_path.name, result.stderr.decode(errors="replace"),
-                    )
-                    raise RuntimeError(f"세그먼트 합치기 실패: {out_path.name}")
-
-                logger.warning(
-                    "영상 concat -c copy 실패, h264_videotoolbox로 재시도: %s\n%s",
-                    out_path.name, result.stderr.decode(errors="replace"),
-                )
-                result = _run(["-c:v", "h264_videotoolbox", "-q:v", "60", "-c:a", "aac", "-b:a", "256k"])
-                if result.returncode != 0:
                     logger.warning(
-                        "h264_videotoolbox 실패, libx264로 재시도: %s\n%s",
+                        "오디오 concat -c copy 실패, pcm_s16le 재샘플로 재시도: %s\n%s",
                         out_path.name, result.stderr.decode(errors="replace"),
                     )
-                    result = _run(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "256k"])
+                    result = _run(["-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2"])
                     if result.returncode != 0:
                         logger.error(
-                            "영상 세그먼트 합치기 최종 실패: %s\n%s",
+                            "오디오 세그먼트 합치기 최종 실패: %s\n%s",
                             out_path.name, result.stderr.decode(errors="replace"),
                         )
                         raise RuntimeError(f"세그먼트 합치기 실패: {out_path.name}")
+                else:
+                    logger.warning(
+                        "영상 concat -c copy 실패, h264_videotoolbox로 재시도: %s\n%s",
+                        out_path.name, result.stderr.decode(errors="replace"),
+                    )
+                    result = _run(["-c:v", "h264_videotoolbox", "-q:v", "60", "-c:a", "aac", "-b:a", "256k"])
+                    if result.returncode != 0:
+                        logger.warning(
+                            "h264_videotoolbox 실패, libx264로 재시도: %s\n%s",
+                            out_path.name, result.stderr.decode(errors="replace"),
+                        )
+                        result = _run(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "256k"])
+                        if result.returncode != 0:
+                            logger.error(
+                                "영상 세그먼트 합치기 최종 실패: %s\n%s",
+                                out_path.name, result.stderr.decode(errors="replace"),
+                            )
+                            raise RuntimeError(f"세그먼트 합치기 실패: {out_path.name}")
 
             out_path.unlink(missing_ok=True)
             tmp_path.rename(out_path)
