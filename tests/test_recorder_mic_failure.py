@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -28,6 +29,24 @@ class _FakeRunningMicProcess:
         return None
 
 
+class _FakeWritingMicProcess:
+    """Popen mock that simulates ffmpeg writing WAV header + samples after a delay."""
+
+    def __init__(self, mic_path: Path, events):
+        self.stdin = None
+        self._events = events
+        self._mic_path = mic_path
+        self._poll_count = 0
+
+    def poll(self):
+        self._events.append("poll")
+        self._poll_count += 1
+        # 두 번째 polling 호출에서 WAV 헤더 + 샘플을 기록한 것으로 시뮬레이션
+        if self._poll_count >= 2 and not self._mic_path.exists():
+            self._mic_path.write_bytes(b"RIFF" + b"\x00" * 40 + b"\x00" * 100)
+        return None
+
+
 class _FakeSystemAudioCapture:
     def __init__(self):
         self.started = False
@@ -41,34 +60,29 @@ class _FakeSystemAudioCapture:
 
 
 class RecorderMicFailureTests(unittest.TestCase):
-    def test_start_mic_records_timestamp_before_readiness_sleep(self):
+    def test_start_mic_returns_timestamp_when_first_samples_written(self):
+        """ffmpeg가 WAV 헤더+샘플을 기록한 시점을 started_at으로 사용한다."""
         recorder = Recorder()
         events = []
 
-        def _fake_popen(*_args, **_kwargs):
-            events.append("popen")
-            return _FakeRunningMicProcess(events)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mic_path = Path(tmpdir) / "demo.wav"
 
-        def _fake_time():
-            events.append("time")
-            return 10.0
+            def _fake_popen(*_args, **_kwargs):
+                events.append("popen")
+                return _FakeWritingMicProcess(mic_path, events)
 
-        def _fake_sleep(_seconds):
-            events.append("sleep")
+            with patch(
+                "recorder.find_ffmpeg", return_value="/usr/bin/ffmpeg"
+            ), patch(
+                "recorder.subprocess.Popen", side_effect=_fake_popen
+            ):
+                started_at = recorder._start_mic(mic_path, "Brio 300")
 
-        with tempfile.TemporaryDirectory() as tmpdir, patch(
-            "recorder.find_ffmpeg", return_value="/usr/bin/ffmpeg"
-        ), patch(
-            "recorder.subprocess.Popen", side_effect=_fake_popen
-        ), patch(
-            "recorder.time.time", side_effect=_fake_time
-        ), patch(
-            "recorder.time.sleep", side_effect=_fake_sleep
-        ):
-            started_at = recorder._start_mic(Path(tmpdir) / "demo.wav", "Brio 300")
-
-        self.assertEqual(started_at, 10.0)
-        self.assertEqual(events[:4], ["popen", "time", "sleep", "poll"])
+        self.assertIsInstance(started_at, float)
+        self.assertEqual(events[0], "popen")
+        self.assertIn("poll", events)
+        self.assertIsNotNone(recorder._mic_process)
 
     def test_start_mic_raises_when_ffmpeg_exits_immediately(self):
         recorder = Recorder()
@@ -99,6 +113,28 @@ class RecorderMicFailureTests(unittest.TestCase):
 
         self.assertTrue(sys_audio.started)
         self.assertTrue(sys_audio.stopped)
+
+    def test_start_mic_started_at_reflects_first_sample_write_time(self):
+        """첫 샘플 기록 시점이 polling으로 감지되어 started_at이 그 시점에 가깝게 기록된다."""
+        recorder = Recorder()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mic_path = Path(tmpdir) / "demo.wav"
+            t0 = [None]
+
+            def _fake_popen(*_args, **_kwargs):
+                t0[0] = time.time()
+                return _FakeWritingMicProcess(mic_path, [])
+
+            with patch(
+                "recorder.find_ffmpeg", return_value="/usr/bin/ffmpeg"
+            ), patch(
+                "recorder.subprocess.Popen", side_effect=_fake_popen
+            ):
+                started_at = recorder._start_mic(mic_path, "Brio 300")
+
+        # started_at은 popen 직후가 아니라 폴링이 끝난 시점(파일 등장 시점)이어야 함
+        self.assertGreater(started_at, t0[0])
 
 
 if __name__ == "__main__":

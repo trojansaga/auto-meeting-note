@@ -10,6 +10,7 @@ class _FakeDriver:
         self.calls = []
         self._handles = []
         self.fail_on_stop = None
+        self.next_started_at = None
 
     def start_stream(self):
         self.calls.append("start_stream")
@@ -19,6 +20,8 @@ class _FakeDriver:
 
     def start_segment(self, path: Path) -> SegmentHandle:
         handle = SegmentHandle(path=path, started=threading.Event(), finished=threading.Event())
+        if self.next_started_at is not None:
+            handle.started_at = self.next_started_at
         handle.started.set()
         self._handles.append(handle)
         self.calls.append(("start_segment", path.name))
@@ -98,6 +101,28 @@ class ContinuousCaptureControllerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "segment finalize failed"):
             controller.pause()
+
+    def test_active_segment_started_at_exposes_handle_timestamp(self):
+        """드라이버가 SegmentHandle에 기록한 started_at을 컨트롤러가 그대로 노출한다."""
+        driver = _FakeDriver()
+        driver.next_started_at = 123.456
+
+        controller = ContinuousCaptureController(
+            driver=driver,
+            output_dir=Path("/tmp"),
+            basename="ts",
+            finalize_segments=lambda paths: Path("/tmp/ts.mp4"),
+        )
+
+        self.assertIsNone(controller.active_segment_started_at)
+        controller.start()
+        self.assertEqual(controller.active_segment_started_at, 123.456)
+
+        # resume 후 새 세그먼트의 timestamp로 갱신되어야 함
+        driver.next_started_at = 200.789
+        controller.pause()
+        controller.resume()
+        self.assertEqual(controller.active_segment_started_at, 200.789)
 
 
 if __name__ == "__main__":

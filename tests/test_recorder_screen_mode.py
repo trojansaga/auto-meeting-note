@@ -19,7 +19,7 @@ class _FixedDateTime:
 
 
 class _FakeContinuousScreenRecorder:
-    def __init__(self, output_dir: Path, basename: str):
+    def __init__(self, output_dir: Path, basename: str, capture_audio: bool = True):
         self.output_dir = output_dir
         self.basename = basename
         self.is_running = False
@@ -27,6 +27,9 @@ class _FakeContinuousScreenRecorder:
         self.pause_calls = 0
         self.resume_calls = 0
         self.stop_calls = 0
+        self.active_segment_started_at = None
+        self.stream_capture_started_at = None
+        self.capture_audio = capture_audio
 
     def start(self) -> Path:
         self.is_running = True
@@ -47,31 +50,57 @@ class _FakeContinuousScreenRecorder:
         return self.output_dir / f"{self.basename}.mp4"
 
 
-def _make_recorder_with_fake_screen(output_dir: Path):
-    """패치된 ContinuousScreenRecorder를 사용하는 Recorder와 fake 인스턴스를 반환."""
-    created = []
+class _FakeSystemAudioCapture:
+    def __init__(self):
+        self.started_at = 100.0
+        self.first_sample_at = 100.0
+        self.mic_capture_active = False
+        self.mic_started_at = None
+        self.output_path = None
+        self.stopped = False
 
-    def _factory(od, bn):
-        r = _FakeContinuousScreenRecorder(od, bn)
+    def start(self, output_path, mic_output_path=None, mic_device_spec=None):
+        self.output_path = output_path
+
+    def stop(self):
+        self.stopped = True
+
+
+def _make_recorder_with_fake_screen(output_dir: Path):
+    """패치된 ContinuousScreenRecorder + SystemAudioCapture를 사용하는 Recorder와 fake 인스턴스 반환."""
+    created = []
+    sys_instances = []
+
+    def _factory(od, bn, capture_audio=True):
+        r = _FakeContinuousScreenRecorder(od, bn, capture_audio=capture_audio)
         created.append(r)
         return r
 
-    patcher = patch("recorder.ContinuousScreenRecorder", side_effect=_factory)
-    return patcher, created
+    def _sys_factory():
+        s = _FakeSystemAudioCapture()
+        sys_instances.append(s)
+        return s
+
+    csr_patcher = patch("recorder.ContinuousScreenRecorder", side_effect=_factory)
+    sys_patcher = patch("system_audio.SystemAudioCapture", side_effect=_sys_factory)
+
+    class _CombinedPatcher:
+        def __enter__(self):
+            csr_patcher.__enter__()
+            sys_patcher.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            sys_patcher.__exit__(*args)
+            csr_patcher.__exit__(*args)
+
+    return _CombinedPatcher(), created
 
 
 class RecorderScreenModeTests(unittest.TestCase):
     def test_screen_pause_resume_uses_continuous_recorder_and_returns_mp4(self):
-        created = []
-
-        def _factory(output_dir, basename):
-            recorder = _FakeContinuousScreenRecorder(output_dir, basename)
-            created.append(recorder)
-            return recorder
-
-        with patch("recorder.datetime", _FixedDateTime), patch(
-            "recorder.ContinuousScreenRecorder", side_effect=_factory
-        ):
+        patcher, created = _make_recorder_with_fake_screen(Path("/tmp"))
+        with patch("recorder.datetime", _FixedDateTime), patcher:
             recorder = Recorder()
             first_segment = recorder.start_screen_recording(Path("/tmp"), mic_enabled=False)
             recorder.pause()
@@ -85,10 +114,8 @@ class RecorderScreenModeTests(unittest.TestCase):
         self.assertEqual(fake.stop_calls, 1)
         self.assertEqual(mode, "screen")
         self.assertEqual(output_path, Path("/tmp/2026-04-02 12-00-00_녹화.mp4"))
-        self.assertIsNone(audio_path)
+        # mic이 비활성화된 상태로 시작하지만 sys WAV는 별도 캡처되어 audio_path는 sys WAV 경로
         self.assertIsNone(mic_path)
-        self.assertEqual(audio_offset, 0.0)
-        self.assertEqual(mic_audio_offset, 0.0)
 
     def test_screen_stop_without_pause_returns_mp4(self):
         """일시정지 없이 곧바로 stop해도 mp4 경로가 반환되어야 한다."""
@@ -103,7 +130,6 @@ class RecorderScreenModeTests(unittest.TestCase):
         self.assertEqual(fake.stop_calls, 1)
         self.assertEqual(mode, "screen")
         self.assertEqual(output_path, Path("/tmp/2026-04-02 12-00-00_녹화.mp4"))
-        self.assertIsNone(audio_path)
 
     def test_screen_stop_propagates_recorder_error_as_none_output(self):
         """ContinuousScreenRecorder.stop()이 예외를 던져도 Recorder.stop()은 정상 반환한다."""

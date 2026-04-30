@@ -2,6 +2,7 @@ import logging
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Protocol
@@ -18,6 +19,7 @@ class SegmentHandle:
     finished: threading.Event = field(default_factory=threading.Event)
     error: Optional[Exception] = None
     token: object = None
+    started_at: Optional[float] = None
 
 
 class RecordingDriver(Protocol):
@@ -66,6 +68,18 @@ class ContinuousCaptureController:
     @property
     def is_paused(self) -> bool:
         return self._paused
+
+    @property
+    def active_segment_started_at(self) -> Optional[float]:
+        if self._active_segment is None:
+            return None
+        return self._active_segment.started_at
+
+    @property
+    def stream_capture_started_at(self) -> Optional[float]:
+        """SCStream 캡처 시작 콜백 시각. RecordingOutput 콜백보다 이른 시점이라
+        mp4 audio time 0의 실제 시각을 더 정확히 반영한다."""
+        return getattr(self._driver, "stream_capture_started_at", None)
 
     def start(self) -> Path:
         if self._stream_running:
@@ -244,11 +258,17 @@ def _get_recording_delegate_class():
 
 
 class ScreenCaptureKitRecordingDriver:
-    def __init__(self):
+    def __init__(self, capture_audio: bool = True):
         self._stream = None
         self._delegate = _get_recording_delegate_class().alloc().initWithOwner_(self)
         self._lock = threading.Lock()
         self._handles: dict[int, SegmentHandle] = {}
+        self._stream_capture_started_at: Optional[float] = None
+        self._capture_audio = capture_audio
+
+    @property
+    def stream_capture_started_at(self) -> Optional[float]:
+        return self._stream_capture_started_at
 
     def start_stream(self) -> None:
         import CoreMedia
@@ -278,8 +298,14 @@ class ScreenCaptureKitRecordingDriver:
 
                 content_filter = SCK.SCContentFilter.alloc().initWithDisplay_excludingWindows_(display, [])
                 config = SCK.SCStreamConfiguration.alloc().init()
-                config.setCapturesAudio_(True)
-                config.setExcludesCurrentProcessAudio_(False)
+                config.setCapturesAudio_(self._capture_audio)
+                if self._capture_audio:
+                    config.setExcludesCurrentProcessAudio_(False)
+                    # 오디오 안정성: 샘플레이트/채널 명시 (system_audio.py와 동일)
+                    if hasattr(config, "setSampleRate_"):
+                        config.setSampleRate_(48000)
+                    if hasattr(config, "setChannelCount_"):
+                        config.setChannelCount_(2)
                 config.setShowsCursor_(True)
                 config.setQueueDepth_(8)
                 config.setWidth_(int(width))
@@ -365,6 +391,7 @@ class ScreenCaptureKitRecordingDriver:
         if not ready.wait(timeout=10):
             raise TimeoutError("SCStream 종료 타임아웃")
         self._stream = None
+        self._stream_capture_started_at = None
         if state["error"] is not None:
             raise state["error"]
 
@@ -388,11 +415,15 @@ class ScreenCaptureKitRecordingDriver:
     def _on_stream_started(self, error, state: dict, ready: threading.Event) -> None:
         if error is not None:
             state["error"] = RuntimeError(f"SCStream 시작 실패: {error}")
+        else:
+            # SCRecordingOutput 콜백보다 더 이른 실제 캡처 시작 시각 (mp4 audio time 0에 가까움)
+            self._stream_capture_started_at = time.time()
         ready.set()
 
     def _on_recording_started(self, recording_output) -> None:
         handle = self._handle_for_output(recording_output)
         if handle is not None:
+            handle.started_at = time.time()
             handle.started.set()
 
     def _on_recording_finished(self, recording_output) -> None:
@@ -417,12 +448,15 @@ class ScreenCaptureKitRecordingDriver:
 
 
 class ContinuousScreenRecorder:
-    def __init__(self, output_dir: Path, basename: str):
+    def __init__(self, output_dir: Path, basename: str, capture_audio: bool = True):
+        """capture_audio=False로 호출하면 SCStream에서 시스템 오디오를 캡처하지 않는다.
+        이 경우 시스템 오디오는 별도 SystemAudioCapture로 잡아 audio quality(특히 popping 회피)를
+        보존하는 것이 권장된다."""
         self._output_dir = Path(output_dir)
         self._basename = basename
         self._final_path = self._output_dir / f"{self._basename}.mp4"
         self._controller = ContinuousCaptureController(
-            driver=ScreenCaptureKitRecordingDriver(),
+            driver=ScreenCaptureKitRecordingDriver(capture_audio=capture_audio),
             output_dir=self._output_dir,
             basename=self._basename,
             finalize_segments=self._finalize_segments,
@@ -435,6 +469,14 @@ class ContinuousScreenRecorder:
     @property
     def is_paused(self) -> bool:
         return self._controller.is_paused
+
+    @property
+    def active_segment_started_at(self) -> Optional[float]:
+        return self._controller.active_segment_started_at
+
+    @property
+    def stream_capture_started_at(self) -> Optional[float]:
+        return self._controller.stream_capture_started_at
 
     def start(self) -> Path:
         return self._controller.start()

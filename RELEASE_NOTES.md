@@ -1,5 +1,16 @@
 # Release Notes
 
+## 1.1.15
+
+- 화면 녹화 시 음성이 영상보다 빠르게 들리고 튀는 소음이 들어가던 문제 수정
+  - 시스템 오디오를 `SCRecordingOutput`이 mp4에 직접 인코딩하던 경로 대신, `SystemAudioCapture`(SCStream raw sample → WAV)로 별도 캡처해 audio quality 보존 (1.1.13 검증 경로 복원)
+  - macOS 15+에서는 마이크도 `SystemAudioCapture`의 SCStream으로 캡처해 ffmpeg subprocess 시작 지연으로 인한 마이크 timing 어긋남 제거
+  - 화면 녹화 sync anchor를 `SCStream.startCaptureWithCompletionHandler_` 콜백 시각(`stream_capture_started_at`)으로 변경해 mp4 video time 0과의 정렬 정확도 개선
+  - mp4 + 마이크 amix 필터에 `normalize=1` 적용해 합산 시 클리핑/튐 방지
+  - 마이크 `_start_mic`을 WAV 파일 첫 샘플 기록 시점 폴링으로 변경해 ffmpeg avfoundation 초기화 지연 보정
+- AAC 인코딩을 `192k @ 48kHz`로 명시해 병합 단계 인코딩 품질 향상
+- `ContinuousScreenRecorder`에 `capture_audio` 파라미터 추가, 화면 녹화 모드에서는 영상만 캡처하도록 분리
+
 ## 1.1.14
 
 - 일시정지 시간을 메뉴바 타이머 경과 시간에서 제외해 일시정지 중 카운트가 멈추도록 수정

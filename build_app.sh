@@ -27,6 +27,52 @@ mkdir -p "$SWIFT_CACHE_DIR"
 export SWIFT_MODULECACHE_PATH="$SWIFT_CACHE_DIR"
 export CLANG_MODULE_CACHE_PATH="$SWIFT_CACHE_DIR"
 
+# CLT 16.4 버그 우회: module.modulemap과 bridging.modulemap이 동일 디렉토리에서
+# SwiftBridging을 중복 정의하는 경우, VFS 오버레이로 module.modulemap을 빈 파일로 가림
+SWIFTC_EXTRA=()
+SWIFT_INC_DIR="/Library/Developer/CommandLineTools/usr/include/swift"
+if [ -f "$SWIFT_INC_DIR/module.modulemap" ] && [ -f "$SWIFT_INC_DIR/bridging.modulemap" ]; then
+    VFS_YAML="$SWIFT_CACHE_DIR/vfs_module_override.yaml"
+    cat > "$VFS_YAML" << YAML_EOF
+{
+  "version": 0,
+  "case-sensitive": false,
+  "roots": [
+    {
+      "name": "$SWIFT_INC_DIR",
+      "type": "directory",
+      "contents": [
+        {
+          "name": "module.modulemap",
+          "type": "file",
+          "external-contents": "/dev/null"
+        }
+      ]
+    }
+  ]
+}
+YAML_EOF
+    SWIFTC_EXTRA=(-vfsoverlay "$VFS_YAML" -Xcc -ivfsoverlay -Xcc "$VFS_YAML")
+    echo "CLT SwiftBridging 충돌 감지 → VFS 오버레이 적용: $VFS_YAML"
+fi
+
+# macOS 26 beta 환경에서 CLT는 MacOSX15.5.sdk까지만 포함됨 → SDK 명시
+CLT_SDK="/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+SWIFTC_SDK_FLAGS=(-sdk "$CLT_SDK" -target arm64-apple-macosx13.0)
+
+# macOS 26 API(SpeechTranscriber 등)는 Xcode SDK가 필요 → 직접 경로 탐지
+XCODE_SWIFTC_CANDIDATE="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+XCODE_SDK="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || echo "")"
+if [ -x "$XCODE_SWIFTC_CANDIDATE" ] && [ -n "$XCODE_SDK" ]; then
+    PROBE_SWIFTC="$XCODE_SWIFTC_CANDIDATE"
+    PROBE_SDK_FLAGS=(-sdk "$XCODE_SDK" -target arm64-apple-macosx13.0)
+    PROBE_EXTRA=()
+else
+    PROBE_SWIFTC="/Library/Developer/CommandLineTools/usr/bin/swiftc"
+    PROBE_SDK_FLAGS=("${SWIFTC_SDK_FLAGS[@]}")
+    PROBE_EXTRA=("${SWIFTC_EXTRA[@]}")
+fi
+
 # Swift 런처 소스 작성
 SWIFT_SRC="$SCRIPT_DIR/.build_launcher.swift"
 cat > "$SWIFT_SRC" << 'SWIFT_EOF'
@@ -101,21 +147,21 @@ exit(child.terminationStatus)
 SWIFT_EOF
 
 echo "Swift 런처 컴파일 중..."
-swiftc -O -o "$MACOS/$APP_NAME" "$SWIFT_SRC"
+/Library/Developer/CommandLineTools/usr/bin/swiftc "${SWIFTC_SDK_FLAGS[@]}" -O -module-cache-path "$SWIFT_CACHE_DIR" "${SWIFTC_EXTRA[@]}" -o "$MACOS/$APP_NAME" "$SWIFT_SRC"
 rm -f "$SWIFT_SRC"
 echo "컴파일 완료"
 
 echo "Apple Speech probe 컴파일 중..."
-swiftc -parse-as-library -O -o "$MACOS/${APP_NAME}SpeechProbe" "$SCRIPT_DIR/apple_speech_probe.swift"
+"$PROBE_SWIFTC" "${PROBE_SDK_FLAGS[@]}" -parse-as-library -O -module-cache-path "$SWIFT_CACHE_DIR" "${PROBE_EXTRA[@]}" -o "$MACOS/${APP_NAME}SpeechProbe" "$SCRIPT_DIR/apple_speech_probe.swift"
 echo "컴파일 완료"
 
 echo "Apple Speech transcriber 컴파일 중..."
-swiftc -parse-as-library -O -o "$MACOS/${APP_NAME}AppleSpeech" "$SCRIPT_DIR/apple_speech_transcriber.swift"
+"$PROBE_SWIFTC" "${PROBE_SDK_FLAGS[@]}" -parse-as-library -O -module-cache-path "$SWIFT_CACHE_DIR" "${PROBE_EXTRA[@]}" -o "$MACOS/${APP_NAME}AppleSpeech" "$SCRIPT_DIR/apple_speech_transcriber.swift"
 echo "컴파일 완료"
 
 echo "$VENV_REAL" > "$RESOURCES/.venv_path"
 
-for f in app.py hotkey_manager.py pipeline.py cancellation.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py live_screen_writer.py sync_diagnostics.py sync_diagnostics_report.py config.yaml dictionary.txt VERSION RELEASE_NOTES.md; do
+for f in app.py hotkey_manager.py pipeline.py cancellation.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py live_screen_writer.py continuous_screen_recorder.py sync_diagnostics.py sync_diagnostics_report.py config.yaml dictionary.txt VERSION RELEASE_NOTES.md; do
     cp "$SCRIPT_DIR/$f" "$RESOURCES/"
 done
 
