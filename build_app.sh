@@ -172,8 +172,17 @@ PLIST
 touch "$CONTENTS/Info.plist" "$APP_DIR"
 
 echo "앱 코드 서명 중..."
-codesign --force --deep --sign - "$APP_DIR"
-echo "코드 서명 완료"
+SIGN_IDENTITY="AutoMeetingNote Local"
+# 자체 서명 인증서는 find-identity 에 0개로 보고되지만 codesign 자체는 동작한다.
+# 따라서 인증서 존재 여부로 검사한 뒤 직접 시도하고, 실패 시에만 ad-hoc 으로 폴백한다.
+if security find-certificate -c "$SIGN_IDENTITY" >/dev/null 2>&1 \
+    && codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_DIR" 2>/dev/null; then
+    echo "코드 서명 완료 (identity: $SIGN_IDENTITY) — 권한 영구 유지"
+else
+    codesign --force --deep --sign - "$APP_DIR"
+    echo "코드 서명 완료 (ad-hoc) — 매 빌드마다 권한 재설정 필요"
+    echo "💡 Keychain Access에서 '$SIGN_IDENTITY' 인증서를 만들면 다음 빌드부터 자동 사용됩니다."
+fi
 
 echo ""
 echo "=== 빌드 완료 ==="

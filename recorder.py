@@ -45,6 +45,8 @@ class Recorder:
         self._segments: list = []          # (output_path, audio_path, mic_path, sys_offset, mic_offset) 목록
         self._is_paused: bool = False
         self._seg_index: int = 0
+        self._paused_duration: float = 0.0
+        self._pause_start: Optional[float] = None
         self._output_dir: Optional[Path] = None
         self._mic_enabled: bool = True
         self._mic_device_index: str = "macbook"
@@ -74,7 +76,10 @@ class Recorder:
     def elapsed_seconds(self) -> float:
         if self._start_time is None:
             return 0.0
-        return time.time() - self._start_time
+        paused = self._paused_duration
+        if self._pause_start is not None:
+            paused += time.time() - self._pause_start
+        return time.time() - self._start_time - paused
 
     def attach_sync_diagnostic_session(self, session) -> None:
         self._sync_diagnostic_session = session
@@ -593,6 +598,7 @@ class Recorder:
             self._audio_offset = 0.0
             self._mic_audio_offset = 0.0
             self._is_paused = True
+            self._pause_start = time.time()
             logger.info("일시 정지 (세그먼트 %d 저장)", self._seg_index)
 
     def resume(self) -> None:
@@ -600,6 +606,9 @@ class Recorder:
         with self._lock:
             if not self._is_paused:
                 return
+            if self._pause_start is not None:
+                self._paused_duration += time.time() - self._pause_start
+                self._pause_start = None
             from system_audio import SystemAudioCapture
 
             self._seg_index += 1
@@ -740,26 +749,35 @@ class Recorder:
 
             segments = list(self._segments)
 
-            if not segments:
-                output_path = audio_path = mic_path = None
-                audio_offset = mic_audio_offset = 0.0
-            elif len(segments) == 1:
-                output_path, audio_path, mic_path, audio_offset, mic_audio_offset = segments[0]
-            else:
-                output_path, audio_path, mic_path, audio_offset, mic_audio_offset = self._concat_segments(mode, segments)
-
-            self._mode = None
-            self._output_path = None
-            self._audio_path = None
-            self._mic_path = None
-            self._audio_offset = 0.0
-            self._mic_audio_offset = 0.0
-            self._start_time = None
-            self._segments = []
-            self._seg_index = 0
-            self._is_paused = False
-            self._mic_started_at = None
-            self._using_stream_microphone = False
+            output_path = audio_path = mic_path = None
+            audio_offset = mic_audio_offset = 0.0
+            try:
+                if not segments:
+                    pass
+                elif len(segments) == 1:
+                    output_path, audio_path, mic_path, audio_offset, mic_audio_offset = segments[0]
+                else:
+                    output_path, audio_path, mic_path, audio_offset, mic_audio_offset = self._concat_segments(mode, segments)
+            except Exception as concat_err:
+                logger.error("세그먼트 합치기 실패 (다음 녹화는 정상 동작): %s", concat_err)
+                # 합치기 실패 시 첫 세그먼트라도 반환해 후속 파이프라인이 진행 가능하게 한다.
+                if segments:
+                    output_path, audio_path, mic_path, audio_offset, mic_audio_offset = segments[0]
+            finally:
+                self._mode = None
+                self._output_path = None
+                self._audio_path = None
+                self._mic_path = None
+                self._audio_offset = 0.0
+                self._mic_audio_offset = 0.0
+                self._start_time = None
+                self._segments = []
+                self._seg_index = 0
+                self._is_paused = False
+                self._paused_duration = 0.0
+                self._pause_start = None
+                self._mic_started_at = None
+                self._using_stream_microphone = False
 
             logger.info("녹화/녹음 중지 완료")
             return mode, output_path, audio_path, mic_path, audio_offset, mic_audio_offset
@@ -787,6 +805,42 @@ class Recorder:
             pass
         if result.returncode != 0:
             raise RuntimeError(f"세그먼트 합치기 실패: {out_path.name}")
+
+    def _concat_videos_normalized(self, ffmpeg_bin: str, paths: list, out_path: Path) -> None:
+        """비디오 세그먼트의 PTS를 0부터 다시 매기며 재인코딩으로 합친다.
+
+        SCRecordingOutput은 Mach time 기반 PTS를 기록해, -c copy 단순 결합 시
+        세그먼트 사이에 일시정지 시간만큼 frozen 구간이 생긴다.
+        setpts=PTS-STARTPTS 로 각 세그먼트 PTS를 0부터 재계산한 뒤 libx264 로 재인코딩한다.
+
+        out_path 가 입력 segments[0] 와 동일 경로일 수 있어, 임시 파일에 쓴 뒤
+        atomic replace 로 최종 위치에 옮긴다 (ffmpeg는 in-place 편집을 거부함).
+        """
+        tmp_out = out_path.parent / f"._normalize_tmp_{out_path.name}"
+        cmd = [ffmpeg_bin]
+        for p in paths:
+            cmd.extend(["-i", str(p)])
+
+        n = len(paths)
+        reset = "".join(f"[{i}:v]setpts=PTS-STARTPTS[v{i}];" for i in range(n))
+        concat_inputs = "".join(f"[v{i}]" for i in range(n))
+        filter_complex = f"{reset}{concat_inputs}concat=n={n}:v=1:a=0[v]"
+
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-y", str(tmp_out),
+        ])
+
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            tmp_out.unlink(missing_ok=True)
+            err = (result.stderr or b"").decode(errors="replace")[-500:]
+            raise RuntimeError(f"PTS 정규화 concat 실패: {err}")
+
+        tmp_out.replace(out_path)
 
     @staticmethod
     def _software_video_codec_args() -> list[str]:
@@ -833,7 +887,11 @@ class Recorder:
                     trimmed_mic.append(trimmed)
 
             if mov_paths:
-                self._concat_files(ffmpeg_bin, mov_paths, final_mov)
+                try:
+                    self._concat_videos_normalized(ffmpeg_bin, mov_paths, final_mov)
+                except Exception as norm_err:
+                    logger.warning("정규화 concat 실패, 단순 concat으로 폴백: %s", norm_err)
+                    self._concat_files(ffmpeg_bin, mov_paths, final_mov)
             if trimmed_sys:
                 self._concat_files(ffmpeg_bin, trimmed_sys, final_sys)
                 for f in trimmed_sys:
