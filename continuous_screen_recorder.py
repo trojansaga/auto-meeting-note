@@ -293,8 +293,12 @@ class ScreenCaptureKitRecordingDriver:
                     raise RuntimeError("캡처 가능한 디스플레이를 찾을 수 없습니다.")
 
                 display = self._pick_display(displays)
-                width = Quartz.CGDisplayPixelsWide(Quartz.CGMainDisplayID())
-                height = Quartz.CGDisplayPixelsHigh(Quartz.CGMainDisplayID())
+                native_w = Quartz.CGDisplayPixelsWide(Quartz.CGMainDisplayID())
+                native_h = Quartz.CGDisplayPixelsHigh(Quartz.CGMainDisplayID())
+                # 화면 픽셀의 75% 로 다운스케일 (4K UHD급, HEVC 매크로블록 정렬 위해 짝수로 정규화)
+                scale = 0.75
+                width = (int(native_w * scale) // 2) * 2
+                height = (int(native_h * scale) // 2) * 2
 
                 content_filter = SCK.SCContentFilter.alloc().initWithDisplay_excludingWindows_(display, [])
                 config = SCK.SCStreamConfiguration.alloc().init()

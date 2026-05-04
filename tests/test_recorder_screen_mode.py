@@ -185,7 +185,7 @@ class ConcatFilesTests(unittest.TestCase):
         self.assertFalse(tmp.exists())
 
     def test_concat_files_video_fallback_on_copy_fail(self):
-        """-c copy 실패 시 h264_videotoolbox → libx264 순으로 fallback한다."""
+        """-c copy 실패 시 hevc_videotoolbox → libx265 순으로 fallback한다."""
         seg0 = self._write("seg0.mp4")
         seg1 = self._write("seg1.mp4")
         out = self._dir / "final.mp4"
@@ -198,11 +198,11 @@ class ConcatFilesTests(unittest.TestCase):
             if attempt[0] == 1:
                 r.returncode = 1  # -c copy 실패
             elif attempt[0] == 2:
-                r.returncode = 1  # h264_videotoolbox 실패
+                r.returncode = 1  # hevc_videotoolbox 실패
             else:
                 tmp_path = Path(cmd[-1])
                 tmp_path.write_bytes(b"reencoded")
-                r.returncode = 0  # libx264 성공
+                r.returncode = 0  # libx265 성공
             return r
 
         recorder = Recorder()

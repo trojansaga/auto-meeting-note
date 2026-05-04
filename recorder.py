@@ -918,7 +918,7 @@ class Recorder:
         """ffmpeg concat demuxer로 파일 목록을 하나로 합침.
 
         input 중 하나가 out_path와 경로가 같아도 안전하도록 임시 파일에 먼저 쓴 뒤 rename.
-        영상(-c copy 실패 시): h264_videotoolbox → libx264 순으로 fallback 재인코드.
+        영상(-c copy 실패 시): hevc_videotoolbox → libx265 순으로 fallback 재인코드.
         """
         tmp_path = out_path.with_name(f"~concat_{out_path.name}")
         list_file = out_path.with_suffix(".concat.txt")
@@ -951,16 +951,16 @@ class Recorder:
                         raise RuntimeError(f"세그먼트 합치기 실패: {out_path.name}")
                 else:
                     logger.warning(
-                        "영상 concat -c copy 실패, h264_videotoolbox로 재시도: %s\n%s",
+                        "영상 concat -c copy 실패, hevc_videotoolbox로 재시도: %s\n%s",
                         out_path.name, result.stderr.decode(errors="replace"),
                     )
-                    result = _run(["-c:v", "h264_videotoolbox", "-q:v", "60", "-c:a", "aac", "-b:a", "256k"])
+                    result = _run(["-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough", "-c:a", "aac", "-b:a", "256k"])
                     if result.returncode != 0:
                         logger.warning(
-                            "h264_videotoolbox 실패, libx264로 재시도: %s\n%s",
+                            "hevc_videotoolbox 실패, libx265로 재시도: %s\n%s",
                             out_path.name, result.stderr.decode(errors="replace"),
                         )
-                        result = _run(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "256k"])
+                        result = _run(["-c:v", "libx265", "-preset", "medium", "-crf", "28", "-tag:v", "hvc1", "-fps_mode", "passthrough", "-c:a", "aac", "-b:a", "256k"])
                         if result.returncode != 0:
                             logger.error(
                                 "영상 세그먼트 합치기 최종 실패: %s\n%s",
@@ -981,7 +981,7 @@ class Recorder:
 
         SCRecordingOutput은 Mach time 기반 PTS를 기록해, -c copy 단순 결합 시
         세그먼트 사이에 일시정지 시간만큼 frozen 구간이 생긴다.
-        setpts=PTS-STARTPTS 로 각 세그먼트 PTS를 0부터 재계산한 뒤 libx264 로 재인코딩한다.
+        setpts=PTS-STARTPTS 로 각 세그먼트 PTS를 0부터 재계산한 뒤 libx265 로 재인코딩한다.
 
         out_path 가 입력 segments[0] 와 동일 경로일 수 있어, 임시 파일에 쓴 뒤
         atomic replace 로 최종 위치에 옮긴다 (ffmpeg는 in-place 편집을 거부함).
@@ -999,7 +999,8 @@ class Recorder:
         cmd.extend([
             "-filter_complex", filter_complex,
             "-map", "[v]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:v", "libx265", "-preset", "medium", "-crf", "28",
+            "-tag:v", "hvc1",
             "-pix_fmt", "yuv420p",
             "-y", str(tmp_out),
         ])
@@ -1014,10 +1015,10 @@ class Recorder:
 
     @staticmethod
     def _software_video_codec_args() -> list[str]:
-        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+        return ["-c:v", "libx265", "-preset", "medium", "-crf", "28", "-tag:v", "hvc1", "-fps_mode", "passthrough"]
 
     def _with_software_video_encoder(self, cmd: list[str]) -> list[str]:
-        pattern = ["-c:v", "h264_videotoolbox", "-q:v", "60"]
+        pattern = ["-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough"]
         for idx in range(len(cmd) - len(pattern) + 1):
             if cmd[idx:idx + len(pattern)] == pattern:
                 return [
@@ -1299,7 +1300,7 @@ class Recorder:
                 *sys_args,
                 *mic_args,
                 "-filter_complex", f"{self._amix_filter()}[aout]",
-                "-c:v", "h264_videotoolbox", "-q:v", "60",
+                "-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough",
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "[aout]",
                 "-shortest",
@@ -1312,7 +1313,7 @@ class Recorder:
                 ffmpeg_bin,
                 "-i", str(mov_path),
                 *sys_args,
-                "-c:v", "h264_videotoolbox", "-q:v", "60",
+                "-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough",
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0",
                 "-shortest",
@@ -1325,7 +1326,7 @@ class Recorder:
                 ffmpeg_bin,
                 "-i", str(mov_path),
                 *mic_args,
-                "-c:v", "h264_videotoolbox", "-q:v", "60",
+                "-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough",
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0",
                 "-shortest",
@@ -1338,7 +1339,7 @@ class Recorder:
                 ffmpeg_bin,
                 "-i", str(mov_path),
                 "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
-                "-c:v", "h264_videotoolbox", "-q:v", "60",
+                "-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough",
                 "-c:a", "aac",
                 "-map", "0:v", "-map", "1:a",
                 "-shortest",
@@ -1383,9 +1384,9 @@ class Recorder:
 
         returncode, stderr_lines = _run_ffmpeg(cmd)
 
-        if returncode != 0 and "h264_videotoolbox" in cmd:
+        if returncode != 0 and "hevc_videotoolbox" in cmd:
             logger.warning(
-                "videotoolbox 인코더 실패, libx264로 재시도합니다 (exit=%d)",
+                "videotoolbox 인코더 실패, libx265로 재시도합니다 (exit=%d)",
                 returncode,
             )
             fallback_cmd = self._with_software_video_encoder(cmd)
