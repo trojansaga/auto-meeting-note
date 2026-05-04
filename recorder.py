@@ -978,13 +978,13 @@ class Recorder:
                         "영상 concat -c copy 실패, hevc_videotoolbox로 재시도: %s\n%s",
                         out_path.name, result.stderr.decode(errors="replace"),
                     )
-                    result = _run(["-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough", "-c:a", "aac", "-b:a", "256k"])
+                    result = _run([*self._hardware_video_codec_args(), "-c:a", "aac", "-b:a", "256k"])
                     if result.returncode != 0:
                         logger.warning(
                             "hevc_videotoolbox 실패, libx265로 재시도: %s\n%s",
                             out_path.name, result.stderr.decode(errors="replace"),
                         )
-                        result = _run(["-c:v", "libx265", "-preset", "medium", "-crf", "28", "-tag:v", "hvc1", "-fps_mode", "passthrough", "-c:a", "aac", "-b:a", "256k"])
+                        result = _run([*self._software_video_codec_args(), "-c:a", "aac", "-b:a", "256k"])
                         if result.returncode != 0:
                             logger.error(
                                 "영상 세그먼트 합치기 최종 실패: %s\n%s",
@@ -1037,20 +1037,66 @@ class Recorder:
 
         tmp_out.replace(out_path)
 
-    @staticmethod
-    def _software_video_codec_args() -> list[str]:
-        return ["-c:v", "libx265", "-preset", "medium", "-crf", "28", "-tag:v", "hvc1", "-fps_mode", "passthrough"]
+    # 비디오 인코더 인자 단일 진실 소스 (hw/sw). 한쪽을 변경하면
+    # _with_software_video_encoder 의 패턴 매처가 자동으로 따라간다.
+    _HW_VIDEO_ENCODER_ARGS: tuple[str, ...] = (
+        "-c:v", "hevc_videotoolbox",
+        "-q:v", "40",
+        "-tag:v", "hvc1",
+        "-fps_mode", "passthrough",
+    )
 
-    def _with_software_video_encoder(self, cmd: list[str]) -> list[str]:
-        pattern = ["-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough"]
-        for idx in range(len(cmd) - len(pattern) + 1):
-            if cmd[idx:idx + len(pattern)] == pattern:
-                return [
-                    *cmd[:idx],
-                    *self._software_video_codec_args(),
-                    *cmd[idx + len(pattern):],
-                ]
-        return cmd
+    _SW_VIDEO_ENCODER_ARGS: tuple[str, ...] = (
+        "-c:v", "libx265",
+        "-preset", "medium",
+        "-crf", "28",
+        "-tag:v", "hvc1",
+        "-fps_mode", "passthrough",
+    )
+
+    @classmethod
+    def _hardware_video_codec_args(cls) -> list[str]:
+        return list(cls._HW_VIDEO_ENCODER_ARGS)
+
+    @classmethod
+    def _software_video_codec_args(cls) -> list[str]:
+        return list(cls._SW_VIDEO_ENCODER_ARGS)
+
+    @classmethod
+    def _with_software_video_encoder(cls, cmd: list[str]) -> list[str]:
+        """ffmpeg cmd 안의 hardware 인코더 블록을 software 인자로 치환.
+
+        매칭은 `-c:v <hardware codec>` 위치만 sentinel 로 잡고, 그 뒤로
+        다음 `-` prefix 옵션 그룹(예: `-c:a`, `-map`, `-shortest`, ...)을
+        만나기 직전까지의 모든 인코더 옵션을 통째로 교체한다.
+        이렇게 하면 hw/sw 옵션에 인자가 추가/변경돼도 매처가 깨지지 않는다.
+        """
+        hw_codec = cls._HW_VIDEO_ENCODER_ARGS[1]  # "hevc_videotoolbox"
+        try:
+            idx = next(
+                i for i in range(len(cmd) - 1)
+                if cmd[i] == "-c:v" and cmd[i + 1] == hw_codec
+            )
+        except StopIteration:
+            return cmd
+
+        # idx 부터 다음 옵션 그룹 시작 전까지를 교체 범위로 잡는다.
+        # 인코더 옵션은 `-key value` 페어이므로 idx+2 부터 짝수 단위로 검사.
+        end = idx + 2  # `-c:v hw_codec` 다음 위치
+        while end + 1 < len(cmd) and cls._is_video_encoder_option(cmd[end]):
+            end += 2  # `-key value` 한 쌍 건너뛰기
+        return [*cmd[:idx], *cls._software_video_codec_args(), *cmd[end:]]
+
+    # _HW_VIDEO_ENCODER_ARGS / _SW_VIDEO_ENCODER_ARGS 에 등장하는 비디오 인코더용 옵션 키.
+    # 다른 옵션(`-c:a`, `-map`, `-shortest`, `-y`, …)은 여기 포함되지 않는다.
+    _VIDEO_ENCODER_OPTION_KEYS: frozenset[str] = frozenset({
+        "-q:v", "-tag:v", "-fps_mode",
+        "-preset", "-crf", "-pix_fmt", "-b:v",
+    })
+
+    @classmethod
+    def _is_video_encoder_option(cls, token: str) -> bool:
+        return token in cls._VIDEO_ENCODER_OPTION_KEYS
 
     def _concat_screen_sys_segments(self, sys_segments: list[tuple[Path, float]]) -> Optional[Path]:
         """screen 모드 시스템 오디오 세그먼트들을 단일 WAV로 통합."""
@@ -1324,7 +1370,7 @@ class Recorder:
                 *sys_args,
                 *mic_args,
                 "-filter_complex", f"{self._amix_filter()}[aout]",
-                "-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough",
+                *self._hardware_video_codec_args(),
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "[aout]",
                 "-shortest",
@@ -1337,7 +1383,7 @@ class Recorder:
                 ffmpeg_bin,
                 "-i", str(mov_path),
                 *sys_args,
-                "-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough",
+                *self._hardware_video_codec_args(),
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0",
                 "-shortest",
@@ -1350,7 +1396,7 @@ class Recorder:
                 ffmpeg_bin,
                 "-i", str(mov_path),
                 *mic_args,
-                "-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough",
+                *self._hardware_video_codec_args(),
                 "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0",
                 "-shortest",
@@ -1363,7 +1409,7 @@ class Recorder:
                 ffmpeg_bin,
                 "-i", str(mov_path),
                 "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
-                "-c:v", "hevc_videotoolbox", "-q:v", "40", "-tag:v", "hvc1", "-fps_mode", "passthrough",
+                *self._hardware_video_codec_args(),
                 "-c:a", "aac",
                 "-map", "0:v", "-map", "1:a",
                 "-shortest",

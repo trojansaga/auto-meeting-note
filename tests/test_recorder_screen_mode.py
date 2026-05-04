@@ -240,5 +240,71 @@ class ConcatFilesTests(unittest.TestCase):
         self.assertEqual(out.read_bytes(), b"resampled")
 
 
+class VideoEncoderArgsTests(unittest.TestCase):
+    """[L1] hw/sw 비디오 인코더 인자 헬퍼와 패턴 매처 회귀 방지."""
+
+    def test_hw_args_starts_with_c_v_flag(self):
+        args = Recorder._hardware_video_codec_args()
+        self.assertEqual(args[0], "-c:v")
+        self.assertEqual(args[1], "hevc_videotoolbox")
+        # 동일 객체 반환 시 list mutation 위험 방지 (매번 새 리스트)
+        self.assertIsNot(args, Recorder._hardware_video_codec_args())
+
+    def test_sw_args_uses_libx265_with_hvc1_tag(self):
+        args = Recorder._software_video_codec_args()
+        self.assertIn("libx265", args)
+        # macOS 호환을 위한 hvc1 태그 보존
+        self.assertEqual(args[args.index("-tag:v") + 1], "hvc1")
+
+    def test_with_software_video_encoder_swaps_hw_block_only(self):
+        """sentinel 매처가 -c:v 위치만 잡아 hw 옵션 그룹을 통째로 sw 인자로 교체한다."""
+        cmd = [
+            "ffmpeg", "-i", "input.mp4",
+            *Recorder._hardware_video_codec_args(),
+            "-c:a", "aac", "-b:a", "256k",
+            "-y", "out.mp4",
+        ]
+        result = Recorder._with_software_video_encoder(cmd)
+
+        # hw 인자는 사라지고 sw 인자가 대체됨
+        self.assertNotIn("hevc_videotoolbox", result)
+        self.assertIn("libx265", result)
+        # 비디오 인코더 외 다른 옵션 (-c:a aac, -y, ...) 은 보존
+        self.assertEqual(result[result.index("-c:a") + 1], "aac")
+        self.assertIn("-y", result)
+        self.assertEqual(result[-1], "out.mp4")
+
+    def test_with_software_video_encoder_returns_unchanged_when_no_hw_block(self):
+        cmd = ["ffmpeg", "-i", "input.mp4", "-c:v", "copy", "-y", "out.mp4"]
+        self.assertEqual(Recorder._with_software_video_encoder(cmd), cmd)
+
+    def test_with_software_video_encoder_handles_extra_hw_options_added_later(self):
+        """미래에 hw 인자 그룹에 옵션이 추가돼도 매처가 깨지지 않는다.
+
+        예: 누군가 _HW_VIDEO_ENCODER_ARGS 에 `-b:v 5M` 옵션을 추가했을 때.
+        매처는 sentinel(-c:v) 위치만 잡고 그 뒤 비디오 인코더 옵션 그룹을
+        통째로 교체하므로, 정확한 토큰 카운트 매칭에 의존하지 않는다.
+        """
+        cmd_with_extra = [
+            "ffmpeg", "-i", "input.mp4",
+            "-c:v", "hevc_videotoolbox",
+            "-q:v", "40",
+            "-tag:v", "hvc1",
+            "-fps_mode", "passthrough",
+            "-b:v", "5M",  # ← 미래 추가
+            "-c:a", "aac", "-b:a", "256k",
+            "-y", "out.mp4",
+        ]
+        result = Recorder._with_software_video_encoder(cmd_with_extra)
+
+        self.assertNotIn("hevc_videotoolbox", result)
+        # 미래 추가된 -b:v 5M 도 sw 블록과 함께 제거됨
+        self.assertNotIn("5M", result)
+        self.assertIn("libx265", result)
+        # 오디오/출력 옵션은 보존
+        self.assertEqual(result[result.index("-c:a") + 1], "aac")
+        self.assertEqual(result[-1], "out.mp4")
+
+
 if __name__ == "__main__":
     unittest.main()

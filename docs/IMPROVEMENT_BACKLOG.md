@@ -89,11 +89,16 @@
 
 ## 🟢 우선순위 낮음 — 잠재적 개선
 
-### [L1] `_with_software_video_encoder` 패턴 매처 fragile
+### ~~[L1] `_with_software_video_encoder` 패턴 매처 fragile~~ ✅ 완료
 
-- **위치**: `recorder.py:1019-1028`
-- **문제**: 정확히 8개 토큰 리스트 매칭. 코덱 인자 추가/변경 시 침묵으로 깨짐. (1.1.16에서 코덱 변경 시 잠재 위험)
-- **수정 방향**: `_videotoolbox_video_codec_args()` 헬퍼로 중앙화하고, 폴백 시 슬라이스 위치를 헬퍼가 반환
+- **위치**: `recorder.py` (이전 1019-1028)
+- **문제**: 정확히 8개 토큰 리스트 매칭. 코덱 인자 추가/변경 시 침묵으로 깨짐.
+- **수정 내용**:
+  - `_HW_VIDEO_ENCODER_ARGS` / `_SW_VIDEO_ENCODER_ARGS` tuple 상수 도입 (단일 진실 소스)
+  - `_hardware_video_codec_args()` / `_software_video_codec_args()` classmethod
+  - `_with_software_video_encoder()` 매처를 sentinel 방식으로 재작성 — `-c:v hevc_videotoolbox` 위치만 매칭하고 그 뒤 비디오 인코더 옵션 그룹(`-q:v`/`-tag:v`/`-fps_mode`/`-preset`/`-crf`/`-pix_fmt`/`-b:v`)을 통째로 교체. 인자 추가/변경에 강함
+  - 메인 병합 4곳 + concat 폴백 1곳 모두 헬퍼 호출로 일원화
+- **테스트 (5개 추가)**: hw/sw 인자 형태, hw 블록 sentinel 매칭, hw 블록 없을 때 변경 없음, **미래에 hw 인자 그룹에 옵션 추가돼도 매처 깨지지 않음 회귀 테스트**
 
 ### [L2] 브리틀 테스트 패턴
 
