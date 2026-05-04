@@ -1185,7 +1185,8 @@ class AutoMeetingNoteApp(rumps.App):
             import Quartz
             return bool(Quartz.CGPreflightScreenCaptureAccess())
         except Exception:
-            return True  # 확인 불가 시 허용으로 간주
+            logger.debug("화면 녹화 권한 조회 실패 — 허용으로 간주", exc_info=True)
+            return True
 
     @staticmethod
     def _request_screen_permission() -> bool:
@@ -1254,6 +1255,7 @@ class AutoMeetingNoteApp(rumps.App):
             )
             return status == 3  # AVAuthorizationStatusAuthorized
         except Exception:
+            logger.debug("마이크 권한 조회 실패 — 허용으로 간주", exc_info=True)
             return True
 
     @staticmethod
@@ -1692,7 +1694,7 @@ class AutoMeetingNoteApp(rumps.App):
             try:
                 self._recorder.stop()
             except Exception:
-                pass
+                logger.warning("종료 시 녹화 중지 실패 — 강제 종료 진행", exc_info=True)
         self._hotkey_manager.stop()
         rumps.quit_application()
 
@@ -1713,7 +1715,7 @@ def main():
         from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
         NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     except Exception:
-        pass
+        logger.warning("NSApplication Accessory 정책 적용 실패 — Dock 아이콘 표시 가능성 있음", exc_info=True)
 
     app = AutoMeetingNoteApp()
     app.run()

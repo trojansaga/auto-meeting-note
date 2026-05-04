@@ -507,13 +507,13 @@ def _clear_torch_cache():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
-        pass
+        logger.debug("CUDA empty_cache 실패", exc_info=True)
 
     try:
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             torch.mps.empty_cache()
     except Exception:
-        pass
+        logger.debug("MPS empty_cache 실패", exc_info=True)
 
 
 def _transcribe_with_whisper(

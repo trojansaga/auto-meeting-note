@@ -145,12 +145,14 @@ def _list_capture_audio_devices() -> list[tuple[str, str]]:
     try:
         import AVFoundation
     except Exception:
+        logger.debug("AVFoundation 임포트 실패 — 캡처 디바이스 목록 비어 있음", exc_info=True)
         return []
 
     devices = []
     try:
         raw_devices = list(AVFoundation.AVCaptureDevice.devicesWithMediaType_(AVFoundation.AVMediaTypeAudio) or [])
     except Exception:
+        logger.warning("AVCaptureDevice enumeration 실패", exc_info=True)
         raw_devices = []
 
     if not raw_devices and hasattr(AVFoundation, "AVCaptureDeviceDiscoverySession"):

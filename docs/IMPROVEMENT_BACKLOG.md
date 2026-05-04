@@ -15,19 +15,24 @@
 - **수정 내용**: 옵션 A 적용 — `_start_mic` 정상 진입 후 daemon drain 스레드 spawn (`mic-stderr-drain`), readline → /dev/null 흘려보내기. `_stop_mic`에서 join(timeout=2)으로 정리.
 - **테스트**: `test_start_mic_spawns_stderr_drain_thread_when_stderr_pipe_open` (100KB stderr 흘려도 drain 정상 종료), `test_start_mic_skips_drain_thread_when_no_stderr_attribute` 추가
 
-### [H2] `except Exception:` 광범위 사용으로 실패 은폐
+### ~~[H2] `except Exception:` 광범위 사용으로 실패 은폐~~ ✅ 부분 완료
 
-- **위치 (확인 필요한 후보)**:
-  - `app.py:1187, 1256, 1716` — 권한 체크, NSApplication 정책 적용
-  - `transcriber.py:509, 515, 673, 907` — GPU 메모리 정리, 모델 로딩 폴백
-  - `system_audio.py:44, 147, 153, 169, 175` — 오디오 디바이스 enumeration
-  - `recorder.py:474, 507, 723, 770` — 화면 녹화 시작/재개 시
-  - `live_screen_writer.py:74, 78`
-- **문제**: 사용자가 "왜 안 되지?" 디버깅할 때 단서가 사라짐. 사일런트 폴백/스왈로우.
-- **수정 방향**:
-  - 최소: 모든 `except Exception:`에 `logger.exception("...")` 추가하여 traceback 보존
-  - 권장: 가능하면 구체 예외 타입(`OSError`, `RuntimeError`, `subprocess.CalledProcessError` 등)으로 좁히기
-- **검증 방법**: grep `except Exception:` 카운트 줄어들었는지 + 의도적으로 권한 거부 시 로그에 traceback 남는지
+- **위치**: 진단 결과 84개 중 진짜 사일런트 스왈로우(`pass`/단순 `return`) 9곳만 의미 있다고 판단
+- **수정 내용 (1.1.16+)**:
+  - `app.py:1187` 화면 권한 조회 실패 → `logger.debug(..., exc_info=True)` 추가
+  - `app.py:1256` 마이크 권한 조회 실패 → 동일
+  - `app.py:1694` 종료 시 녹화 중지 실패 → `logger.warning(..., exc_info=True)`
+  - `app.py:1715` NSApplication Accessory 정책 실패 → `logger.warning(..., exc_info=True)`
+  - `transcriber.py:509` CUDA empty_cache 실패 → `logger.debug(..., exc_info=True)`
+  - `transcriber.py:515` MPS empty_cache 실패 → 동일
+  - `system_audio.py:147` AVFoundation 임포트 실패 → `logger.debug(..., exc_info=True)`
+  - `system_audio.py:153` AVCaptureDevice enumeration 실패 → `logger.warning(..., exc_info=True)`
+- **의도적으로 미수정**:
+  - `recorder.py:263` (mic stderr drain 내부) — backend drain은 silent가 맞음 (로깅 시 spam)
+  - `system_audio.py:44` `_flog` — 로그 파일 쓰기 자체 실패라 logger 사용 시 재귀 위험
+  - `transcriber.py:673` — 이미 `exc_info=True` 로깅 존재
+  - `transcriber.py:907` — traceback을 result_queue로 부모 프로세스에 전달
+- **남은 후속 작업 (별도 항목)**: `except Exception as e: logger.error("... %s", e)` 패턴 75건은 traceback 누락 → `logger.exception()` 또는 `exc_info=True` 추가 권장 (대량이라 별도 PR)
 
 ### [H3] 데몬 스레드 8+개 join 없음
 
