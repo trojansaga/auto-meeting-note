@@ -71,20 +71,20 @@
   - 변경 알림이 필요한 경우 옵저버 또는 매번 인자로 전달
 - **검증 방법**: pytest로 임의 config 주입 가능해지는지
 
-### [M3] 테스트 0개 모듈 6개 보강
+### [M3] 테스트 0개 모듈 6개 보강 — 부분 완료 (`pipeline.py` ✅)
 
 - **대상**:
+  - ~~`pipeline.py` (316 lines) — STT→전처리→노트 핵심 흐름~~ ✅ **완료** — `tests/test_pipeline.py` (8개): happy path mp4/wav, Apple Speech 모드 전처리 skip, stop_event 시 cancel + 원본 복원, 예외 시 error.log 작성, `_work_dir_with_title` rename 규칙 3건
   - `audio_extractor.py` (136 lines) — ffmpeg 추출/duration 파싱
   - `audio_preprocessor.py` (204 lines) — 노이즈/무음/정규화
   - `note_generator.py` (185 lines) — 마크다운 생성
-  - `pipeline.py` (316 lines) — STT→전처리→노트 핵심 흐름 ← **가장 우선**
   - `system_audio.py` (592 lines) — SCStream + WAV 헤더 작성
   - `live_screen_writer.py` (227 lines)
-- **수정 방향**:
-  - 합성 오디오(numpy로 만든 sine wave WAV)로 audio_extractor/preprocessor 통합 테스트
-  - `pipeline.py`는 단계별 mock으로 cancellation/error path 단위 테스트
+- **현황**: 테스트 43 → 57 (+14건; H1 +2, H3 +4, M3 +8)
+- **남은 작업 방향**:
+  - 합성 오디오(numpy sine wave WAV)로 audio_extractor/preprocessor 통합 테스트
   - `system_audio.py`는 SCStream 모킹 부담 커서 후순위
-- **목표**: 테스트 43개 → 60개+
+- **다음 목표**: 60개+
 
 ---
 
