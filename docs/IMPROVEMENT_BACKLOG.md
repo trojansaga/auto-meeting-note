@@ -34,18 +34,16 @@
   - `transcriber.py:907` — traceback을 result_queue로 부모 프로세스에 전달
 - **남은 후속 작업 (별도 항목)**: `except Exception as e: logger.error("... %s", e)` 패턴 75건은 traceback 누락 → `logger.exception()` 또는 `exc_info=True` 추가 권장 (대량이라 별도 PR)
 
-### [H3] 데몬 스레드 8+개 join 없음
+### ~~[H3] 데몬 스레드 8+개 join 없음~~ ✅ 완료
 
-- **위치 (app.py 후보)**:
-  - line 330 `_validate_openai_model`
-  - line 493 `_download_model`
-  - line 1180, 1333, 1379, 1392, 1438, 1444 등
-- **문제**: `daemon=True`로 백그라운드 작업이 앱 종료 시 강제 중단됨. 임시 파일/부분 다운로드 모델 잔존 가능.
-- **수정 방향**:
-  - `atexit.register()` + `threading.Event` 기반 graceful shutdown
-  - 모델 다운로드 같은 긴 작업은 명시적 cancel + 임시 파일 cleanup
-  - 또는 `concurrent.futures.ThreadPoolExecutor`로 통합 + `executor.shutdown(wait=True, timeout=N)`
-- **검증 방법**: 다운로드 진행 중 앱 종료 → 임시 파일 잔존 확인
+- **위치**: `app.py`의 9개 `threading.Thread(daemon=True)` spawn (validate/download/run-files/on-recording-stopped × 2 / start-bg × 2 / resume)
+- **문제**: 종료 시 강제 중단 → 임시 파일/부분 mp4/wav/모델 잔존 위험
+- **수정 내용**:
+  - `_spawn_bg_thread(target, args, name)` 헬퍼 도입 — daemon 스레드를 `_bg_threads` 리스트에 등록 후 시작 (락으로 보호, dead 스레드 자동 prune)
+  - `_join_bg_threads(timeout)` — graceful join, alive 스레드 카운트 반환
+  - `_quit()` 에서 다운로드 cancel signal → bg join(timeout=3s) → hotkey stop → quit_application 순서
+  - 9개 spawn 사이트를 모두 헬퍼로 전환
+- **테스트 (4개 추가)**: spawn 등록/dead prune/timeout 내 join/timeout 초과 시 alive 카운트
 
 ---
 

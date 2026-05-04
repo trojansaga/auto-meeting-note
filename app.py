@@ -275,6 +275,11 @@ class AutoMeetingNoteApp(rumps.App):
         self._download_stop_event: threading.Event = threading.Event()
         self._download_stop_event.set()  # 초기값: 다운로드 없음
 
+        # 종료 시 graceful shutdown 을 위해 추적되는 백그라운드 작업
+        # _spawn_bg_thread() 로 등록된 daemon 스레드. _quit() 에서 join(timeout) 시도.
+        self._bg_threads: list[threading.Thread] = []
+        self._bg_threads_lock = threading.Lock()
+
         self._pipeline_stop_event: threading.Event = threading.Event()
         self._pipeline_pause_event: threading.Event = threading.Event()
         self._pipeline_pause_event.set()  # set = 실행 중, clear = 일시중단
@@ -327,7 +332,7 @@ class AutoMeetingNoteApp(rumps.App):
             rumps.alert(title="설정 오류", message="\n\n".join(errors))
             return
 
-        threading.Thread(target=self._validate_openai_model, daemon=True).start()
+        self._spawn_bg_thread(self._validate_openai_model, name="validate-openai-model")
 
         backend, model_name, quant = self._get_current_stt_selection()
         self._check_and_download_model(backend, model_name, quant)
@@ -490,11 +495,11 @@ class AutoMeetingNoteApp(rumps.App):
                 return
             self._download_stop_event = threading.Event()
             self._show_cancel_item()
-            threading.Thread(
-                target=self._download_model,
+            self._spawn_bg_thread(
+                self._download_model,
                 args=(repo, model_cache, hf_home, self._download_stop_event),
-                daemon=True,
-            ).start()
+                name="download-model",
+            )
 
     def _show_cancel_item(self):
         """메인 스레드에서 호출"""
@@ -1177,7 +1182,7 @@ class AutoMeetingNoteApp(rumps.App):
         if not paths:
             return
 
-        threading.Thread(target=self._run_files_sequentially, args=(paths,), daemon=True).start()
+        self._spawn_bg_thread(self._run_files_sequentially, args=(paths,), name="run-files")
 
     @staticmethod
     def _check_screen_permission() -> bool:
@@ -1332,11 +1337,11 @@ class AutoMeetingNoteApp(rumps.App):
             self._pause_item.set_callback(None)
             self._stop_rec_timer()
             mode, output_path, audio_path, mic_path, audio_offset, mic_audio_offset = self._recorder.stop()
-            threading.Thread(
-                target=self._on_recording_stopped,
+            self._spawn_bg_thread(
+                self._on_recording_stopped,
                 args=(mode, output_path, audio_path, mic_path, audio_offset, mic_audio_offset),
-                daemon=True,
-            ).start()
+                name="on-recording-stopped-screen",
+            )
         else:
             # 권한 확인
             if not self._ensure_screen_permission("화면 녹화"):
@@ -1378,7 +1383,7 @@ class AutoMeetingNoteApp(rumps.App):
                     rumps.Timer(_revert, 0).start()
                     self._notify("AutoMeetingNote", "화면 녹화 오류", str(e))
 
-            threading.Thread(target=_start_bg, daemon=True).start()
+            self._spawn_bg_thread(_start_bg, name="start-screen-rec")
 
     def _toggle_audio_rec(self, sender):
         if self._is_recording:
@@ -1391,11 +1396,11 @@ class AutoMeetingNoteApp(rumps.App):
             self._pause_item.set_callback(None)
             self._stop_rec_timer()
             mode, output_path, audio_path, mic_path, audio_offset, mic_audio_offset = self._recorder.stop()
-            threading.Thread(
-                target=self._on_recording_stopped,
+            self._spawn_bg_thread(
+                self._on_recording_stopped,
                 args=(mode, output_path, audio_path, mic_path, audio_offset, mic_audio_offset),
-                daemon=True,
-            ).start()
+                name="on-recording-stopped-audio",
+            )
         else:
             # 권한 확인 (시스템 오디오는 화면 녹화 권한 필요)
             if not self._ensure_screen_permission("시스템 오디오 녹음"):
@@ -1437,13 +1442,13 @@ class AutoMeetingNoteApp(rumps.App):
                         rumps.alert(title="녹음 오류", message=str(e))
                     rumps.Timer(_revert, 0.0).start()
 
-            threading.Thread(target=_start_bg, daemon=True).start()
+            self._spawn_bg_thread(_start_bg, name="start-audio-rec")
 
     def _toggle_pause(self, sender):
         if self._recorder.is_paused:
             # 재개: 백그라운드에서 SCStream 초기화 (블로킹)
             sender.title = "일시 정지"
-            threading.Thread(target=self._do_resume, daemon=True).start()
+            self._spawn_bg_thread(self._do_resume, name="resume-recording")
         else:
             # 일시 정지
             sender.title = "녹화 재개"
@@ -1689,12 +1694,55 @@ class AutoMeetingNoteApp(rumps.App):
             return
         subprocess.Popen(["open", str(release_notes_path)])
 
+    def _spawn_bg_thread(
+        self,
+        target,
+        args: tuple = (),
+        name: Optional[str] = None,
+    ) -> threading.Thread:
+        """daemon 스레드를 생성/등록한 뒤 시작한다.
+
+        등록된 스레드는 `_quit()` 종료 시 join(timeout) 으로 회수돼,
+        후처리/다운로드/STT 등이 진행 중이면 잠깐 대기 후 종료한다.
+        """
+        thread = threading.Thread(target=target, args=args, daemon=True, name=name)
+        with self._bg_threads_lock:
+            # 이미 끝난 스레드 정리
+            self._bg_threads = [t for t in self._bg_threads if t.is_alive()]
+            self._bg_threads.append(thread)
+        thread.start()
+        return thread
+
+    def _join_bg_threads(self, timeout: float) -> int:
+        """추적된 daemon 스레드를 graceful 하게 회수.
+
+        반환값: 시간 내 종료되지 못해 강제 종료될 alive 스레드 수.
+        """
+        with self._bg_threads_lock:
+            threads = list(self._bg_threads)
+        deadline = time.monotonic() + timeout
+        for t in threads:
+            remaining = max(0.0, deadline - time.monotonic())
+            t.join(timeout=remaining)
+        alive = [t for t in threads if t.is_alive()]
+        if alive:
+            logger.warning(
+                "종료 시 미완료 백그라운드 작업 %d개 — 강제 종료: %s",
+                len(alive), [t.name for t in alive],
+            )
+        return len(alive)
+
     def _quit(self, _):
         if self._is_recording:
             try:
                 self._recorder.stop()
             except Exception:
                 logger.warning("종료 시 녹화 중지 실패 — 강제 종료 진행", exc_info=True)
+        # 진행 중 다운로드는 즉시 cancel signal (이미 _download_stop_event 사용 중)
+        if not self._download_stop_event.is_set():
+            self._download_stop_event.set()
+        # 백그라운드 후처리/STT 가 진행 중이면 짧게 기다린 뒤 종료
+        self._join_bg_threads(timeout=3.0)
         self._hotkey_manager.stop()
         rumps.quit_application()
 
