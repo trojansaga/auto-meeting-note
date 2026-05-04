@@ -33,6 +33,7 @@ class Recorder:
         self._screen_recorder: Optional[ContinuousScreenRecorder] = None
         self._screen_mic_segments: list = []  # screen mode: [(mic_path, mic_offset), ...]
         self._mic_process: Optional[subprocess.Popen] = None     # ffmpeg 마이크
+        self._mic_stderr_thread: Optional[threading.Thread] = None  # ffmpeg stderr drain (PIPE 버퍼 풀림 방지)
         self._sys_audio = None                                    # SystemAudioCapture (녹음 모드 전용)
         self._mode: Optional[str] = None  # "screen" | "audio"
         self._output_path: Optional[Path] = None
@@ -251,6 +252,25 @@ class Recorder:
             logger.warning("마이크 첫 샘플 감지 타임아웃 — 폴백 timestamp 사용")
 
         self._mic_process = process
+
+        # ffmpeg stderr 를 백그라운드에서 지속 소비 (장기 녹화 시 PIPE 64KB 버퍼 풀림 차단)
+        stderr_stream = getattr(process, "stderr", None)
+        if stderr_stream is not None:
+            def _drain_stderr(stream):
+                try:
+                    for _ in iter(stream.readline, b""):
+                        pass
+                except Exception:
+                    pass
+
+            self._mic_stderr_thread = threading.Thread(
+                target=_drain_stderr,
+                args=(stderr_stream,),
+                daemon=True,
+                name="mic-stderr-drain",
+            )
+            self._mic_stderr_thread.start()
+
         logger.info(
             "마이크 녹음 시작: %s (입력=%s, 초기화 지연=%.3fs)",
             mic_path.name,
@@ -426,6 +446,10 @@ class Recorder:
         except Exception as e:
             logger.error("마이크 중지 오류: %s", e)
         self._mic_process = None
+        # 프로세스 종료 후 stderr 가 EOF 되면서 drain 스레드 자연 종료
+        if self._mic_stderr_thread is not None:
+            self._mic_stderr_thread.join(timeout=2)
+            self._mic_stderr_thread = None
 
     def start_screen_recording(
         self, output_dir: Path, mic_enabled: bool = True, mic_device_index: str = "builtin"
