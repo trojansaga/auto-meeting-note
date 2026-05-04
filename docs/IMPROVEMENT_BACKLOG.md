@@ -71,20 +71,20 @@
   - 변경 알림이 필요한 경우 옵저버 또는 매번 인자로 전달
 - **검증 방법**: pytest로 임의 config 주입 가능해지는지
 
-### [M3] 테스트 0개 모듈 6개 보강 — 부분 완료 (`pipeline.py` ✅)
+### [M3] 테스트 0개 모듈 6개 보강 — 진행 중 (2/6)
 
 - **대상**:
-  - ~~`pipeline.py` (316 lines) — STT→전처리→노트 핵심 흐름~~ ✅ **완료** — `tests/test_pipeline.py` (8개): happy path mp4/wav, Apple Speech 모드 전처리 skip, stop_event 시 cancel + 원본 복원, 예외 시 error.log 작성, `_work_dir_with_title` rename 규칙 3건
-  - `audio_extractor.py` (136 lines) — ffmpeg 추출/duration 파싱
+  - ~~`pipeline.py` (316 lines) — STT→전처리→노트 핵심 흐름~~ ✅ — `tests/test_pipeline.py` (8개)
+  - ~~`audio_extractor.py` (136 lines) — ffmpeg 추출/duration 파싱~~ ✅ — `tests/test_audio_extractor.py` (12개): ffmpeg 탐색 fallback, parse helper, ffmpeg/입력 부재 시 에러, progress callback 진행률, returncode 비정상 처리, stop_event cancel + 부분 출력 정리, sample_rate=None Apple Speech 케이스
   - `audio_preprocessor.py` (204 lines) — 노이즈/무음/정규화
   - `note_generator.py` (185 lines) — 마크다운 생성
   - `system_audio.py` (592 lines) — SCStream + WAV 헤더 작성
   - `live_screen_writer.py` (227 lines)
-- **현황**: 테스트 43 → 57 (+14건; H1 +2, H3 +4, M3 +8)
+- **현황**: 테스트 43 → 69 (+26건; H1 +2, H3 +4, M3 +20)
 - **남은 작업 방향**:
-  - 합성 오디오(numpy sine wave WAV)로 audio_extractor/preprocessor 통합 테스트
-  - `system_audio.py`는 SCStream 모킹 부담 커서 후순위
-- **다음 목표**: 60개+
+  - 합성 오디오(numpy sine wave WAV)로 audio_preprocessor 통합 테스트
+  - `note_generator.py` 는 OpenAI/Naver SDK mock 으로 응답/렌더 검증
+  - `system_audio.py`/`live_screen_writer.py` 는 SCStream 모킹 부담 커서 후순위
 
 ---
 
