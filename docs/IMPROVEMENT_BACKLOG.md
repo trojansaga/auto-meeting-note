@@ -71,19 +71,17 @@
   - 변경 알림이 필요한 경우 옵저버 또는 매번 인자로 전달
 - **검증 방법**: pytest로 임의 config 주입 가능해지는지
 
-### [M3] 테스트 0개 모듈 6개 보강 — 진행 중 (3/6)
+### [M3] 테스트 0개 모듈 6개 보강 — 진행 중 (4/6)
 
 - **대상**:
   - ~~`pipeline.py` (316 lines) — STT→전처리→노트 핵심 흐름~~ ✅ — `tests/test_pipeline.py` (8개)
   - ~~`audio_extractor.py` (136 lines) — ffmpeg 추출/duration 파싱~~ ✅ — `tests/test_audio_extractor.py` (12개)
-  - ~~`note_generator.py` (185 lines) — 마크다운 생성~~ ✅ — `tests/test_note_generator.py` (14개): `_extract_title` 파일명 금지 문자/길이 제한/H1 부재, `_create_client` Naver 키 검증/base_url 정리, `generate_note` 스트리밍/비스트리밍/stop_event/BadRequestError 즉시 raise/APIError MAX_RETRIES 후 raise/temperature provider 분기
-  - `audio_preprocessor.py` (204 lines) — 노이즈/무음/정규화
-  - `system_audio.py` (592 lines) — SCStream + WAV 헤더 작성
-  - `live_screen_writer.py` (227 lines)
-- **현황**: 테스트 43 → 83 (+40건; H1 +2, H3 +4, M3 +34)
-- **남은 작업 방향**:
-  - 합성 오디오(numpy sine wave WAV)로 audio_preprocessor 통합 테스트
-  - `system_audio.py`/`live_screen_writer.py` 는 SCStream 모킹 부담 커서 후순위
+  - ~~`note_generator.py` (185 lines) — 마크다운 생성~~ ✅ — `tests/test_note_generator.py` (14개)
+  - ~~`audio_preprocessor.py` (204 lines) — 노이즈/무음/정규화~~ ✅ — `tests/test_audio_preprocessor.py` (12개): `_energy_vad` 무음 입력 빈 결과/단일 음성 구간 감지/MERGE_GAP 이내 인접 구간 합치기, `_normalize_segments` 저음량 증폭/이미 정규화된 신호 클리핑 방지/MAX_GAIN 캡, `preprocess_audio` 전체 비활성화 시 단순 복사/VAD only 결과 길이 단축/순수 무음 입력 시 원본 fallback/stop_event cancel/progress callback/noisereduce 호출 검증
+  - `system_audio.py` (592 lines) — SCStream + WAV 헤더 작성 (보류, 가성비 낮음)
+  - `live_screen_writer.py` (227 lines) (보류, 가성비 낮음)
+- **현황**: 테스트 43 → 100 (+57건; H1 +2, H3 +4, M3 +46, L1 +5)
+- **남은 모듈**: `system_audio.py` / `live_screen_writer.py` — SCStream 모킹 부담 큼. 가성비 낮아 **장기 보류 권장**.
 
 ---
 
@@ -100,11 +98,11 @@
   - 메인 병합 4곳 + concat 폴백 1곳 모두 헬퍼 호출로 일원화
 - **테스트 (5개 추가)**: hw/sw 인자 형태, hw 블록 sentinel 매칭, hw 블록 없을 때 변경 없음, **미래에 hw 인자 그룹에 옵션 추가돼도 매처 깨지지 않음 회귀 테스트**
 
-### [L2] 브리틀 테스트 패턴
+### ~~[L2] 브리틀 테스트 패턴~~ ✅ 완료
 
-- **위치**: `tests/test_recorder_screen_mode.py` 등에서 `attempt[0] == N` 카운트 의존
-- **문제**: 폴백 단계 추가/제거 시 침묵으로 깨짐
-- **수정 방향**: 결과 파일 내용/메타로 행동 검증 (예: "reencoded" 바이트 vs 호출 횟수)
+- **위치**: `tests/test_recorder_screen_mode.py`의 `test_concat_files_video_fallback_on_copy_fail`, `test_concat_files_audio_fallback_to_resample`
+- **문제**: `attempt[0] == N` 호출 카운터 분기 + `assertEqual(attempt[0], 3)` 식 검증 → 폴백 단계 추가/제거 시 침묵으로 깨짐
+- **수정 내용**: 행동 검증 방식으로 전환 — 각 호출의 cmd 토큰을 기록하고, 결과는 cmd 내용(`copy`/`hevc_videotoolbox`/`libx265`/`pcm_s16le`)으로 결정. 마지막에 폴백 체인이 모두 시도되었는지 cmd 내용으로 검증. 호출 횟수에 의존하지 않음.
 
 ### [L3] `cancellation.py`는 빈 껍데기 (3줄)
 

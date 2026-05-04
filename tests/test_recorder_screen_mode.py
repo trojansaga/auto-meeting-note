@@ -185,59 +185,79 @@ class ConcatFilesTests(unittest.TestCase):
         self.assertFalse(tmp.exists())
 
     def test_concat_files_video_fallback_on_copy_fail(self):
-        """-c copy 실패 시 hevc_videotoolbox → libx265 순으로 fallback한다."""
+        """-c copy 실패 시 hevc_videotoolbox → libx265 순으로 fallback한다.
+
+        호출 횟수 대신 각 시도의 cmd 토큰을 검사하여 폴백 체인이
+        실제로 다른 인코더로 진행됐는지 행동 검증한다 (폴백 단계 추가/변경에 강함).
+        """
         seg0 = self._write("seg0.mp4")
         seg1 = self._write("seg1.mp4")
         out = self._dir / "final.mp4"
-        attempt = [0]
+        calls: list[list[str]] = []
 
         def _fake_run(cmd, **kwargs):
-            attempt[0] += 1
+            calls.append(list(cmd))
             r = MagicMock()
             r.stderr = b""
-            if attempt[0] == 1:
+            # cmd 내용으로 결과를 결정 (호출 순서 의존 X)
+            if "copy" in cmd:
                 r.returncode = 1  # -c copy 실패
-            elif attempt[0] == 2:
-                r.returncode = 1  # hevc_videotoolbox 실패
-            else:
+            elif "hevc_videotoolbox" in cmd:
+                r.returncode = 1  # hardware 인코더 실패
+            elif "libx265" in cmd:
                 tmp_path = Path(cmd[-1])
                 tmp_path.write_bytes(b"reencoded")
-                r.returncode = 0  # libx265 성공
+                r.returncode = 0  # software 인코더 성공
+            else:
+                r.returncode = 1
             return r
 
         recorder = Recorder()
         with patch("subprocess.run", side_effect=_fake_run):
             recorder._concat_files("ffmpeg", [seg0, seg1], out, is_video=True)
 
-        self.assertEqual(attempt[0], 3)
+        # 결과 파일은 software 인코더가 작성한 내용으로 채워졌어야 한다
         self.assertTrue(out.exists())
         self.assertEqual(out.read_bytes(), b"reencoded")
 
+        # 폴백 체인이 모두 시도되었는지 cmd 내용으로 검증
+        flat = [tok for cmd in calls for tok in cmd]
+        self.assertIn("copy", flat)
+        self.assertIn("hevc_videotoolbox", flat)
+        self.assertIn("libx265", flat)
+
     def test_concat_files_audio_fallback_to_resample(self):
-        """-c copy 실패 시 pcm_s16le 재샘플로 fallback한다."""
+        """-c copy 실패 시 pcm_s16le 재샘플로 fallback한다.
+
+        호출 횟수 대신 cmd 내용으로 폴백 동작을 행동 검증.
+        """
         seg0 = self._write("seg0.wav")
         seg1 = self._write("seg1.wav")
         out = self._dir / "final.wav"
-        attempt = [0]
+        calls: list[list[str]] = []
 
         def _fake_run(cmd, **kwargs):
-            attempt[0] += 1
+            calls.append(list(cmd))
             r = MagicMock()
             r.stderr = b""
-            if attempt[0] == 1:
+            if "copy" in cmd:
                 r.returncode = 1
-            else:
+            elif "pcm_s16le" in cmd:
                 Path(cmd[-1]).write_bytes(b"resampled")
                 r.returncode = 0
+            else:
+                r.returncode = 1
             return r
 
         recorder = Recorder()
         with patch("subprocess.run", side_effect=_fake_run):
             recorder._concat_files("ffmpeg", [seg0, seg1], out, is_video=False)
 
-        self.assertEqual(attempt[0], 2)
         self.assertTrue(out.exists())
         self.assertEqual(out.read_bytes(), b"resampled")
+        flat = [tok for cmd in calls for tok in cmd]
+        self.assertIn("copy", flat)
+        self.assertIn("pcm_s16le", flat)
 
 
 class VideoEncoderArgsTests(unittest.TestCase):
