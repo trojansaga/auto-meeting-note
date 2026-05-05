@@ -140,38 +140,57 @@ DEFAULT_CONFIG = {
     "mic_latency_correction_source_session": "",
     "sync_diagnostic_mode": False,
     "stt_skip": False,
+    "mic_echo_cancel": False,  # 마이크 에코 제거 (베타) — 화상회의 시 스피커→마이크 echo 차감
 }
 
 
 def _ensure_notification_runtime_plist():
-    """rumps가 찾는 python 실행 디렉터리의 Info.plist를 보정한다."""
-    plist_path = Path(sys.executable).parent / "Info.plist"
+    """rumps/AppKit 알림 표시자 이름이 "python" 이 아니라 AutoMeetingNote 로
+    뜨도록 Info.plist 를 두 위치에 모두 보정한다.
+
+    빌드된 앱은 Swift 런처가 `runtime/AutoMeetingNote` 심링크를 통해 Python 을
+    실행하지만, Python 시작 시 sys.executable 은 심링크가 resolve 된 실제 경로
+    (`.venv/bin/python3.11`)로 잡힌다. 그래서 sys.executable.parent 한 곳에만
+    plist 를 두면 macOS 알림 시스템이 심링크 디렉터리에서 plist 를 못 찾아
+    fallback 으로 process 이름(`python`) 을 표시자로 사용한다.
+    이를 막기 위해 `runtime/` (심링크 위치) 에도 동일 plist 를 두어 어느
+    룩업 경로든 커버한다.
+    """
     desired = {
         "CFBundleIdentifier": APP_BUNDLE_IDENTIFIER,
         "CFBundleName": APP_DISPLAY_NAME,
         "CFBundleDisplayName": APP_DISPLAY_NAME,
     }
 
-    try:
-        current = {}
-        if plist_path.exists():
-            with plist_path.open("rb") as f:
-                loaded = plistlib.load(f)
-                if isinstance(loaded, dict):
-                    current = loaded
+    candidate_dirs: list[Path] = [Path(sys.executable).parent]
+    runtime_dir = APP_SUPPORT_DIR / "runtime"
+    if runtime_dir not in candidate_dirs:
+        candidate_dirs.append(runtime_dir)
 
-        changed = False
-        for key, value in desired.items():
-            if current.get(key) != value:
-                current[key] = value
-                changed = True
+    for plist_dir in candidate_dirs:
+        try:
+            plist_dir.mkdir(parents=True, exist_ok=True)
+            plist_path = plist_dir / "Info.plist"
 
-        if changed:
-            with plist_path.open("wb") as f:
-                plistlib.dump(current, f, sort_keys=True)
-            logger.info("알림 런타임 plist 준비: %s", plist_path)
-    except Exception as e:
-        logger.warning("알림 런타임 plist 준비 실패: %s", e)
+            current = {}
+            if plist_path.exists():
+                with plist_path.open("rb") as f:
+                    loaded = plistlib.load(f)
+                    if isinstance(loaded, dict):
+                        current = loaded
+
+            changed = False
+            for key, value in desired.items():
+                if current.get(key) != value:
+                    current[key] = value
+                    changed = True
+
+            if changed:
+                with plist_path.open("wb") as f:
+                    plistlib.dump(current, f, sort_keys=True)
+                logger.info("알림 런타임 plist 준비: %s", plist_path)
+        except Exception as e:
+            logger.warning("알림 런타임 plist 준비 실패 (%s): %s", plist_dir, e)
 
 
 _ensure_notification_runtime_plist()
@@ -182,6 +201,21 @@ def _resource_path() -> Path:
     if getattr(sys, "frozen", False):
         return Path(os.environ.get("RESOURCEPATH", Path(__file__).parent))
     return Path(__file__).parent
+
+
+def _find_notify_sender() -> Optional[Path]:
+    """`.app/Contents/MacOS/AutoMeetingNoteNotifySender` 헬퍼 경로 탐색.
+
+    빌드된 앱 안에서는 리소스 경로의 `../MacOS/` 에 동봉된다.
+    개발 환경(`python app.py`)에서는 helper 가 없으므로 None.
+    """
+    candidates = [
+        _resource_path().parent / "MacOS" / f"{APP_DISPLAY_NAME}NotifySender",
+    ]
+    for path in candidates:
+        if path.exists() and os.access(path, os.X_OK):
+            return path
+    return None
 
 
 def _ensure_user_config() -> Path:
@@ -253,11 +287,14 @@ class AutoMeetingNoteApp(rumps.App):
         self._sync_diagnostic_item.state = 1 if self._config.get("sync_diagnostic_mode", False) else 0
         self._stt_skip_item = rumps.MenuItem("녹화/녹음만 (STT 건너뛰기)", callback=self._toggle_stt_skip)
         self._stt_skip_item.state = 1 if self._config.get("stt_skip", False) else 0
+        self._mic_echo_cancel_item = rumps.MenuItem("마이크 에코 제거 (베타)", callback=self._toggle_mic_echo_cancel)
+        self._mic_echo_cancel_item.state = 1 if self._config.get("mic_echo_cancel", False) else 0
         self._flags_menu = rumps.MenuItem("녹화/녹음 옵션")
         self._flags_menu.add(self._mic_item)
         self._flags_menu.add(self._mic_device_menu)
         self._flags_menu.add(self._sync_diagnostic_item)
         self._flags_menu.add(self._stt_skip_item)
+        self._flags_menu.add(self._mic_echo_cancel_item)
         self._status_item = rumps.MenuItem("처리 현황: 대기 중", callback=self._show_status_detail)
         self._open_config_item = rumps.MenuItem("설정 파일 열기", callback=self._open_config)
         self._open_prompt_item = rumps.MenuItem("STT 용어 사전 열기", callback=self._open_prompt)
@@ -514,10 +551,30 @@ class AutoMeetingNoteApp(rumps.App):
         rumps.Timer(_remove, 0.0).start()
 
     def _notify(self, title: str, subtitle: str = "", message: str = ""):
-        """가능하면 AutoMeetingNote 이름으로 네이티브 알림을 보낸다."""
+        """가능하면 AutoMeetingNote 이름으로 네이티브 알림을 보낸다.
+
+        macOS 14+/Tahoe(26.x) 에서 Python 자식 프로세스가 직접 송출하면
+        알림 표시자가 "python" 으로 잡힌다. 이를 우회하기 위해 .app bundle
+        안에 동봉된 Swift helper executable(`AutoMeetingNoteNotifySender`)
+        을 1순위로 호출한다. helper 는 .app bundle 컨텍스트에서 실행되므로
+        표시자 이름이 "AutoMeetingNote" 로 정상 잡힌다.
+        """
         title = (title or APP_DISPLAY_NAME).strip() or APP_DISPLAY_NAME
         subtitle = (subtitle or "").strip()
         message = (message or "").strip() or title
+
+        # 1순위: .app bundle 안의 Swift 알림 helper (개발 환경엔 없을 수 있음)
+        helper = _find_notify_sender()
+        if helper is not None:
+            try:
+                args = [str(helper), f"--title={title}"]
+                if subtitle:
+                    args.append(f"--subtitle={subtitle}")
+                args.append(f"--message={message}")
+                subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except Exception as e:
+                logger.warning("알림 helper 실행 실패, rumps 로 폴백: %s", e)
 
         try:
             rumps.notification(title=title, subtitle=subtitle, message=message)
@@ -765,6 +822,11 @@ class AutoMeetingNoteApp(rumps.App):
     def _toggle_stt_skip(self, sender):
         sender.state = not sender.state
         self._config["stt_skip"] = bool(sender.state)
+        self._save_config()
+
+    def _toggle_mic_echo_cancel(self, sender):
+        sender.state = not sender.state
+        self._config["mic_echo_cancel"] = bool(sender.state)
         self._save_config()
 
     def _toggle_sync_diagnostic(self, sender):
@@ -1524,6 +1586,7 @@ class AutoMeetingNoteApp(rumps.App):
                         audio_offset=audio_offset,
                         mic_audio_offset=mic_audio_offset,
                         progress_callback=self._on_status,
+                        mic_echo_cancel=bool(self._config.get("mic_echo_cancel", False)),
                     )
                 self._notify("AutoMeetingNote", "녹화 완료", mp4_path.name)
                 if sync_session is not None:

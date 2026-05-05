@@ -125,6 +125,9 @@ let curPath = env["PATH"] ?? "/usr/bin:/bin"
 if !curPath.contains("/opt/homebrew/bin") {
     env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + curPath
 }
+// macOS 알림 송출자 ID 를 .app bundle 로 강제. 이게 없으면 Python 자식 프로세스의
+// 알림 표시자 이름이 "python" 으로 잡힘 (특히 macOS 14+/Tahoe(26.x) 에서 plist 트릭 무효).
+env["__CFBundleIdentifier"] = "com.automeetingnote.app"
 
 let child = Process()
 child.executableURL = URL(fileURLWithPath: pythonPath)
@@ -159,9 +162,13 @@ echo "Apple Speech transcriber 컴파일 중..."
 "$PROBE_SWIFTC" "${PROBE_SDK_FLAGS[@]}" -parse-as-library -O -module-cache-path "$SWIFT_CACHE_DIR" "${PROBE_EXTRA[@]}" -o "$MACOS/${APP_NAME}AppleSpeech" "$SCRIPT_DIR/apple_speech_transcriber.swift"
 echo "컴파일 완료"
 
+echo "알림 송출 helper 컴파일 중..."
+/Library/Developer/CommandLineTools/usr/bin/swiftc "${SWIFTC_SDK_FLAGS[@]}" -O -module-cache-path "$SWIFT_CACHE_DIR" "${SWIFTC_EXTRA[@]}" -o "$MACOS/${APP_NAME}NotifySender" "$SCRIPT_DIR/notify_sender.swift"
+echo "컴파일 완료"
+
 echo "$VENV_REAL" > "$RESOURCES/.venv_path"
 
-for f in app.py hotkey_manager.py pipeline.py cancellation.py audio_extractor.py audio_preprocessor.py transcriber.py note_generator.py recorder.py system_audio.py live_screen_writer.py continuous_screen_recorder.py sync_diagnostics.py sync_diagnostics_report.py config.yaml dictionary.txt VERSION RELEASE_NOTES.md; do
+for f in app.py hotkey_manager.py pipeline.py cancellation.py audio_extractor.py audio_preprocessor.py acoustic_echo_cancel.py transcriber.py note_generator.py recorder.py system_audio.py live_screen_writer.py continuous_screen_recorder.py sync_diagnostics.py sync_diagnostics_report.py config.yaml dictionary.txt VERSION RELEASE_NOTES.md; do
     cp "$SCRIPT_DIR/$f" "$RESOURCES/"
 done
 

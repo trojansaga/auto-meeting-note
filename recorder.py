@@ -1337,10 +1337,12 @@ class Recorder:
         audio_offset: float = 0.0,
         mic_audio_offset: float = 0.0,
         progress_callback: Optional[Callable[[str], None]] = None,
+        mic_echo_cancel: bool = False,
     ) -> Path:
         """MOV + 시스템 오디오 WAV [+ 마이크 WAV] → H.264 MP4로 병합 압축. 원본 파일 삭제.
 
         audio_offset: 오디오가 영상보다 먼저 시작된 시간(초). 양수면 오디오 앞부분 trim.
+        mic_echo_cancel: True 면 amix 직전 마이크 트랙에서 시스템 오디오 echo 를 차감.
         """
         ffmpeg_bin = find_ffmpeg()
         if not ffmpeg_bin:
@@ -1355,6 +1357,32 @@ class Recorder:
 
         has_sys = audio_path and audio_path.exists() and audio_path.stat().st_size > 44
         has_mic = mic_path and mic_path.exists() and mic_path.stat().st_size > 44
+
+        # 마이크 에코 제거 (sys 와 mic 둘 다 있고 옵션 켜진 경우만)
+        if mic_echo_cancel and has_sys and has_mic:
+            try:
+                from acoustic_echo_cancel import cancel_echo
+                aec_path = mic_path.with_name(mic_path.stem + "_aec.wav")
+                # mic_audio_offset = mic 가 anchor 보다 먼저 시작된 시간(초)
+                # audio_offset    = sys 가 anchor 보다 먼저 시작된 시간(초)
+                # mic 시작 시점 - sys 시작 시점 = audio_offset - mic_audio_offset
+                mic_minus_sys_offset = audio_offset - mic_audio_offset
+                if progress_callback:
+                    progress_callback("마이크 에코 제거 중...")
+                cancel_echo(
+                    mic_path=mic_path,
+                    sys_path=audio_path,
+                    output_path=aec_path,
+                    mic_sys_offset_seconds=mic_minus_sys_offset,
+                )
+                logger.info("마이크 에코 제거 적용: %s → %s", mic_path.name, aec_path.name)
+                mic_path = aec_path
+                # AEC 출력은 mic 와 같은 시간축이므로 mic_audio_offset 그대로 사용
+            except Exception as e:
+                logger.warning(
+                    "마이크 에코 제거 실패 — 원본 마이크 트랙으로 진행: %s",
+                    e, exc_info=True,
+                )
 
         # 오디오 싱크 보정: 오디오가 영상보다 먼저 시작된 경우 앞부분 skip
         logger.info("오디오 싱크 오프셋: sys=%.3fs, mic=%.3fs", audio_offset, mic_audio_offset)
