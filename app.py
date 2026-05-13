@@ -141,6 +141,7 @@ DEFAULT_CONFIG = {
     "sync_diagnostic_mode": False,
     "stt_skip": False,
     "mic_echo_cancel": False,  # 마이크 에코 제거 (베타) — 화상회의 시 스피커→마이크 echo 차감
+    "note_prefix": "(자동회의록)",
 }
 
 
@@ -243,6 +244,12 @@ def load_config() -> dict:
         loaded = yaml.safe_load(f) or {}
     config = dict(DEFAULT_CONFIG)
     config.update(loaded)
+    missing = {k: v for k, v in DEFAULT_CONFIG.items() if k not in loaded}
+    if missing:
+        loaded.update(missing)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            yaml.dump(loaded, f, allow_unicode=True, default_flow_style=False)
+        logger.info("config.yaml에 새 기본값 추가: %s", list(missing.keys()))
     return config
 
 
@@ -296,6 +303,10 @@ class AutoMeetingNoteApp(rumps.App):
         self._flags_menu.add(self._stt_skip_item)
         self._flags_menu.add(self._mic_echo_cancel_item)
         self._status_item = rumps.MenuItem("처리 현황: 대기 중", callback=self._show_status_detail)
+        self._export_dir_item = rumps.MenuItem(
+            f"내보내기 경로: {self._config.get('export_dir', '~/Downloads')}",
+            callback=self._change_export_dir,
+        )
         self._open_config_item = rumps.MenuItem("설정 파일 열기", callback=self._open_config)
         self._open_prompt_item = rumps.MenuItem("STT 용어 사전 열기", callback=self._open_prompt)
         self._open_log_item = rumps.MenuItem("로그 파일 열기", callback=self._open_log)
@@ -339,6 +350,7 @@ class AutoMeetingNoteApp(rumps.App):
             self._preprocess_menu,
             self._hotkey_menu,
             None,
+            self._export_dir_item,
             self._open_config_item,
             self._open_prompt_item,
             self._open_log_item,
@@ -719,6 +731,14 @@ class AutoMeetingNoteApp(rumps.App):
         )
         menu.add(self._naver_key_item)
 
+        menu.add(None)
+
+        self._note_prefix_item = rumps.MenuItem(
+            f"회의록 파일 접두사: {self._config.get('note_prefix', '(자동회의록)')}",
+            callback=self._change_note_prefix,
+        )
+        menu.add(self._note_prefix_item)
+
         return menu
 
     def _make_note_provider_callback(self, provider: str):
@@ -784,6 +804,25 @@ class AutoMeetingNoteApp(rumps.App):
             self._save_config()
             self._naver_key_item.title = f"Naver API 키: {self._get_naver_key_display()}"
             logger.info("Naver API 키 변경 완료")
+
+    def _change_note_prefix(self, _):
+        current = self._config.get("note_prefix", "(자동회의록)")
+        window = rumps.Window(
+            message="회의록 MD 파일명 앞에 붙을 접두사를 입력하세요.\n비워두면 접두사 없이 저장됩니다.",
+            title="회의록 파일 접두사 변경",
+            default_text=current,
+            ok="저장",
+            cancel="취소",
+            dimensions=(300, 20),
+        )
+        response = window.run()
+        if response.clicked:
+            prefix = response.text.strip()
+            self._config["note_prefix"] = prefix
+            self._save_config()
+            display = prefix if prefix else "(없음)"
+            self._note_prefix_item.title = f"회의록 파일 접두사: {display}"
+            logger.info("회의록 파일 접두사 변경: %r", prefix)
 
     def _toggle_mic(self, sender):
         sender.state = not sender.state
@@ -1736,6 +1775,25 @@ class AutoMeetingNoteApp(rumps.App):
             self._pipeline_pause_event.set()  # 잔류 일시중단 상태 해제
             self._pipeline_start_time = None
             self._pipeline_running = False
+
+    def _change_export_dir(self, _):
+        current = self._config.get("export_dir", "~/Downloads")
+        window = rumps.Window(
+            message="회의록 MD 파일을 내보낼 경로를 입력하세요.\n띄어쓰기가 있는 경로도 그대로 입력하면 됩니다. 비워두면 내보내기를 사용하지 않습니다.",
+            title="내보내기 경로 변경",
+            default_text=current,
+            ok="저장",
+            cancel="취소",
+            dimensions=(400, 20),
+        )
+        response = window.run()
+        if response.clicked:
+            path = response.text.strip()
+            self._config["export_dir"] = path
+            self._save_config()
+            display = path if path else "(없음)"
+            self._export_dir_item.title = f"내보내기 경로: {display}"
+            logger.info("내보내기 경로 변경: %r", path)
 
     def _open_config(self, _):
         subprocess.Popen(["open", str(CONFIG_PATH)])

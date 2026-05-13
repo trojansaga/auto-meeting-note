@@ -26,3 +26,4 @@ mic_device_index: "macbook"   # macbook 또는 iphone
                               # 장치 목록 확인: ffmpeg -f avfoundation -list_devices true -i ""
 mic_latency_correction_seconds: 0.0   # 진단 모드가 계산한 마이크 지연 보정값(초)
 sync_diagnostic_mode: false   # 켜면 녹화/녹음 시 진단용 클릭/플래시와 raw/final 산출물을 별도 저장
+note_prefix: "(자동회의록)"   # 회의록 MD 파일명 앞에 붙는 접두사 (비워두면 없음)

@@ -93,6 +93,7 @@ def run_pipeline(
     naver_api_key = config.get("naver_api_key", "")
     naver_api_base_url = config.get("naver_api_base_url", "https://namc-aigw.io.naver.com")
     note_model = naver_model if note_provider == "naver" else openai_model
+    note_prefix = config.get("note_prefix", "(자동회의록)")
 
     work_dir = watch_dir / stem
     moved_mp4 = work_dir / mp4.name
@@ -245,9 +246,9 @@ def run_pipeline(
         # 폴더명 예: "2026-03-20 15-03-21_회의내용"
         m = re.match(r'(\d{4}-\d{2}-\d{2})[\s_-](\d{2})', stem)
         if m:
-            note_filename = f"(자동회의록){m.group(1)}_{m.group(2)}_{title}.md"
+            note_filename = f"{note_prefix}{m.group(1)}_{m.group(2)}_{title}.md"
         else:
-            note_filename = f"(자동회의록){stem}_{title}.md"
+            note_filename = f"{note_prefix}{stem}_{title}.md"
         note_path = work_dir / note_filename
         Path(note_tmp).rename(note_path)
 
@@ -266,6 +267,7 @@ def run_pipeline(
         export_dir_raw = config.get("export_dir", "~/Downloads")
         if export_dir_raw:
             try:
+                export_dir_raw = str(export_dir_raw).strip().strip('"').strip("'")
                 export_dir_raw = export_dir_raw.replace("\\ ", " ").replace("\\~", "~")
                 export_dir = Path(export_dir_raw).expanduser()
                 export_dir.mkdir(parents=True, exist_ok=True)

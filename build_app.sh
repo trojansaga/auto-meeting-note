@@ -162,14 +162,22 @@ echo "Apple Speech transcriber 컴파일 중..."
 "$PROBE_SWIFTC" "${PROBE_SDK_FLAGS[@]}" -parse-as-library -O -module-cache-path "$SWIFT_CACHE_DIR" "${PROBE_EXTRA[@]}" -o "$MACOS/${APP_NAME}AppleSpeech" "$SCRIPT_DIR/apple_speech_transcriber.swift"
 echo "컴파일 완료"
 
-echo "알림 송출 helper 컴파일 중..."
-/Library/Developer/CommandLineTools/usr/bin/swiftc "${SWIFTC_SDK_FLAGS[@]}" -O -module-cache-path "$SWIFT_CACHE_DIR" "${SWIFTC_EXTRA[@]}" -o "$MACOS/${APP_NAME}NotifySender" "$SCRIPT_DIR/notify_sender.swift"
-echo "컴파일 완료"
+if [ -f "$SCRIPT_DIR/notify_sender.swift" ]; then
+    echo "알림 송출 helper 컴파일 중..."
+    /Library/Developer/CommandLineTools/usr/bin/swiftc "${SWIFTC_SDK_FLAGS[@]}" -O -module-cache-path "$SWIFT_CACHE_DIR" "${SWIFTC_EXTRA[@]}" -o "$MACOS/${APP_NAME}NotifySender" "$SCRIPT_DIR/notify_sender.swift"
+    echo "컴파일 완료"
+else
+    echo "⚠️  notify_sender.swift 없음 — 알림 helper 컴파일 건너뜀 (rumps/AppKit 알림으로 폴백)"
+fi
 
 echo "$VENV_REAL" > "$RESOURCES/.venv_path"
 
 for f in app.py hotkey_manager.py pipeline.py cancellation.py audio_extractor.py audio_preprocessor.py acoustic_echo_cancel.py transcriber.py note_generator.py recorder.py system_audio.py live_screen_writer.py continuous_screen_recorder.py sync_diagnostics.py sync_diagnostics_report.py config.yaml dictionary.txt VERSION RELEASE_NOTES.md; do
-    cp "$SCRIPT_DIR/$f" "$RESOURCES/"
+    if [ -f "$SCRIPT_DIR/$f" ]; then
+        cp "$SCRIPT_DIR/$f" "$RESOURCES/"
+    else
+        echo "⚠️  $f 없음 — 복사 건너뜀"
+    fi
 done
 
 # 앱 아이콘 복사
