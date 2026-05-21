@@ -38,6 +38,16 @@ STEP_NAMES = [
 ]
 
 
+def normalize_export_dir(raw: str) -> str:
+    """사용자 입력 export_dir에서 따옴표·셸 이스케이프를 제거한다.
+
+    Why: 따옴표 + `\\~`, `\\(` 같은 셸 이스케이프가 섞이면 YAML 저장 시
+    invalid double-quoted scalar로 파싱이 깨진다.
+    """
+    cleaned = str(raw).strip().strip('"').strip("'")
+    return cleaned.replace("\\ ", " ").replace("\\~", "~").replace("\\(", "(").replace("\\)", ")")
+
+
 def _work_dir_with_title(work_dir: Path, title: str) -> Path:
     """회의록 제목을 폴더명에 반영한 새 작업 폴더 경로를 반환."""
     clean_title = title.strip()
@@ -267,9 +277,7 @@ def run_pipeline(
         export_dir_raw = config.get("export_dir", "~/Downloads")
         if export_dir_raw:
             try:
-                export_dir_raw = str(export_dir_raw).strip().strip('"').strip("'")
-                export_dir_raw = export_dir_raw.replace("\\ ", " ").replace("\\~", "~")
-                export_dir = Path(export_dir_raw).expanduser()
+                export_dir = Path(normalize_export_dir(export_dir_raw)).expanduser()
                 export_dir.mkdir(parents=True, exist_ok=True)
                 export_dest = export_dir / note_path.name
                 shutil.copy2(note_path, str(export_dest))

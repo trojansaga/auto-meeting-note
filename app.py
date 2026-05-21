@@ -51,7 +51,7 @@ from dotenv import load_dotenv
 
 from hotkey_manager import HotkeyManager, format_hotkey, DEFAULT_HOTKEYS, HOTKEY_LABELS
 from note_generator import NOTE_PROVIDERS, NAVER_DEFAULT_BASE_URL
-from pipeline import run_pipeline, PipelineCancelledError
+from pipeline import run_pipeline, PipelineCancelledError, normalize_export_dir
 from recorder import Recorder
 from sync_diagnostics import SyncDiagnosticSession, analyze_session, emit_screen_flash, play_probe_click
 from transcriber import (
@@ -1745,8 +1745,8 @@ class AutoMeetingNoteApp(rumps.App):
         self._pipeline_step = (0, 0)
         self._pipeline_base_msg = ""
         self._pipeline_running = True
-        self._config = load_config()
         try:
+            self._config = load_config()
             if self._config.get("stt_backend", DEFAULT_STT_BACKEND) == "apple_speech":
                 authorized, detail = self._ensure_apple_speech_authorization(request_if_needed=True)
                 if not authorized:
@@ -1788,7 +1788,7 @@ class AutoMeetingNoteApp(rumps.App):
         )
         response = window.run()
         if response.clicked:
-            path = response.text.strip()
+            path = normalize_export_dir(response.text) if response.text else ""
             self._config["export_dir"] = path
             self._save_config()
             display = path if path else "(없음)"

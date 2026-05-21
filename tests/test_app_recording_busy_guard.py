@@ -60,5 +60,33 @@ class RecordingBusyGuardTests(unittest.TestCase):
             )
 
 
+class RunSingleFileFailureCleanupTests(unittest.TestCase):
+    """load_config 같은 초기 단계 예외에서도 파이프라인 상태가 잔류하지 않아야 한다."""
+
+    def _make_app(self):
+        instance = app.AutoMeetingNoteApp.__new__(app.AutoMeetingNoteApp)
+        instance._config = {}
+        instance._pipeline_running = False
+        instance._pipeline_start_time = None
+        instance._pipeline_step = (0, 0)
+        instance._pipeline_base_msg = ""
+        instance._pipeline_stop_event = Mock()
+        instance._pipeline_pause_event = Mock()
+        instance._status_log = []
+        instance._pending_status_title = None
+        instance._reset_title_at = None
+        instance._notify = Mock()
+        instance._schedule_title_reset = Mock()
+        return instance
+
+    def test_load_config_failure_clears_pipeline_running_state(self):
+        instance = self._make_app()
+        with patch.object(app, "load_config", side_effect=RuntimeError("yaml broken")):
+            instance._run_single_file("/tmp/demo.mp4")
+
+        self.assertFalse(instance._pipeline_running)
+        self.assertIsNone(instance._pipeline_start_time)
+
+
 if __name__ == "__main__":
     unittest.main()
