@@ -1700,16 +1700,26 @@ class AutoMeetingNoteApp(rumps.App):
         rumps.Timer(_alert, 0.0).start()
 
     def _confirm_on_main(self, message: str) -> bool:
-        """회의록 생성 여부 확인. 메뉴바 앱에서는 osascript가 더 안정적이다."""
+        """회의록 생성 여부 확인. 메뉴바 앱에서는 osascript가 더 안정적이다.
+
+        Why timeout: System Events의 기본 AppleEvent 타임아웃(60초) 안에 사용자가
+        버튼을 못 누르면 -1712가 떨어져 "예"를 눌러도 취소로 처리되는 사고가 났다.
+        with timeout + giving up after로 양쪽 다 길게 잡아 사용자 응답 시간을 보장한다.
+        """
+        timeout_seconds = 600
         script = (
             "on run argv\n"
             "set dialogMessage to item 1 of argv\n"
+            f"with timeout of {timeout_seconds} seconds\n"
             "tell application \"System Events\"\n"
             "activate\n"
             "set dialogResult to display dialog dialogMessage with title \"확인\" "
-            "buttons {\"아니오\", \"예\"} default button \"예\" cancel button \"아니오\"\n"
+            "buttons {\"아니오\", \"예\"} default button \"예\" cancel button \"아니오\" "
+            f"giving up after {timeout_seconds}\n"
+            "if gave up of dialogResult then return \"__giveup__\"\n"
             "return button returned of dialogResult\n"
             "end tell\n"
+            "end timeout\n"
             "end run"
         )
         try:
@@ -1721,7 +1731,13 @@ class AutoMeetingNoteApp(rumps.App):
             stdout = (result.stdout or "").strip()
             stderr = (result.stderr or "").strip()
             if result.returncode == 0:
+                if stdout == "__giveup__":
+                    logger.info("회의록 생성 확인 다이얼로그 시간 초과 (%ds) — 취소로 처리", timeout_seconds)
+                    return False
                 return stdout == "예"
+            # rc != 0: -128(사용자가 cancel button 누름)은 정상 취소이므로 경고하지 않음
+            if "(-128)" in stderr:
+                return False
             if stderr:
                 logger.warning("confirm dialog osascript 경고: %s", stderr)
             else:
