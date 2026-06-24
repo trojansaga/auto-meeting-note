@@ -53,6 +53,7 @@ from hotkey_manager import HotkeyManager, format_hotkey, DEFAULT_HOTKEYS, HOTKEY
 from note_generator import NOTE_PROVIDERS, NAVER_DEFAULT_BASE_URL
 from pipeline import run_pipeline, PipelineCancelledError, normalize_export_dir
 from recorder import Recorder
+from recording_indicator import RecordingIndicator
 from sync_diagnostics import SyncDiagnosticSession, analyze_session, emit_screen_flash, play_probe_click
 from transcriber import (
     APPLE_SPEECH_MODELS,
@@ -269,6 +270,9 @@ class AutoMeetingNoteApp(rumps.App):
 
         self._recorder = Recorder()
         self._rec_timer: Optional[rumps.Timer] = None
+        self._rec_indicator = RecordingIndicator(
+            status_item_getter=lambda: getattr(self._nsapp, "nsstatusitem", None)
+        )
         self._is_recording = False  # screencapture 프로세스 종료 여부와 무관한 앱 레벨 상태
         self._recording_mode = None  # 'screen' or 'audio'
         self._sync_diagnostic_session: Optional[SyncDiagnosticSession] = None
@@ -1568,19 +1572,25 @@ class AutoMeetingNoteApp(rumps.App):
     def _start_rec_timer(self):
         self._rec_timer = rumps.Timer(self._update_rec_display, 1)
         self._rec_timer.start()
+        self._update_rec_display(None)
+        self._rec_indicator.start()
 
     def _update_rec_display(self, _timer):
         elapsed = int(self._recorder.elapsed_seconds)
         mins, secs = divmod(elapsed, 60)
         if self._recorder.is_paused:
-            self._pending_app_title = f"⏸ REC {mins:02d}:{secs:02d}"
+            text = f"⏸ REC {mins:02d}:{secs:02d}"
         else:
-            self._pending_app_title = f"● REC {mins:02d}:{secs:02d}"
+            text = f"● REC {mins:02d}:{secs:02d}"
+        # 녹화 중 타이틀은 인디케이터(빨간색 점멸)가 그리므로 _pending_app_title 대신
+        # 인디케이터로 텍스트만 전달한다.
+        self._rec_indicator.set_text(text)
 
     def _stop_rec_timer(self):
         if self._rec_timer:
             self._rec_timer.stop()
             self._rec_timer = None
+        self._rec_indicator.stop()
         self._pending_app_title = "MN"
 
     def _on_recording_stopped(
