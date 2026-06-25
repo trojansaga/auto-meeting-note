@@ -17,7 +17,7 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 # 가장자리에서 안쪽으로 빨간색이 사라지는 글로우 폭(포인트)
-_GLOW_WIDTH = 90.0
+_GLOW_WIDTH = 30.0
 # 빨간색 최대 투명도(불투명도). 0.5 = 50%
 _MAX_ALPHA = 0.5
 # 펄스(밝아졌다 어두워지는) 한 주기 길이(초) — 자연스러운 호흡 느낌
