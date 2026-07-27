@@ -19,8 +19,6 @@ fi
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS" "$RESOURCES"
 
-VENV_REAL="$(cd "$SCRIPT_DIR/.venv" && pwd -P)"
-
 # 샌드박스/권한 이슈를 피하기 위해 Swift/Clang 모듈 캐시를 쓰기 가능한 임시 경로로 고정
 SWIFT_CACHE_DIR="${TMPDIR:-/tmp}/AutoMeetingNoteSwiftModuleCache"
 mkdir -p "$SWIFT_CACHE_DIR"
@@ -88,33 +86,64 @@ guard let resourcesPath = Bundle.main.resourcePath else {
     fputs("AutoMeetingNote: resources not found\n", stderr); exit(1)
 }
 
-// venv python 경로 읽기
+// venv 탐색 순서:
+//  1) <bundle>/../../.venv — 번들 기준 상대경로. dist/ 에서 실행하면 프로젝트를
+//     통째로 옮겨도 .app↔.venv 상대관계가 유지돼 경로가 안 깨진다. (주 경로)
+//  2) .venv_path 의 절대경로 — .app 을 /Applications·Dock 등 dist/ 밖으로 복사해
+//     실행할 때 사용. 프로젝트 폴더가 빌드 당시 위치에 있으면 동작한다. (폴백)
+//  시스템 python(3.9)로는 절대 폴백하지 않는다 — 조용한 파이썬 버전 불일치 크래시 방지.
+let fm = FileManager.default
+let bundleURL = Bundle.main.bundleURL
+
+var venvRoots: [URL] = []
+venvRoots.append(bundleURL.deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .appendingPathComponent(".venv"))
 let venvFile = URL(fileURLWithPath: resourcesPath).appendingPathComponent(".venv_path").path
-var pythonPath = "/usr/bin/python3"
-if let venv = try? String(contentsOfFile: venvFile, encoding: .utf8) {
-    let venvRoot = URL(fileURLWithPath: venv.trimmingCharacters(in: .whitespacesAndNewlines))
-    let candidates = [
-        venvRoot.appendingPathComponent("bin/python3.11").path,
-        venvRoot.appendingPathComponent("bin/python3").path,
-        venvRoot.appendingPathComponent("bin/python").path,
-    ]
-    if let realPythonPath = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-        let runtimeDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/AutoMeetingNote/runtime", isDirectory: true)
-        try? FileManager.default.createDirectory(at: runtimeDir, withIntermediateDirectories: true, attributes: nil)
-
-        let runtimePythonPath = runtimeDir.appendingPathComponent("AutoMeetingNote").path
-        if FileManager.default.fileExists(atPath: runtimePythonPath) {
-            try? FileManager.default.removeItem(atPath: runtimePythonPath)
-        }
-
-        let symlinkCreated = (try? FileManager.default.createSymbolicLink(atPath: runtimePythonPath, withDestinationPath: realPythonPath)) != nil
-        if symlinkCreated && FileManager.default.isExecutableFile(atPath: runtimePythonPath) {
-            pythonPath = runtimePythonPath
-        } else {
-            pythonPath = realPythonPath
-        }
+if let raw = try? String(contentsOfFile: venvFile, encoding: .utf8) {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !trimmed.isEmpty {
+        venvRoots.append(trimmed.hasPrefix("/")
+            ? URL(fileURLWithPath: trimmed)
+            : URL(fileURLWithPath: trimmed, relativeTo: bundleURL).standardizedFileURL)
     }
+}
+
+// 상대경로/절대경로 폴백이 같은 위치로 해석되는 경우(= dist/ 에서 실행)가 흔하므로 중복 제거
+var seenRoots = Set<String>()
+venvRoots = venvRoots.filter { seenRoots.insert($0.standardizedFileURL.path).inserted }
+
+func findVenvPython(_ root: URL) -> String? {
+    for sub in ["bin/python3.11", "bin/python3", "bin/python"] {
+        let p = root.appendingPathComponent(sub).path
+        if fm.isExecutableFile(atPath: p) { return p }
+    }
+    return nil
+}
+
+guard let realPythonPath = venvRoots.lazy.compactMap({ findVenvPython($0) }).first else {
+    let tried = venvRoots.map { "  " + $0.path }.joined(separator: "\n")
+    let msg = "Python 가상환경(.venv)을 찾을 수 없습니다.\n\n확인한 위치:\n\(tried)\n\n프로젝트 폴더에서 setup_env.sh 실행 후 build_app.sh로 재빌드하고, dist/AutoMeetingNote.app 을 그 자리에서 실행하세요."
+    fputs("AutoMeetingNote: \(msg)\n", stderr)
+    let alert = Process()
+    alert.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    alert.arguments = ["-e", "display alert \"AutoMeetingNote 실행 실패\" message \"\(msg)\" as critical"]
+    try? alert.run()
+    alert.waitUntilExit()
+    exit(1)
+}
+
+var pythonPath = realPythonPath
+let runtimeDir = fm.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/AutoMeetingNote/runtime", isDirectory: true)
+try? fm.createDirectory(at: runtimeDir, withIntermediateDirectories: true, attributes: nil)
+let runtimePythonPath = runtimeDir.appendingPathComponent("AutoMeetingNote").path
+if fm.fileExists(atPath: runtimePythonPath) {
+    try? fm.removeItem(atPath: runtimePythonPath)
+}
+if (try? fm.createSymbolicLink(atPath: runtimePythonPath, withDestinationPath: realPythonPath)) != nil
+    && fm.isExecutableFile(atPath: runtimePythonPath) {
+    pythonPath = runtimePythonPath
 }
 
 let appScript = URL(fileURLWithPath: resourcesPath).appendingPathComponent("app.py").path
@@ -170,7 +199,12 @@ else
     echo "⚠️  notify_sender.swift 없음 — 알림 helper 컴파일 건너뜀 (rumps/AppKit 알림으로 폴백)"
 fi
 
-echo "$VENV_REAL" > "$RESOURCES/.venv_path"
+# .venv_path 에는 절대경로를 기록한다 — .app 을 /Applications·Dock 등 dist/ 밖으로
+# 복사해 실행할 때의 폴백용. dist/ 에서 실행하는 정상 경우엔 런처가 번들 기준
+# 상대경로(../../.venv)를 먼저 찾으므로 이 값은 안 쓰인다.
+# (프로젝트 폴더를 옮기면 이 절대경로는 깨지지만, dist/ 에서 실행하면 상대경로로 계속 동작한다.)
+VENV_ABS="$(cd "$SCRIPT_DIR/.venv" && pwd -P)"
+printf '%s\n' "$VENV_ABS" > "$RESOURCES/.venv_path"
 
 for f in app.py hotkey_manager.py pipeline.py cancellation.py audio_extractor.py audio_preprocessor.py acoustic_echo_cancel.py transcriber.py note_generator.py recorder.py recording_indicator.py system_audio.py live_screen_writer.py continuous_screen_recorder.py sync_diagnostics.py sync_diagnostics_report.py config.yaml dictionary.txt VERSION RELEASE_NOTES.md; do
     if [ -f "$SCRIPT_DIR/$f" ]; then
@@ -250,7 +284,10 @@ echo "=== 빌드 완료 ==="
 echo "앱 위치: $APP_DIR"
 echo ""
 echo "실행 방법:"
-echo "  open \"$APP_DIR\""
+echo "  open \"$APP_DIR\"                # dist/ 에서 실행 (권장)"
+echo "  cp -R \"$APP_DIR\" /Applications/  # /Applications·Dock 에서 실행도 가능"
 echo ""
-echo "Applications에 설치:"
-echo "  cp -R \"$APP_DIR\" /Applications/"
+echo "ℹ️  venv 참조: ① 번들 기준 상대경로(../../.venv) → ② 빌드 시 절대경로 순으로 찾습니다."
+echo "   • dist/ 에서 실행: 프로젝트를 통째로 옮겨도 계속 동작"
+echo "   • /Applications 등에서 실행: 프로젝트 폴더가 제자리에 있으면 동작"
+echo "   • 프로젝트를 옮긴 뒤엔 build_app.sh 로 재빌드하면 절대경로가 갱신됩니다."
