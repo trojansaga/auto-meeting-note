@@ -138,7 +138,11 @@ let runtimeDir = fm.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/AutoMeetingNote/runtime", isDirectory: true)
 try? fm.createDirectory(at: runtimeDir, withIntermediateDirectories: true, attributes: nil)
 let runtimePythonPath = runtimeDir.appendingPathComponent("AutoMeetingNote").path
-if fm.fileExists(atPath: runtimePythonPath) {
+// 기존 런타임 심링크를 제거한다. fileExists(atPath:)는 심링크를 따라가므로
+// 이전 빌드가 남긴 "끊긴(dangling) 심링크"에는 false 를 반환 → 제거를 건너뛰고
+// createSymbolicLink 가 "파일 있음"으로 실패, 옛 경로가 그대로 남던 버그가 있었다.
+// attributesOfItem(atPath:)는 lstat 성격이라 심링크 자체를 보고 끊긴 링크도 감지한다.
+if (try? fm.attributesOfItem(atPath: runtimePythonPath)) != nil {
     try? fm.removeItem(atPath: runtimePythonPath)
 }
 if (try? fm.createSymbolicLink(atPath: runtimePythonPath, withDestinationPath: realPythonPath)) != nil
