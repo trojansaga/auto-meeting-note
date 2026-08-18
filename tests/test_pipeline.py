@@ -43,8 +43,7 @@ class _TempEnv:
             "export_dir": str(self.export_dir),
             "stt_backend": "whisper",
             "language": "ko",
-            "note_provider": "openai",
-            "openai_model": "gpt-5.4",
+            "claude_cli_model": "opus",
         }
 
     def cleanup(self):
@@ -72,6 +71,13 @@ class PipelineHappyPathTests(unittest.TestCase):
             self.assertEqual(m_pre.call_count, 1)
             self.assertEqual(m_tr.call_count, 1)
             self.assertEqual(m_note.call_count, 1)
+
+            # generate_note는 config의 claude_cli_model 값을 model kwarg로만 전달받고
+            # provider/naver 관련 인자는 전혀 넘기지 않는다
+            note_kwargs = m_note.call_args.kwargs
+            self.assertEqual(note_kwargs.get("model"), "opus")
+            for forbidden_kwarg in ("provider", "naver_api_key", "naver_api_base_url"):
+                self.assertNotIn(forbidden_kwarg, note_kwargs)
 
             # 진행 상태 메시지에 STT/회의록 단계 표시 포함
             joined = "\n".join(statuses)
@@ -101,6 +107,41 @@ class PipelineHappyPathTests(unittest.TestCase):
 
             m_extract.assert_not_called()
             self.assertEqual(m_pre.call_count, 1)
+        finally:
+            env.cleanup()
+
+    def test_claude_cli_model_config_value_is_threaded_to_generate_note(self):
+        """config의 claude_cli_model이 기본값('opus')과 다른 임의 값이어도
+        그대로 generate_note(model=...)에 전달되는지 검증 (하드코딩된 우연의 일치 방지)."""
+        env = _TempEnv()
+        try:
+            cfg = env.base_config()
+            cfg["claude_cli_model"] = "sonnet"  # 기본값(opus)과 다른 값
+
+            with patch.object(pipeline, "extract_audio", side_effect=_stub_extract_audio), \
+                 patch.object(pipeline, "preprocess_audio", side_effect=_stub_preprocess_audio), \
+                 patch.object(pipeline, "transcribe", side_effect=_stub_transcribe), \
+                 patch.object(pipeline, "generate_note", side_effect=_stub_generate_note) as m_note:
+                pipeline.run_pipeline(str(env.mp4), cfg)
+
+            self.assertEqual(m_note.call_args.kwargs.get("model"), "sonnet")
+        finally:
+            env.cleanup()
+
+    def test_claude_cli_model_defaults_to_opus_when_unset(self):
+        """config에 claude_cli_model 키가 아예 없으면 기본값 'opus'가 전달된다."""
+        env = _TempEnv()
+        try:
+            cfg = env.base_config()
+            del cfg["claude_cli_model"]
+
+            with patch.object(pipeline, "extract_audio", side_effect=_stub_extract_audio), \
+                 patch.object(pipeline, "preprocess_audio", side_effect=_stub_preprocess_audio), \
+                 patch.object(pipeline, "transcribe", side_effect=_stub_transcribe), \
+                 patch.object(pipeline, "generate_note", side_effect=_stub_generate_note) as m_note:
+                pipeline.run_pipeline(str(env.mp4), cfg)
+
+            self.assertEqual(m_note.call_args.kwargs.get("model"), "opus")
         finally:
             env.cleanup()
 

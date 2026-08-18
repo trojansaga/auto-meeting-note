@@ -10,7 +10,7 @@ macOS 메뉴바 앱으로, 화면 녹화 또는 오디오 녹음 후 자동으�
 - **일시 정지/재개** — 세그먼트 분할 방식으로 녹화·녹음 중 일시 정지
 - **음성 전처리** — 노이즈 제거, 침묵 구간 제거, 음량 정규화
 - **로컬 STT** — Whisper(mlx-whisper), Qwen3-ASR, Apple Speech 중 선택 가능한 로컬 음성 인식
-- **회의록 생성** — OpenAI GPT API로 구조화된 회의록 자동 생성
+- **회의록 생성** — 로컬 claude CLI(Claude Code)로 구조화된 회의록 자동 생성
 - **수동 처리** — 기존 mp4/mov 파일을 선택하여 처리
 - **릴리즈 노트** — 메뉴에서 현재 버전과 변경 이력 확인
 
@@ -19,7 +19,7 @@ macOS 메뉴바 앱으로, 화면 녹화 또는 오디오 녹음 후 자동으�
 - macOS (Apple Silicon)
 - Python 3.11+
 - ffmpeg (`brew install ffmpeg`)
-- OpenAI API 키
+- claude CLI(Claude Code) 설치 및 로그인 (`claude /login` 등으로 인증 완료 상태여야 회의록 생성이 동작합니다)
 
 ## 설치
 
@@ -29,9 +29,6 @@ bash setup_env.sh
 
 # 가상환경 활성화
 source .venv/bin/activate
-
-# .env 파일에 API 키 설정
-echo "OPENAI_API_KEY=sk-..." > .env
 ```
 
 ## 빌드 및 실행
@@ -68,7 +65,7 @@ qwen_max_new_tokens: 4096        # Qwen3-ASR 최대 생성 토큰 수
 qwen_max_batch_size: 1           # Qwen3-ASR 추론 배치 제한
 qwen_chunk_seconds: 600          # 긴 오디오를 Qwen 입력 청크로 나누는 길이(초)
 language: "ko"                   # STT 언어
-openai_model: "gpt-5.4"         # 회의록 생성 모델
+claude_cli_model: "opus"         # 회의록 생성에 사용할 claude CLI 모델
 export_dir: "~/Downloads"        # 회의록 내보내기 디렉토리
 mic_enabled: false               # 마이크 동시 녹음 여부
 mic_device_index: "macbook"      # macbook 또는 iphone
@@ -99,7 +96,7 @@ audio_preprocessor.py  # 음성 전처리
 transcriber.py         # Whisper / Qwen3-ASR / Apple Speech STT
 apple_speech_probe.swift # Apple Speech 권한/지원 상태 점검 helper
 apple_speech_transcriber.swift # Apple Speech 파일 전사용 helper
-note_generator.py      # OpenAI API 회의록 생성
+note_generator.py      # claude CLI 회의록 생성
 generate_prompt.py     # 회의록 생성 프롬프트 빌더
 config.yaml            # 기본 설정
 dictionary.txt         # STT 용어 사전

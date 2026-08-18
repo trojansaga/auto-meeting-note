@@ -97,12 +97,7 @@ def run_pipeline(
     qwen_max_batch_size = int(config.get("qwen_max_batch_size", 1))
     qwen_chunk_seconds = config.get("qwen_chunk_seconds", 600)
     language = config.get("language", "ko")
-    note_provider = config.get("note_provider", "openai")
-    openai_model = config.get("openai_model", "gpt-5.4")
-    naver_model = config.get("naver_model", "gpt-4o")
-    naver_api_key = config.get("naver_api_key", "")
-    naver_api_base_url = config.get("naver_api_base_url", "https://namc-aigw.io.naver.com")
-    note_model = naver_model if note_provider == "naver" else openai_model
+    claude_cli_model = config.get("claude_cli_model", "opus")
     note_prefix = config.get("note_prefix", "(자동회의록)")
 
     work_dir = watch_dir / stem
@@ -245,10 +240,7 @@ def run_pipeline(
             note_tmp,
             original_filename,
             created_at,
-            model=note_model,
-            provider=note_provider,
-            naver_api_key=naver_api_key,
-            naver_api_base_url=naver_api_base_url,
+            model=claude_cli_model,
             progress_callback=_notify,
             stop_event=stop_event,
         )

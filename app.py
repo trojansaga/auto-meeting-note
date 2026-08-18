@@ -50,7 +50,7 @@ import yaml
 from dotenv import load_dotenv
 
 from hotkey_manager import HotkeyManager, format_hotkey, DEFAULT_HOTKEYS, HOTKEY_LABELS
-from note_generator import NOTE_PROVIDERS, NAVER_DEFAULT_BASE_URL
+from note_generator import DEFAULT_CLAUDE_MODEL, find_claude_cli
 from pipeline import run_pipeline, PipelineCancelledError, normalize_export_dir
 from recorder import Recorder
 from recording_indicator import RecordingIndicator
@@ -129,11 +129,7 @@ DEFAULT_CONFIG = {
     "qwen_max_batch_size": 1,
     "qwen_chunk_seconds": 600,
     "language": "ko",
-    "note_provider": "openai",
-    "openai_model": "gpt-5.4",
-    "naver_model": "gpt-4o",
-    "naver_api_key": "",
-    "naver_api_base_url": "https://namc-aigw.io.naver.com",
+    "claude_cli_model": "opus",
     "export_dir": "~/Downloads",
     "mic_enabled": False,
     "mic_device_index": "macbook",
@@ -319,7 +315,6 @@ class AutoMeetingNoteApp(rumps.App):
 
         self._model_menu_items: dict = {}
         self._model_menu = self._build_model_menu()
-        self._note_provider_menu_items: dict = {}
         self._note_provider_menu = self._build_note_provider_menu()
         self._preprocess_menu = self._build_preprocess_menu()
         self._hotkey_menu = self._build_hotkey_menu()
@@ -373,8 +368,12 @@ class AutoMeetingNoteApp(rumps.App):
         if not shutil.which("ffmpeg"):
             errors.append("ffmpeg가 없습니다.\n터미널에서 'brew install ffmpeg' 실행 후 앱을 재시작하세요.")
 
-        if not os.environ.get("OPENAI_API_KEY"):
-            errors.append("OPENAI_API_KEY가 설정되지 않았습니다.\n설정 파일 열기 메뉴에서 .env 파일을 확인하세요.")
+        if not find_claude_cli():
+            errors.append(
+                "claude CLI(Claude Code)가 설치되어 있지 않습니다.\n"
+                "https://claude.com/claude-code 안내에 따라 설치 후 터미널에서 "
+                "'claude --version'으로 확인하고 앱을 재시작하세요."
+            )
 
         backend = self._config.get("stt_backend", DEFAULT_STT_BACKEND)
         stt_dependency_error = self._get_stt_dependency_error(backend)
@@ -384,8 +383,6 @@ class AutoMeetingNoteApp(rumps.App):
         if errors:
             rumps.alert(title="설정 오류", message="\n\n".join(errors))
             return
-
-        self._spawn_bg_thread(self._validate_openai_model, name="validate-openai-model")
 
         backend, model_name, quant = self._get_current_stt_selection()
         self._check_and_download_model(backend, model_name, quant)
@@ -482,30 +479,6 @@ class AutoMeetingNoteApp(rumps.App):
                 "mlx_whisper 패키지가 없습니다.\n"
                 "터미널에서 'pip install mlx-whisper' 실행 후 앱을 재시작하세요."
             )
-
-    def _validate_openai_model(self):
-        note_provider = self._config.get("note_provider", "openai")
-        if note_provider != "openai":
-            logger.info("회의록 provider: %s — OpenAI 모델 검증 건너뜀", note_provider)
-            return
-        import openai
-        model = self._config.get("openai_model", "gpt-5.4")
-        try:
-            client = openai.OpenAI()
-            available = [m.id for m in client.models.list().data]
-            if model not in available:
-                logger.warning("OpenAI 모델 없음: %s", model)
-                def _alert(_timer):
-                    _timer.stop()
-                    rumps.alert(
-                        title="OpenAI 모델 오류",
-                        message=f"설정된 모델 '{model}'을 찾을 수 없습니다.\n'설정 파일 열기'에서 openai_model 값을 확인해주세요.",
-                    )
-                rumps.Timer(_alert, 0.0).start()
-            else:
-                logger.info("OpenAI 모델 확인 완료: %s", model)
-        except Exception as e:
-            logger.warning("OpenAI 모델 검증 실패: %s", e)
 
     def _save_config(self):
         CONFIG_PATH.write_text(yaml.dump(self._config, allow_unicode=True), encoding="utf-8")
@@ -695,45 +668,17 @@ class AutoMeetingNoteApp(rumps.App):
         return model_menu
 
     def _get_note_provider_menu_title(self) -> str:
-        provider = self._config.get("note_provider", "openai")
-        label = NOTE_PROVIDERS.get(provider, provider)
-        model = self._config.get("naver_model", "gpt-4o") if provider == "naver" else self._config.get("openai_model", "gpt-5.4")
-        return f"회의록 AI: {label} / {model}"
-
-    def _get_naver_key_display(self) -> str:
-        key = self._config.get("naver_api_key", "")
-        if not key:
-            return "미설정"
-        return "****" + key[-4:] if len(key) > 4 else "****"
+        model = self._config.get("claude_cli_model", DEFAULT_CLAUDE_MODEL)
+        return f"회의록 AI: Claude / {model}"
 
     def _build_note_provider_menu(self) -> rumps.MenuItem:
         menu = rumps.MenuItem(self._get_note_provider_menu_title())
-        current = self._config.get("note_provider", "openai")
-        for provider_key, provider_label in NOTE_PROVIDERS.items():
-            item = rumps.MenuItem(provider_label, callback=self._make_note_provider_callback(provider_key))
-            item.state = 1 if provider_key == current else 0
-            self._note_provider_menu_items[provider_key] = item
-            menu.add(item)
 
-        menu.add(None)
-
-        self._openai_model_item = rumps.MenuItem(
-            f"OpenAI 모델: {self._config.get('openai_model', 'gpt-5.4')}",
-            callback=self._change_openai_model,
+        self._claude_cli_model_item = rumps.MenuItem(
+            f"Claude 모델: {self._config.get('claude_cli_model', DEFAULT_CLAUDE_MODEL)}",
+            callback=self._change_claude_cli_model,
         )
-        menu.add(self._openai_model_item)
-
-        self._naver_model_item = rumps.MenuItem(
-            f"Naver 모델: {self._config.get('naver_model', 'gpt-4o')}",
-            callback=self._change_naver_model,
-        )
-        menu.add(self._naver_model_item)
-
-        self._naver_key_item = rumps.MenuItem(
-            f"Naver API 키: {self._get_naver_key_display()}",
-            callback=self._change_naver_api_key,
-        )
-        menu.add(self._naver_key_item)
+        menu.add(self._claude_cli_model_item)
 
         menu.add(None)
 
@@ -745,22 +690,11 @@ class AutoMeetingNoteApp(rumps.App):
 
         return menu
 
-    def _make_note_provider_callback(self, provider: str):
-        def _select(_sender):
-            for item in self._note_provider_menu_items.values():
-                item.state = 0
-            self._note_provider_menu_items[provider].state = 1
-            self._config["note_provider"] = provider
-            self._note_provider_menu.title = self._get_note_provider_menu_title()
-            self._save_config()
-            logger.info("회의록 AI provider 변경: %s", provider)
-        return _select
-
-    def _change_openai_model(self, _):
-        current = self._config.get("openai_model", "gpt-5.4")
+    def _change_claude_cli_model(self, _):
+        current = self._config.get("claude_cli_model", DEFAULT_CLAUDE_MODEL)
         window = rumps.Window(
-            message="OpenAI 모델명을 입력하세요.",
-            title="OpenAI 모델 변경",
+            message="claude CLI 호출에 사용할 모델명을 입력하세요. (예: opus, sonnet)",
+            title="Claude 모델 변경",
             default_text=current,
             ok="저장",
             cancel="취소",
@@ -768,46 +702,11 @@ class AutoMeetingNoteApp(rumps.App):
         response = window.run()
         if response.clicked and response.text.strip():
             model = response.text.strip()
-            self._config["openai_model"] = model
+            self._config["claude_cli_model"] = model
             self._save_config()
-            self._openai_model_item.title = f"OpenAI 모델: {model}"
+            self._claude_cli_model_item.title = f"Claude 모델: {model}"
             self._note_provider_menu.title = self._get_note_provider_menu_title()
-            logger.info("OpenAI 모델 변경: %s", model)
-
-    def _change_naver_model(self, _):
-        current = self._config.get("naver_model", "gpt-4o")
-        window = rumps.Window(
-            message="Naver AI Gateway 모델명을 입력하세요.",
-            title="Naver 모델 변경",
-            default_text=current,
-            ok="저장",
-            cancel="취소",
-        )
-        response = window.run()
-        if response.clicked and response.text.strip():
-            model = response.text.strip()
-            self._config["naver_model"] = model
-            self._save_config()
-            self._naver_model_item.title = f"Naver 모델: {model}"
-            self._note_provider_menu.title = self._get_note_provider_menu_title()
-            logger.info("Naver 모델 변경: %s", model)
-
-    def _change_naver_api_key(self, _):
-        window = rumps.Window(
-            message="Naver AI Gateway API 키를 입력하세요.",
-            title="Naver API 키 변경",
-            default_text=self._config.get("naver_api_key", ""),
-            ok="저장",
-            cancel="취소",
-            dimensions=(400, 20),
-        )
-        response = window.run()
-        if response.clicked:
-            key = response.text.strip()
-            self._config["naver_api_key"] = key
-            self._save_config()
-            self._naver_key_item.title = f"Naver API 키: {self._get_naver_key_display()}"
-            logger.info("Naver API 키 변경 완료")
+            logger.info("Claude 모델 변경: %s", model)
 
     def _change_note_prefix(self, _):
         current = self._config.get("note_prefix", "(자동회의록)")

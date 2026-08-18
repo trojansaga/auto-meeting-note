@@ -14,11 +14,7 @@ qwen_max_new_tokens: 4096
 qwen_max_batch_size: 1
 qwen_chunk_seconds: 600
 language: "ko"
-note_provider: "openai"   # "openai" 또는 "naver"
-openai_model: "gpt-5.4"
-naver_model: "gpt-4o"
-naver_api_key: ""         # Naver AI Gateway 상용 API 키
-naver_api_base_url: "https://namc-aigw.io.naver.com"
+claude_cli_model: "opus"  # claude CLI --model 플래그로 전달. "sonnet"/"opus"/"haiku" 별칭 또는 전체 모델 ID 지정 가능
 export_dir: "~/Downloads"
 mic_enabled: false       # 마이크 동시 녹음 여부 (시스템 오디오와 믹싱됨)
 mic_device_index: "macbook"   # macbook 또는 iphone
