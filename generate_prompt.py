@@ -215,7 +215,7 @@ def main():
     vault = Path(args.vault)
     output = Path(args.output)
 
-    env_path = Path.home() / "Library" / "Application Support" / "AutoMeetingNote" / ".env"
+    env_path = Path.home() / "Library" / "Application Support" / "auto-meeting-note-v2" / ".env"
     load_dotenv(env_path)
 
     print(f"볼트 경로: {vault}")

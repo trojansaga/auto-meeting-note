@@ -22,7 +22,7 @@ _MIC_DEFAULT_CHANNELS = 1
 _MIC_DEFAULT_SAMPLE_WIDTH = 2
 
 # 앱 번들 내에서 stdout이 없으므로 파일로 디버그 로그 기록
-_LOG_PATH = os.path.join(os.path.expanduser("~"), "Library", "Logs", "AutoMeetingNote_audio.log")
+_LOG_PATH = os.path.join(os.path.expanduser("~"), "Library", "Logs", "auto-meeting-note-v2_audio.log")
 
 _AUDIO_FORMAT_LINEAR_PCM = 0x6C70636D  # 'lpcm'
 _AUDIO_FORMAT_FLAG_IS_FLOAT = 1 << 0
@@ -122,6 +122,57 @@ _cm_lib.CMSampleBufferGetFormatDescription.restype = ctypes.c_void_p
 _cm_lib.CMSampleBufferGetFormatDescription.argtypes = [ctypes.c_void_p]
 _cm_lib.CMAudioFormatDescriptionGetStreamBasicDescription.restype = ctypes.POINTER(_AudioStreamBasicDescription)
 _cm_lib.CMAudioFormatDescriptionGetStreamBasicDescription.argtypes = [ctypes.c_void_p]
+
+
+class _CMTime(ctypes.Structure):
+    _fields_ = [
+        ("value", ctypes.c_int64),
+        ("timescale", ctypes.c_int32),
+        ("flags", ctypes.c_uint32),
+        ("epoch", ctypes.c_int64),
+    ]
+
+
+_cm_lib.CMSampleBufferGetPresentationTimeStamp.restype = _CMTime
+_cm_lib.CMSampleBufferGetPresentationTimeStamp.argtypes = [ctypes.c_void_p]
+
+_CMTIME_FLAG_VALID = 1
+
+
+class _MachTimebaseInfo(ctypes.Structure):
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+
+_libc = ctypes.CDLL(None)
+_libc.mach_absolute_time.restype = ctypes.c_uint64
+_libc.mach_timebase_info.argtypes = [ctypes.POINTER(_MachTimebaseInfo)]
+_mach_timebase = _MachTimebaseInfo()
+_libc.mach_timebase_info(ctypes.byref(_mach_timebase))
+
+
+def _host_time_seconds() -> float:
+    """CMClockGetHostTimeClock 과 같은 눈금(mach absolute time)의 현재 초."""
+    return _libc.mach_absolute_time() * _mach_timebase.numer / _mach_timebase.denom / 1e9
+
+
+def _sample_buffer_wall_clock(sample_buffer_ptr: int) -> Optional[float]:
+    """샘플 버퍼 첫 샘플이 실제로 캡처된 시각을 wall clock(time.time() 기준)으로 환산.
+
+    SCStream 샘플 버퍼의 PTS 는 host time clock 기준이라 캡처 시점을 정확히 가리킨다.
+    콜백 도착 시각(time.time())은 탭 backlog 에 따라 실측 6ms~1.5초까지 늦어져 앵커로 쓸 수 없다.
+    """
+    try:
+        pts = _cm_lib.CMSampleBufferGetPresentationTimeStamp(sample_buffer_ptr)
+        if not (pts.flags & _CMTIME_FLAG_VALID) or pts.timescale == 0:
+            return None
+        pts_seconds = pts.value / pts.timescale
+        # host clock 과 wall clock 을 같은 순간에 읽어 두 시간축의 차이를 구한다
+        host_now = _host_time_seconds()
+        wall_now = time.time()
+        return wall_now - (host_now - pts_seconds)
+    except Exception as exc:
+        _flog(f"PTS 변환 실패: {exc}")
+        return None
 
 
 def _sample_buffer_pointer(sample_buffer) -> int:
@@ -396,11 +447,13 @@ class _AudioDelegate(objc.lookUpClass('NSObject')):
         if output_type == _SCStreamOutputTypeAudio:
             writer = self._system_writer
             timestamp_attr = "first_sample_at"
+            host_attr = "first_sample_host_at"
             self._audio_call_count += 1
             call_count = self._audio_call_count
         elif output_type == _SCStreamOutputTypeMicrophone:
             writer = self._mic_writer
             timestamp_attr = "mic_first_sample_at"
+            host_attr = "mic_first_sample_host_at"
             self._mic_call_count += 1
             call_count = self._mic_call_count
         else:
@@ -419,6 +472,11 @@ class _AudioDelegate(objc.lookUpClass('NSObject')):
             if self._owner is not None and getattr(self._owner, timestamp_attr, None) is None:
                 setattr(self._owner, timestamp_attr, time.time())
                 _flog(f"{timestamp_attr} set to {getattr(self._owner, timestamp_attr):.6f}")
+                # WAV sample 0 의 실제 캡처 시각. 싱크 앵커는 이 값을 써야 한다.
+                host_at = _sample_buffer_wall_clock(sb_ptr)
+                if host_at is not None:
+                    setattr(self._owner, host_attr, host_at)
+                    _flog(f"{host_attr} set to {host_at:.6f} (콜백 도착 대비 {host_at - getattr(self._owner, timestamp_attr):+.4f}s)")
             with self._lock:
                 writer.write_sample_buffer(sb_ptr, num_samples)
 
@@ -448,6 +506,10 @@ class SystemAudioCapture:
         self.first_sample_at: Optional[float] = None
         self.mic_started_at: Optional[float] = None
         self.mic_first_sample_at: Optional[float] = None
+        # *_host_at: 첫 샘플의 PTS(host clock)를 wall clock 으로 환산한 값 = WAV sample 0 의 캡처 시각.
+        # 싱크 앵커는 이 값을 쓴다 (_sample_buffer_wall_clock 참고).
+        self.first_sample_host_at: Optional[float] = None
+        self.mic_first_sample_host_at: Optional[float] = None
         self.mic_capture_active: bool = False
 
     @staticmethod
@@ -481,6 +543,8 @@ class SystemAudioCapture:
         self.first_sample_at = None
         self.mic_started_at = None
         self.mic_first_sample_at = None
+        self.first_sample_host_at = None
+        self.mic_first_sample_host_at = None
 
         _flog(
             f"start() called: {output_path}, mic_output_path={mic_output_path}, "

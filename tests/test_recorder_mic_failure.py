@@ -61,6 +61,12 @@ class _FakeSystemAudioCapture:
     def __init__(self):
         self.started = False
         self.stopped = False
+        # 실제 캡처에서는 첫 샘플 버퍼 PTS 가 앵커로 쓰인다 (_AUDIO_ANCHOR_ATTRS)
+        self.started_at = 100.0
+        self.first_sample_at = 100.0
+        self.first_sample_host_at = 100.0
+        self.mic_capture_active = False
+        self.mic_started_at = None
 
     def start(self, output_path: Path, mic_output_path: Path | None = None, mic_device_spec: str | None = None) -> None:
         self.started = True

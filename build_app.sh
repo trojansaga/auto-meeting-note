@@ -2,7 +2,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_NAME="AutoMeetingNote"
+APP_NAME="auto-meeting-note-v2"
 APP_VERSION="$(tr -d '\n' < "$SCRIPT_DIR/VERSION")"
 APP_DIR="$SCRIPT_DIR/dist/$APP_NAME.app"
 CONTENTS="$APP_DIR/Contents"
@@ -20,7 +20,7 @@ rm -rf "$APP_DIR"
 mkdir -p "$MACOS" "$RESOURCES"
 
 # 샌드박스/권한 이슈를 피하기 위해 Swift/Clang 모듈 캐시를 쓰기 가능한 임시 경로로 고정
-SWIFT_CACHE_DIR="${TMPDIR:-/tmp}/AutoMeetingNoteSwiftModuleCache"
+SWIFT_CACHE_DIR="${TMPDIR:-/tmp}/auto-meeting-note-v2SwiftModuleCache"
 mkdir -p "$SWIFT_CACHE_DIR"
 export SWIFT_MODULECACHE_PATH="$SWIFT_CACHE_DIR"
 export CLANG_MODULE_CACHE_PATH="$SWIFT_CACHE_DIR"
@@ -83,7 +83,7 @@ func forwardSignal(_ sig: Int32) {
 }
 
 guard let resourcesPath = Bundle.main.resourcePath else {
-    fputs("AutoMeetingNote: resources not found\n", stderr); exit(1)
+    fputs("auto-meeting-note-v2: resources not found\n", stderr); exit(1)
 }
 
 // venv 탐색 순서:
@@ -123,11 +123,11 @@ func findVenvPython(_ root: URL) -> String? {
 
 guard let realPythonPath = venvRoots.lazy.compactMap({ findVenvPython($0) }).first else {
     let tried = venvRoots.map { "  " + $0.path }.joined(separator: "\n")
-    let msg = "Python 가상환경(.venv)을 찾을 수 없습니다.\n\n확인한 위치:\n\(tried)\n\n프로젝트 폴더에서 setup_env.sh 실행 후 build_app.sh로 재빌드하고, dist/AutoMeetingNote.app 을 그 자리에서 실행하세요."
-    fputs("AutoMeetingNote: \(msg)\n", stderr)
+    let msg = "Python 가상환경(.venv)을 찾을 수 없습니다.\n\n확인한 위치:\n\(tried)\n\n프로젝트 폴더에서 setup_env.sh 실행 후 build_app.sh로 재빌드하고, dist/auto-meeting-note-v2.app 을 그 자리에서 실행하세요."
+    fputs("auto-meeting-note-v2: \(msg)\n", stderr)
     let alert = Process()
     alert.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    alert.arguments = ["-e", "display alert \"AutoMeetingNote 실행 실패\" message \"\(msg)\" as critical"]
+    alert.arguments = ["-e", "display alert \"auto-meeting-note-v2 실행 실패\" message \"\(msg)\" as critical"]
     try? alert.run()
     alert.waitUntilExit()
     exit(1)
@@ -135,9 +135,9 @@ guard let realPythonPath = venvRoots.lazy.compactMap({ findVenvPython($0) }).fir
 
 var pythonPath = realPythonPath
 let runtimeDir = fm.homeDirectoryForCurrentUser
-    .appendingPathComponent("Library/Application Support/AutoMeetingNote/runtime", isDirectory: true)
+    .appendingPathComponent("Library/Application Support/auto-meeting-note-v2/runtime", isDirectory: true)
 try? fm.createDirectory(at: runtimeDir, withIntermediateDirectories: true, attributes: nil)
-let runtimePythonPath = runtimeDir.appendingPathComponent("AutoMeetingNote").path
+let runtimePythonPath = runtimeDir.appendingPathComponent("auto-meeting-note-v2").path
 // 기존 런타임 심링크를 제거한다. fileExists(atPath:)는 심링크를 따라가므로
 // 이전 빌드가 남긴 "끊긴(dangling) 심링크"에는 false 를 반환 → 제거를 건너뛰고
 // createSymbolicLink 가 "파일 있음"으로 실패, 옛 경로가 그대로 남던 버그가 있었다.
@@ -160,7 +160,7 @@ if !curPath.contains("/opt/homebrew/bin") {
 }
 // macOS 알림 송출자 ID 를 .app bundle 로 강제. 이게 없으면 Python 자식 프로세스의
 // 알림 표시자 이름이 "python" 으로 잡힘 (특히 macOS 14+/Tahoe(26.x) 에서 plist 트릭 무효).
-env["__CFBundleIdentifier"] = "com.automeetingnote.app"
+env["__CFBundleIdentifier"] = "com.automeetingnote.v2"
 
 let child = Process()
 child.executableURL = URL(fileURLWithPath: pythonPath)
@@ -170,7 +170,7 @@ child.environment = env
 do {
     try child.run()
 } catch {
-    fputs("AutoMeetingNote: launch failed: \(error)\n", stderr); exit(1)
+    fputs("auto-meeting-note-v2: launch failed: \(error)\n", stderr); exit(1)
 }
 
 gChildPID = child.processIdentifier
@@ -233,17 +233,17 @@ cat > "$CONTENTS/Info.plist" << PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>AutoMeetingNote</string>
+    <string>auto-meeting-note-v2</string>
     <key>CFBundleDisplayName</key>
-    <string>AutoMeetingNote</string>
+    <string>auto-meeting-note-v2</string>
     <key>CFBundleIdentifier</key>
-    <string>com.automeetingnote.app</string>
+    <string>com.automeetingnote.v2</string>
     <key>CFBundleVersion</key>
     <string>${APP_VERSION}</string>
     <key>CFBundleShortVersionString</key>
     <string>${APP_VERSION}</string>
     <key>CFBundleExecutable</key>
-    <string>AutoMeetingNote</string>
+    <string>auto-meeting-note-v2</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSUIElement</key>
@@ -271,7 +271,7 @@ PLIST
 touch "$CONTENTS/Info.plist" "$APP_DIR"
 
 echo "앱 코드 서명 중..."
-SIGN_IDENTITY="AutoMeetingNote Local"
+SIGN_IDENTITY="auto-meeting-note-v2 Local"
 # 자체 서명 인증서는 find-identity 에 0개로 보고되지만 codesign 자체는 동작한다.
 # 따라서 인증서 존재 여부로 검사한 뒤 직접 시도하고, 실패 시에만 ad-hoc 으로 폴백한다.
 if security find-certificate -c "$SIGN_IDENTITY" >/dev/null 2>&1 \

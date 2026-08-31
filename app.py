@@ -19,7 +19,7 @@ for _p in ["/opt/homebrew/bin", "/usr/local/bin"]:
         os.environ["PATH"] = _p + ":" + os.environ.get("PATH", "")
 
 # HuggingFace 모델 저장 경로를 쓰기 가능한 위치로 지정
-_HF_HOME = str(Path.home() / "Library" / "Application Support" / "AutoMeetingNote" / "huggingface")
+_HF_HOME = str(Path.home() / "Library" / "Application Support" / "auto-meeting-note-v2" / "huggingface")
 os.environ.setdefault("HF_HOME", _HF_HOME)
 Path(_HF_HOME).mkdir(parents=True, exist_ok=True)
 
@@ -41,7 +41,7 @@ if _VENV_SITE.exists() and str(_VENV_SITE) not in sys.path:
 
 try:
     import setproctitle
-    setproctitle.setproctitle("AutoMeetingNote")
+    setproctitle.setproctitle("auto-meeting-note-v2")
 except ImportError:
     pass
 
@@ -54,7 +54,7 @@ from note_generator import DEFAULT_CLAUDE_MODEL, find_claude_cli
 from pipeline import run_pipeline, PipelineCancelledError, normalize_export_dir
 from recorder import Recorder
 from recording_indicator import RecordingIndicator
-from sync_diagnostics import SyncDiagnosticSession, analyze_session, emit_screen_flash, play_probe_click
+from sync_diagnostics import SyncDiagnosticSession, analyze_session, emit_probe_signals
 from transcriber import (
     APPLE_SPEECH_MODELS,
     DEFAULT_APPLE_SPEECH_MODEL,
@@ -70,10 +70,10 @@ from transcriber import (
     get_model_download_repo,
 )
 
-APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "AutoMeetingNote"
+APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "auto-meeting-note-v2"
 APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-LOG_DIR = Path.home() / "Library" / "Logs" / "AutoMeetingNote"
+LOG_DIR = Path.home() / "Library" / "Logs" / "auto-meeting-note-v2"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "app.log"
 
@@ -88,8 +88,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-APP_BUNDLE_IDENTIFIER = "com.automeetingnote.app"
-APP_DISPLAY_NAME = "AutoMeetingNote"
+APP_BUNDLE_IDENTIFIER = "com.automeetingnote.v2"
+APP_DISPLAY_NAME = "auto-meeting-note-v2"
 VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
 APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "1.1.11"
 
@@ -143,10 +143,10 @@ DEFAULT_CONFIG = {
 
 
 def _ensure_notification_runtime_plist():
-    """rumps/AppKit 알림 표시자 이름이 "python" 이 아니라 AutoMeetingNote 로
+    """rumps/AppKit 알림 표시자 이름이 "python" 이 아니라 auto-meeting-note-v2 로
     뜨도록 Info.plist 를 두 위치에 모두 보정한다.
 
-    빌드된 앱은 Swift 런처가 `runtime/AutoMeetingNote` 심링크를 통해 Python 을
+    빌드된 앱은 Swift 런처가 `runtime/auto-meeting-note-v2` 심링크를 통해 Python 을
     실행하지만, Python 시작 시 sys.executable 은 심링크가 resolve 된 실제 경로
     (`.venv/bin/python3.11`)로 잡힌다. 그래서 sys.executable.parent 한 곳에만
     plist 를 두면 macOS 알림 시스템이 심링크 디렉터리에서 plist 를 못 찾아
@@ -202,7 +202,7 @@ def _resource_path() -> Path:
 
 
 def _find_notify_sender() -> Optional[Path]:
-    """`.app/Contents/MacOS/AutoMeetingNoteNotifySender` 헬퍼 경로 탐색.
+    """`.app/Contents/MacOS/auto-meeting-note-v2NotifySender` 헬퍼 경로 탐색.
 
     빌드된 앱 안에서는 리소스 경로의 `../MacOS/` 에 동봉된다.
     개발 환경(`python app.py`)에서는 helper 가 없으므로 None.
@@ -252,7 +252,7 @@ def load_config() -> dict:
 
 class AutoMeetingNoteApp(rumps.App):
     def __init__(self):
-        super().__init__("MN", quit_button=None)
+        super().__init__("MN2", quit_button=None)
 
         env_path = APP_SUPPORT_DIR / ".env"
         if not env_path.exists():
@@ -389,9 +389,9 @@ class AutoMeetingNoteApp(rumps.App):
 
     def _apple_speech_probe_path(self) -> Optional[Path]:
         candidates = [
-            _resource_path().parent / "MacOS" / "AutoMeetingNoteSpeechProbe",
-            Path(__file__).resolve().parent.parent / "MacOS" / "AutoMeetingNoteSpeechProbe",
-            Path(__file__).resolve().parent / "dist" / "AutoMeetingNote.app" / "Contents" / "MacOS" / "AutoMeetingNoteSpeechProbe",
+            _resource_path().parent / "MacOS" / "auto-meeting-note-v2SpeechProbe",
+            Path(__file__).resolve().parent.parent / "MacOS" / "auto-meeting-note-v2SpeechProbe",
+            Path(__file__).resolve().parent / "dist" / "auto-meeting-note-v2.app" / "Contents" / "MacOS" / "auto-meeting-note-v2SpeechProbe",
         ]
         for candidate in candidates:
             if candidate.exists():
@@ -450,7 +450,7 @@ class AutoMeetingNoteApp(rumps.App):
             return False, (
                 "음성 인식 권한이 거부되었습니다.\n\n"
                 "시스템 설정 → 개인 정보 보호 및 보안 → 음성 인식에서 "
-                "AutoMeetingNote를 허용한 뒤 다시 시도하세요."
+                "auto-meeting-note-v2를 허용한 뒤 다시 시도하세요."
             )
         if status == "restricted":
             return False, "이 Mac에서는 음성 인식 권한이 제한되어 Apple Speech를 사용할 수 없습니다."
@@ -540,13 +540,13 @@ class AutoMeetingNoteApp(rumps.App):
         rumps.Timer(_remove, 0.0).start()
 
     def _notify(self, title: str, subtitle: str = "", message: str = ""):
-        """가능하면 AutoMeetingNote 이름으로 네이티브 알림을 보낸다.
+        """가능하면 auto-meeting-note-v2 이름으로 네이티브 알림을 보낸다.
 
         macOS 14+/Tahoe(26.x) 에서 Python 자식 프로세스가 직접 송출하면
         알림 표시자가 "python" 으로 잡힌다. 이를 우회하기 위해 .app bundle
-        안에 동봉된 Swift helper executable(`AutoMeetingNoteNotifySender`)
+        안에 동봉된 Swift helper executable(`auto-meeting-note-v2NotifySender`)
         을 1순위로 호출한다. helper 는 .app bundle 컨텍스트에서 실행되므로
-        표시자 이름이 "AutoMeetingNote" 로 정상 잡힌다.
+        표시자 이름이 "auto-meeting-note-v2" 로 정상 잡힌다.
         """
         title = (title or APP_DISPLAY_NAME).strip() or APP_DISPLAY_NAME
         subtitle = (subtitle or "").strip()
@@ -881,12 +881,16 @@ class AutoMeetingNoteApp(rumps.App):
             self._sync_probe_include_flash = False
             return
 
-        flash_started_at = emit_screen_flash() if self._sync_probe_include_flash else None
-        click_started_at = play_probe_click(session.probe_audio_path)
-        session.record_probe_emission(
+        emission = emit_probe_signals(
+            session.probe_audio_path,
             include_flash=self._sync_probe_include_flash,
-            flash_started_at=flash_started_at,
-            click_started_at=click_started_at,
+        )
+        session.record_probe_emission(**emission)
+        logger.info(
+            "싱크 진단 프로브 발신: method=%s flash=%s click=%s",
+            emission.get("click_method"),
+            emission.get("flash_started_at"),
+            emission.get("click_started_at"),
         )
         self._sync_probe_session = None
         self._sync_probe_due_at = None
@@ -986,13 +990,13 @@ class AutoMeetingNoteApp(rumps.App):
 
                 self._hotkey_manager.update_binding(action, mod, keycode)
                 self._hotkey_items[action].title = f"{label}: {display}"
-                self._pending_app_title = "MN"
+                self._pending_app_title = "MN2"
 
                 logger.info("단축키 변경: %s → %s", action, display)
-                self._notify("AutoMeetingNote", "단축키 변경", f"{label}: {display}")
+                self._notify("auto-meeting-note-v2", "단축키 변경", f"{label}: {display}")
 
             def _on_cancel():
-                self._pending_app_title = "MN"
+                self._pending_app_title = "MN2"
 
             self._hotkey_manager.start_recording(_on_recorded, _on_cancel)
 
@@ -1092,7 +1096,7 @@ class AutoMeetingNoteApp(rumps.App):
             self.title = self._pending_app_title
             self._pending_app_title = None
         if self._reset_title_at is not None and time.time() >= self._reset_title_at:
-            self.title = "MN"
+            self.title = "MN2"
             self._reset_title_at = None
         self._emit_pending_sync_probe()
         if getattr(self, "_pipeline_running", False):
@@ -1251,7 +1255,7 @@ class AutoMeetingNoteApp(rumps.App):
             message=f"{purpose}에는 화면 녹화 권한이 필요합니다.\n\n"
                     f"{settings_message}"
                     "시스템 설정 → 개인 정보 보호 및 보안 → 화면 및 시스템 오디오 녹음\n"
-                    "에서 AutoMeetingNote를 허용한 후 앱을 재시작하세요.",
+                    "에서 auto-meeting-note-v2를 허용한 후 앱을 재시작하세요.",
         )
         return False
 
@@ -1326,7 +1330,7 @@ class AutoMeetingNoteApp(rumps.App):
             message=f"{purpose}에는 마이크 권한이 필요합니다.\n\n"
                     f"{settings_message}"
                     "시스템 설정 → 개인 정보 보호 및 보안 → 마이크\n"
-                    "에서 AutoMeetingNote를 허용한 후 다시 시도하세요.",
+                    "에서 auto-meeting-note-v2를 허용한 후 다시 시도하세요.",
         )
         return False
 
@@ -1385,7 +1389,7 @@ class AutoMeetingNoteApp(rumps.App):
                         self._audio_rec_item.set_callback(self._toggle_audio_rec)
                         self._pause_item.set_callback(None)
                     rumps.Timer(_revert, 0).start()
-                    self._notify("AutoMeetingNote", "화면 녹화 오류", str(e))
+                    self._notify("auto-meeting-note-v2", "화면 녹화 오류", str(e))
 
             self._spawn_bg_thread(_start_bg, name="start-screen-rec")
 
@@ -1490,7 +1494,7 @@ class AutoMeetingNoteApp(rumps.App):
             self._rec_timer.stop()
             self._rec_timer = None
         self._rec_indicator.stop()
-        self._pending_app_title = "MN"
+        self._pending_app_title = "MN2"
 
     def _on_recording_stopped(
         self,
@@ -1536,7 +1540,7 @@ class AutoMeetingNoteApp(rumps.App):
                         progress_callback=self._on_status,
                         mic_echo_cancel=bool(self._config.get("mic_echo_cancel", False)),
                     )
-                self._notify("AutoMeetingNote", "녹화 완료", mp4_path.name)
+                self._notify("auto-meeting-note-v2", "녹화 완료", mp4_path.name)
                 if sync_session is not None:
                     sync_session.preserve_artifact("final_video", mp4_path, group="final")
                     sync_session.finalize("completed")
@@ -1568,7 +1572,7 @@ class AutoMeetingNoteApp(rumps.App):
                     )
                 else:
                     final_path = output_path
-                self._notify("AutoMeetingNote", "녹음 완료", final_path.name)
+                self._notify("auto-meeting-note-v2", "녹음 완료", final_path.name)
                 if sync_session is not None:
                     sync_session.preserve_artifact("final_audio", Path(final_path), group="final")
                     sync_session.finalize("completed")
@@ -1795,7 +1799,7 @@ class AutoMeetingNoteApp(rumps.App):
 
 def main():
     logger.info("=" * 60)
-    logger.info("AutoMeetingNote 앱 시작")
+    logger.info("auto-meeting-note-v2 앱 시작")
     logger.info(
         "앱 정보: version=%s, resource_path=%s, app_file=%s",
         APP_VERSION,

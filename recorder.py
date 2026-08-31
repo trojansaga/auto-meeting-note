@@ -27,6 +27,26 @@ _BUILTIN_MIC_HINTS = (
 )
 _IPHONE_MIC_HINTS = ("iphone", "ipad", "continuity")
 
+# 오디오 병합 ffmpeg 프로세스 생성이 일시적 자원 부족(EAGAIN 등)으로 실패할 때의 재시도 정책.
+# 실측: 44분 녹화 종료 직후 posix_spawn 이 [Errno 35] Resource temporarily unavailable 로 실패해
+# 병합이 통째로 취소됐고, 영상만 남아 그 회의의 음성이 영구 유실됐다.
+_MERGE_SPAWN_RETRIES = 3
+_MERGE_SPAWN_RETRY_DELAY = 2.0
+
+
+def _last_stderr_lines(stderr: str, limit: int = 5) -> str:
+    """ffmpeg stderr 의 마지막 몇 줄만 추려 예외 메시지에 넣는다."""
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    return " / ".join(lines[-limit:]) if lines else "stderr 출력 없음"
+
+# 오디오 탭 첫 샘플 버퍼 도착을 기다리는 최대 시간 (_await_capture_anchor 참고)
+_AUDIO_ANCHOR_WAIT_SECONDS = 3.0
+
+# WAV sample 0 의 캡처 시각 후보를 정확한 순서대로. *_host_at 은 샘플 버퍼 PTS(host clock)
+# 기반이라 실측 오차 ~25ms, 콜백 도착 시각(time.time())은 탭 backlog 에 따라 0.1~1.5초까지 늦는다.
+_AUDIO_ANCHOR_ATTRS = ("first_sample_host_at", "first_sample_at", "started_at")
+_MIC_ANCHOR_ATTRS = ("mic_first_sample_host_at", "mic_first_sample_at", "mic_started_at")
+
 
 class Recorder:
     def __init__(self):
@@ -306,6 +326,82 @@ class Recorder:
         return ["-i", str(path)]
 
     @staticmethod
+    def _await_capture_anchor(capture, attr_name: str, timeout: float = _AUDIO_ANCHOR_WAIT_SECONDS) -> bool:
+        """첫 샘플 버퍼 도착 시각(anchor)이 채워질 때까지 기다린다.
+
+        SCStream 오디오 탭의 첫 버퍼는 startCapture 완료보다 한참 늦게 올 수 있다(실측 6ms ~ 2.19초).
+        그 전에 offset 을 계산하면 started_at 으로 폴백하는데, started_at 은 첫 샘플보다
+        0.9초까지 이를 수 있어 그만큼 오디오가 앞으로 당겨진다. 캡처는 이미 돌고 있으므로
+        여기서 기다려도 녹음 내용이 잘리지는 않는다.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if isinstance(getattr(capture, attr_name, None), (int, float)):
+                return True
+            time.sleep(0.01)
+        return isinstance(getattr(capture, attr_name, None), (int, float))
+
+    @staticmethod
+    def _run_merge_ffmpeg(cmd: list, mp4_path: Path):
+        """병합 ffmpeg 실행. 프로세스 생성이 일시적으로 실패하면 재시도한다.
+
+        긴 녹화 직후에는 스레드/프로세스 자원이 순간적으로 말라 posix_spawn 이
+        EAGAIN 으로 실패할 수 있다(실측 [Errno 35]). 이때 그대로 예외를 올리면
+        오디오가 병합되지 않은 영상만 남고 원본 WAV 는 사용자가 정리하면서
+        사라져 회의 음성이 영구 유실된다. 일시적 실패이므로 잠깐 쉬고 다시 띄운다.
+        """
+        last_error = None
+        for attempt in range(1, _MERGE_SPAWN_RETRIES + 1):
+            try:
+                return subprocess.run(cmd, capture_output=True, text=True)
+            except OSError as e:
+                last_error = e
+                if attempt >= _MERGE_SPAWN_RETRIES:
+                    break
+                logger.warning(
+                    "오디오 병합 프로세스 생성 실패 (시도 %d/%d, %s) — %.0f초 후 재시도: %s",
+                    attempt, _MERGE_SPAWN_RETRIES, mp4_path.name, _MERGE_SPAWN_RETRY_DELAY, e,
+                )
+                time.sleep(_MERGE_SPAWN_RETRY_DELAY)
+
+        raise RuntimeError(
+            f"오디오 병합 프로세스를 {_MERGE_SPAWN_RETRIES}회 시도했으나 실행하지 못했습니다: {last_error}. "
+            "영상 옆의 _sys.wav / _mic.wav 파일은 삭제하지 마세요 — 그 파일로 병합을 다시 시도할 수 있습니다."
+        ) from last_error
+
+    @staticmethod
+    def _first_number(source, *attr_names: str) -> Optional[float]:
+        for attr_name in attr_names:
+            value = getattr(source, attr_name, None)
+            if isinstance(value, (int, float)):
+                return float(value)
+        return None
+
+    @classmethod
+    def _screen_video_anchor(cls, screen_recorder, fallback: float) -> tuple[float, str]:
+        """mp4 의 첫 프레임(video pts 0)에 해당하는 wall clock 추정치.
+
+        active_segment_started_at (SCRecordingOutput recordingDidStart) 을 쓴다.
+        mp4 pts 0 은 recording output 이 처음 기록한 프레임이고, 그 콜백이 곧 그 시점이다.
+
+        stream_capture_started_at (SCStream startCapture 완료) 은 "스트림이 돌기 시작했다"는
+        뜻일 뿐 recording output 의 첫 기록보다 한참 이를 수 있다 — 실측에서 두 콜백 간격이
+        0.17~1.09초까지 벌어졌고, 프로브 플래시 프레임과 파일 길이로 역산한 pts 0 은 매번
+        recordingDidStart 쪽(±50ms)이었다. 앞쪽 앵커를 쓰면 그 간격만큼 오디오가 뒤로 밀린다.
+        """
+        capture_started = cls._first_number(screen_recorder, "stream_capture_started_at")
+        segment_started = cls._first_number(screen_recorder, "active_segment_started_at")
+
+        if segment_started is not None:
+            if capture_started is None or segment_started >= capture_started:
+                return segment_started, "active_segment_started_at"
+        if capture_started is not None:
+            return capture_started, "stream_capture_started_at"
+        if segment_started is not None:
+            return segment_started, "active_segment_started_at"
+        return fallback, "fallback"
+
+    @staticmethod
     def _offset_from_anchor(anchor: float, started_at: Optional[float]) -> float:
         if isinstance(started_at, (int, float)):
             return anchor - float(started_at)
@@ -335,23 +431,31 @@ class Recorder:
         mic_offset: float,
     ) -> None:
         sys_first_sample = getattr(sys_capture, "first_sample_at", None)
-        screen_capture_started = getattr(screen_writer, "capture_started_at", None)
-        screen_recording_started = getattr(screen_writer, "started_at", None)
+        sys_first_sample_host = getattr(sys_capture, "first_sample_host_at", None)
+        # ContinuousScreenRecorder / LiveScreenWriter 가 쓰는 속성명이 달라 둘 다 본다
+        screen_capture_started = self._first_number(
+            screen_writer, "stream_capture_started_at", "capture_started_at"
+        )
+        screen_recording_started = self._first_number(
+            screen_writer, "active_segment_started_at", "started_at"
+        )
         alt_first_sample_offset = None
         if isinstance(sys_first_sample, (int, float)):
             alt_first_sample_offset = screen_started_at - float(sys_first_sample)
 
         logger.info(
             "화면 녹화 싱크 로그: "
-            "sys.started_at=%s(%s), sys.first_sample_at=%s, "
-            "mic.started_at=%s, screen.capture_started_at=%s, screen.started_at=%s, "
+            "sys.started_at=%s(%s), sys.first_sample_at=%s, sys.first_sample_host_at=%s, "
+            "mic.started_at=%s, screen.capture_started_at=%s, screen.started_at=%s, screen.anchor=%s, "
             "sys_offset=%.3f(screen:%s-sys:%s), mic_offset=%.3f, alt_first_sample_offset=%s",
             self._format_debug_time(sys_started_at),
             sys_source,
             self._format_debug_time(sys_first_sample),
+            self._format_debug_time(sys_first_sample_host),
             self._format_debug_time(mic_started_at),
             self._format_debug_time(screen_capture_started),
             self._format_debug_time(screen_recording_started),
+            self._format_debug_time(screen_started_at),
             sys_offset,
             screen_source,
             sys_source,
@@ -365,9 +469,11 @@ class Recorder:
                     "sys.started_at": sys_started_at,
                     "sys.source": sys_source,
                     "sys.first_sample_at": sys_first_sample,
+                    "sys.first_sample_host_at": sys_first_sample_host,
                     "mic.started_at": mic_started_at,
                     "screen.capture_started_at": screen_capture_started,
                     "screen.started_at": screen_recording_started,
+                    "screen.anchor": screen_started_at,
                     "screen.source": screen_source,
                     "sys_offset": sys_offset,
                     "mic_offset": mic_offset,
@@ -481,12 +587,6 @@ class Recorder:
                 mic_output_path=mic_path if mic_enabled else None,
                 mic_device_spec=self._mic_device_index if mic_enabled else None,
             )
-            sys_audio_ready_time, sys_audio_source = self._capture_started_info(
-                sys_audio,
-                time.time(),
-                "first_sample_at",
-                "started_at",
-            )
             self._sys_audio = sys_audio
             self._audio_path = sys_path
             logger.info("시스템 오디오 캡처 시작: %s", sys_path.name)
@@ -504,23 +604,27 @@ class Recorder:
                 self._audio_path = None
                 raise
 
-            screen_start_time, screen_source = self._capture_started_info(
-                screen_recorder,
-                time.time(),
-                "stream_capture_started_at",
-                "active_segment_started_at",
-            )
+            screen_start_time, screen_source = self._screen_video_anchor(screen_recorder, time.time())
             self._screen_recorder = screen_recorder
             logger.info("화면 녹화 시작: %s", first_segment.name)
+
+            # 오디오 앵커는 화면 녹화 시작(블로킹 ~1초) 이후에 읽는다. 그 사이에 첫 오디오 버퍼가
+            # 도착하므로 보통 대기 없이 앵커를 얻고, 늦는 경우만 잠깐 기다린다.
+            if not self._await_capture_anchor(sys_audio, "first_sample_host_at"):
+                logger.warning("시스템 오디오 첫 샘플 PTS 를 얻지 못했습니다 — 콜백 도착 시각으로 폴백")
+            sys_audio_ready_time, sys_audio_source = self._capture_started_info(
+                sys_audio,
+                time.time(),
+                *_AUDIO_ANCHOR_ATTRS,
+            )
 
             # 3) 마이크 처리: SCStream에서 잡혔으면 그대로, 아니면 ffmpeg fallback
             self._using_stream_microphone = False
             if mic_enabled and getattr(sys_audio, "mic_capture_active", False):
-                self._mic_started_at = (
-                    getattr(sys_audio, "mic_first_sample_at", None)
-                    or getattr(sys_audio, "mic_started_at", None)
-                    or sys_audio_ready_time
-                )
+                self._await_capture_anchor(sys_audio, "mic_first_sample_host_at")
+                self._mic_started_at = self._first_number(sys_audio, *_MIC_ANCHOR_ATTRS)
+                if self._mic_started_at is None:
+                    self._mic_started_at = sys_audio_ready_time
                 self._mic_path = mic_path
                 self._using_stream_microphone = True
                 logger.info("마이크: SCStream에서 캡처됨 (stream microphone)")
@@ -545,18 +649,21 @@ class Recorder:
                 self._mic_path = None
                 self._mic_started_at = None
 
-            # 4) 싱크 anchor: screen_start_time (SCStream 캡처 시작 콜백 시각, mp4 video time 0에 가까움)
+            # 4) 싱크 anchor: screen_start_time (mp4 video time 0 추정치, _screen_video_anchor 참고)
             #    sys_audio_offset = screen_start_time - sys_audio_ready_time
             #    mic_offset = screen_start_time - mic_started_at - latency_correction
             self._audio_offset = self._offset_from_anchor(screen_start_time, sys_audio_ready_time)
             self._mic_audio_offset = self._mic_offset_from_anchor(screen_start_time)
-            logger.info(
-                "화면 녹화 시작 완료: screen_start=%.3f(%s) sys_started=%.3f(%s) mic_started=%.3f "
-                "audio_offset=%.3f mic_offset=%.3f",
-                screen_start_time, screen_source,
-                sys_audio_ready_time, sys_audio_source,
-                self._mic_started_at or 0.0,
-                self._audio_offset, self._mic_audio_offset,
+            self._log_screen_sync_debug(
+                sys_audio,
+                screen_recorder,
+                sys_audio_ready_time,
+                sys_audio_source,
+                self._mic_started_at,
+                screen_start_time,
+                screen_source,
+                self._audio_offset,
+                self._mic_audio_offset,
             )
 
             self._mode = "screen"
@@ -590,15 +697,19 @@ class Recorder:
                 mic_output_path=mic_path if mic_enabled else None,
                 mic_device_spec=self._mic_device_index if mic_enabled else None,
             )
+            self._await_capture_anchor(self._sys_audio, "first_sample_host_at")
             sys_audio_ready_time, _ = self._capture_started_info(
                 self._sys_audio,
                 time.time(),
-                "started_at",
+                *_AUDIO_ANCHOR_ATTRS,
             )
 
             self._using_stream_microphone = False
             if mic_enabled and getattr(self._sys_audio, "mic_capture_active", False):
-                self._mic_started_at = getattr(self._sys_audio, "mic_started_at", sys_audio_ready_time)
+                self._await_capture_anchor(self._sys_audio, "mic_first_sample_host_at")
+                self._mic_started_at = self._first_number(self._sys_audio, *_MIC_ANCHOR_ATTRS)
+                if self._mic_started_at is None:
+                    self._mic_started_at = sys_audio_ready_time
                 self._mic_path = mic_path
                 self._using_stream_microphone = True
             elif mic_enabled:
@@ -717,9 +828,6 @@ class Recorder:
                     mic_output_path=mic_path if self._mic_enabled else None,
                     mic_device_spec=self._mic_device_index if self._mic_enabled else None,
                 )
-                sys_audio_ready_time, _ = self._capture_started_info(
-                    sys_audio, time.time(), "first_sample_at", "started_at",
-                )
                 self._sys_audio = sys_audio
                 logger.info("재개: 시스템 오디오 시작: %s", sys_path.name)
 
@@ -730,14 +838,19 @@ class Recorder:
                 )
                 logger.info("재개: 화면 녹화 세그먼트 시작: %s", new_segment.name)
 
+                # 오디오 앵커는 세그먼트 시작 후에 읽는다 (start_screen_recording 과 동일한 이유)
+                self._await_capture_anchor(sys_audio, "first_sample_host_at")
+                sys_audio_ready_time, _ = self._capture_started_info(
+                    sys_audio, time.time(), *_AUDIO_ANCHOR_ATTRS,
+                )
+
                 # 3) 마이크: SCStream에서 잡혔으면 그대로, 아니면 ffmpeg fallback
                 self._using_stream_microphone = False
                 if self._mic_enabled and getattr(sys_audio, "mic_capture_active", False):
-                    self._mic_started_at = (
-                        getattr(sys_audio, "mic_first_sample_at", None)
-                        or getattr(sys_audio, "mic_started_at", None)
-                        or sys_audio_ready_time
-                    )
+                    self._await_capture_anchor(sys_audio, "mic_first_sample_host_at")
+                    self._mic_started_at = self._first_number(sys_audio, *_MIC_ANCHOR_ATTRS)
+                    if self._mic_started_at is None:
+                        self._mic_started_at = sys_audio_ready_time
                     self._mic_path = mic_path
                     self._using_stream_microphone = True
                 elif self._mic_enabled:
@@ -775,16 +888,20 @@ class Recorder:
                     mic_output_path=mic_path if self._mic_enabled else None,
                     mic_device_spec=self._mic_device_index if self._mic_enabled else None,
                 )
+                self._await_capture_anchor(self._sys_audio, "first_sample_host_at")
                 sys_audio_ready_time, _ = self._capture_started_info(
                     self._sys_audio,
                     time.time(),
-                    "started_at",
+                    *_AUDIO_ANCHOR_ATTRS,
                 )
                 logger.info("재개: 시스템 오디오 시작: %s", sys_path.name)
 
                 self._using_stream_microphone = False
                 if self._mic_enabled and getattr(self._sys_audio, "mic_capture_active", False):
-                    self._mic_started_at = getattr(self._sys_audio, "mic_started_at", sys_audio_ready_time)
+                    self._await_capture_anchor(self._sys_audio, "mic_first_sample_host_at")
+                    self._mic_started_at = self._first_number(self._sys_audio, *_MIC_ANCHOR_ATTRS)
+                    if self._mic_started_at is None:
+                        self._mic_started_at = sys_audio_ready_time
                     self._mic_path = mic_path
                     self._using_stream_microphone = True
                 elif self._mic_enabled:
@@ -1571,12 +1688,12 @@ class Recorder:
                 "-y", str(temp_path),
             ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = self._run_merge_ffmpeg(cmd, mp4_path)
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
             if stderr:
                 logger.error("오디오 병합 ffmpeg stderr:\n%s", stderr)
-            raise RuntimeError("오디오 병합 실패")
+            raise RuntimeError(f"오디오 병합 실패: {_last_stderr_lines(stderr)}")
 
         mp4_path.unlink(missing_ok=True)
         temp_path.rename(mp4_path)

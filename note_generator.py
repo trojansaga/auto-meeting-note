@@ -91,7 +91,25 @@ _INVALID_CHARS = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
 
 
 class _ClaudeCliError(Exception):
-    """claude CLI 호출 실패. generate_note의 재시도 루프에서만 사용하는 내부 예외."""
+    """claude CLI 호출 실패. generate_note의 재시도 루프에서만 사용하는 내부 예외.
+
+    retryable=False 이면 재시도해도 결과가 달라지지 않는 실패(인증 만료 등)라
+    재시도 루프가 즉시 중단한다.
+    """
+
+    def __init__(self, message: str, retryable: bool = True, guidance: Optional[str] = None):
+        super().__init__(message)
+        self.retryable = retryable
+        self.guidance = guidance
+
+
+# CLI가 stdout JSON 의 error 필드로 알려주는, 재시도가 무의미한 실패들
+_FATAL_CLI_ERRORS = {
+    "authentication_failed": (
+        "claude CLI 로그인이 만료되었습니다. 터미널에서 `claude` 를 실행한 뒤 "
+        "`/login` 으로 다시 로그인하고 회의록 생성을 재시도하세요."
+    ),
+}
 
 
 def find_claude_cli() -> Optional[str]:
@@ -190,6 +208,7 @@ def _run_claude_cli(
 
         result_text = None
         is_error = False
+        error_code = None
         received_chars = 0
 
         for line in proc.stdout:
@@ -204,6 +223,11 @@ def _run_claude_cli(
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
+
+            # CLI 는 인증 만료 같은 실패를 stderr 가 아니라 stdout JSON 의 error 필드로 알린다.
+            # 종료 코드만 보고 stderr 를 읽으면 빈 메시지가 되므로 여기서 코드를 잡아 둔다.
+            if isinstance(event.get("error"), str):
+                error_code = event["error"]
 
             event_type = event.get("type")
             if event_type == "stream_event":
@@ -235,17 +259,28 @@ def _run_claude_cli(
     if timed_out.is_set():
         raise _ClaudeCliError(f"claude CLI 응답 시간 초과 ({CLI_TIMEOUT_SECONDS}초)")
 
-    if proc.returncode != 0:
+    if proc.returncode != 0 or is_error:
         stderr_output = ""
         try:
             if proc.stderr is not None:
                 stderr_output = proc.stderr.read()
         except Exception:
             pass
-        raise _ClaudeCliError(f"claude CLI 종료 코드 {proc.returncode}: {stderr_output.strip()}")
 
-    if is_error:
-        raise _ClaudeCliError(f"claude CLI가 오류를 반환했습니다: {result_text}")
+        # 원인은 대개 stdout JSON 쪽에 있다(stderr 는 비어 있는 경우가 많다).
+        # 셋 중 실제로 값이 있는 것만 이어 붙여 빈 메시지가 나오지 않게 한다.
+        details = [
+            part.strip()
+            for part in (error_code, result_text, stderr_output)
+            if isinstance(part, str) and part.strip()
+        ]
+        reason = " | ".join(dict.fromkeys(details)) or "원인 정보 없음"
+
+        guidance = _FATAL_CLI_ERRORS.get(error_code or "")
+        message = f"claude CLI 실패 (종료 코드 {proc.returncode}): {reason}"
+        if guidance:
+            message = f"{message}\n{guidance}"
+        raise _ClaudeCliError(message, retryable=guidance is None, guidance=guidance)
 
     if not result_text:
         raise _ClaudeCliError("claude CLI가 빈 결과를 반환했습니다.")
@@ -313,6 +348,10 @@ def generate_note(
             raise
         except _ClaudeCliError as e:
             last_error = e
+            if not e.retryable:
+                # 인증 만료처럼 재시도해도 결과가 같은 실패 — 즉시 중단하고 조치 안내를 그대로 올린다
+                logger.error("claude CLI 호출 실패 (재시도 불가): %s", e)
+                raise RuntimeError(str(e)) from e
             if attempt < MAX_RETRIES:
                 _check_stop()
                 delay = BASE_DELAY ** attempt

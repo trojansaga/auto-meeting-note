@@ -21,7 +21,12 @@ class _FixedDateTime:
 class _FakeSystemAudioCapture:
     def __init__(self, started_at: float, mic_capture_active: bool = False):
         self.started_at = started_at
+        # 실제 캡처에서는 첫 샘플 버퍼 PTS 가 앵커로 쓰인다 (_AUDIO_ANCHOR_ATTRS)
+        self.first_sample_at = started_at
+        self.first_sample_host_at = started_at
         self.mic_started_at = started_at if mic_capture_active else None
+        self.mic_first_sample_at = started_at if mic_capture_active else None
+        self.mic_first_sample_host_at = started_at if mic_capture_active else None
         self.mic_capture_active = mic_capture_active
         self.output_path = None
         self.mic_output_path = None
@@ -82,6 +87,38 @@ class CaptureSyncTests(unittest.TestCase):
 
             self.assertAlmostEqual(recorder._audio_offset, 0.09, places=3)
             self.assertEqual(recorder._mic_audio_offset, 0.0)
+
+    def test_screen_mode_anchor_prefers_recording_did_start(self):
+        """영상 t=0 앵커는 recordingDidStart(active_segment_started_at)를 쓴다.
+
+        startCapture 완료는 recording output 의 첫 기록보다 한참 이를 수 있어(실측 0.17~1.09초)
+        그 앵커를 쓰면 간격만큼 오디오가 뒤로 밀린다.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_sys, fake_csr = _make_screen_mode_patches(tmpdir, sys_started_at=100.00, screen_started_at=100.20)
+            fake_csr.active_segment_started_at = 100.40
+
+            with patch("recorder.datetime", _FixedDateTime), patch(
+                "recorder.ContinuousScreenRecorder", return_value=fake_csr
+            ), patch("system_audio.SystemAudioCapture", return_value=fake_sys):
+                recorder = Recorder()
+                recorder.start_screen_recording(Path(tmpdir), mic_enabled=False)
+
+            self.assertAlmostEqual(recorder._audio_offset, 0.40, places=3)
+
+    def test_screen_mode_anchor_falls_back_when_segment_callback_missing(self):
+        """recordingDidStart 값이 없으면 startCapture 앵커로 되돌린다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_sys, fake_csr = _make_screen_mode_patches(tmpdir, sys_started_at=100.00, screen_started_at=100.20)
+            fake_csr.active_segment_started_at = None
+
+            with patch("recorder.datetime", _FixedDateTime), patch(
+                "recorder.ContinuousScreenRecorder", return_value=fake_csr
+            ), patch("system_audio.SystemAudioCapture", return_value=fake_sys):
+                recorder = Recorder()
+                recorder.start_screen_recording(Path(tmpdir), mic_enabled=False)
+
+            self.assertAlmostEqual(recorder._audio_offset, 0.20, places=3)
 
     def test_screen_mode_mic_latency_correction_applies(self):
         """화면 녹화 모드에서 mic_latency_correction이 mic_audio_offset에 반영된다."""
@@ -166,9 +203,9 @@ class CaptureSyncTests(unittest.TestCase):
                 recorder.start_screen_recording(Path(tmpdir), mic_enabled=False)
 
             joined = "\n".join(captured.output)
-            self.assertIn("화면 녹화 시작 완료", joined)
-            self.assertIn("screen_start=100.600", joined)
-            self.assertIn("sys_started=100.250", joined)
+            self.assertIn("화면 녹화 싱크 로그", joined)
+            self.assertIn("screen.anchor=100.600", joined)
+            self.assertIn("sys.started_at=100.250", joined)
 
     def test_merge_audio_into_mp4_uses_distinct_offsets_for_system_and_mic(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -209,6 +246,66 @@ class CaptureSyncTests(unittest.TestCase):
             mic_idx = cmd.index(str(mic_path))
             self.assertEqual(cmd[sys_idx - 3:sys_idx + 1], ["-ss", "0.300", "-i", str(sys_path)])
             self.assertEqual(cmd[mic_idx - 3:mic_idx + 1], ["-ss", "0.120", "-i", str(mic_path)])
+
+    def _merge_fixture(self, tmpdir):
+        tmpdir_path = Path(tmpdir)
+        mp4_path = tmpdir_path / "demo.mp4"
+        sys_path = tmpdir_path / "demo_sys.wav"
+        mp4_path.write_bytes(b"video")
+        sys_path.write_bytes(b"0" * 128)
+        return mp4_path, sys_path, tmpdir_path / "demo_mux.mp4"
+
+    def test_merge_retries_when_process_spawn_temporarily_fails(self):
+        """프로세스 생성이 일시적 자원 부족으로 실패하면 재시도한다.
+
+        회귀 방지: 실측에서 44분 녹화 종료 직후 posix_spawn 이
+        [Errno 35] Resource temporarily unavailable 로 실패해 병합이 통째로 취소됐고,
+        오디오 없는 영상만 남아 그 회의의 음성이 영구 유실됐다.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mp4_path, sys_path, temp_path = self._merge_fixture(tmpdir)
+
+            class _Result:
+                returncode = 0
+                stderr = ""
+
+            calls = []
+
+            def _fake_run(cmd, capture_output=False, text=False):
+                calls.append(cmd)
+                if len(calls) == 1:
+                    raise BlockingIOError(35, "Resource temporarily unavailable")
+                temp_path.write_bytes(b"muxed")
+                return _Result()
+
+            with patch("recorder.find_ffmpeg", return_value="/usr/bin/ffmpeg"), \
+                 patch("recorder.subprocess.run", side_effect=_fake_run), \
+                 patch("recorder.time.sleep"):
+                recorder = Recorder()
+                result = recorder.merge_audio_into_mp4(mp4_path, sys_path, audio_offset=0.30)
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(result, mp4_path)
+
+    def test_merge_spawn_failure_message_tells_user_to_keep_wav(self):
+        """끝내 실패하면 원본 WAV 를 지우지 말라고 알린다 (병합 재시도의 유일한 근거)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mp4_path, sys_path, _ = self._merge_fixture(tmpdir)
+
+            def _always_eagain(cmd, capture_output=False, text=False):
+                raise BlockingIOError(35, "Resource temporarily unavailable")
+
+            with patch("recorder.find_ffmpeg", return_value="/usr/bin/ffmpeg"), \
+                 patch("recorder.subprocess.run", side_effect=_always_eagain), \
+                 patch("recorder.time.sleep"):
+                recorder = Recorder()
+                with self.assertRaises(RuntimeError) as ctx:
+                    recorder.merge_audio_into_mp4(mp4_path, sys_path, audio_offset=0.30)
+
+            message = str(ctx.exception)
+            self.assertIn("_sys.wav", message)
+            self.assertIn("삭제하지 마세요", message)
+            self.assertTrue(sys_path.exists(), "실패 시 원본 WAV 는 남아 있어야 한다")
 
     def test_screen_mode_mic_path_set_when_enabled(self):
         """mic_enabled=True면 _mic_path가 설정된다."""

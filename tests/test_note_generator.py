@@ -313,6 +313,88 @@ class GenerateNoteTests(unittest.TestCase):
 
             self.assertEqual(mock_popen.call_count, note_generator.MAX_RETRIES)
 
+    def _auth_failure_lines(self):
+        """실제 claude CLI 가 로그인 만료 시 stdout 으로 내보내는 형태.
+
+        오류는 stderr 가 아니라 stdout JSON 의 error/result 필드에만 실려 오고,
+        프로세스는 종료 코드 1 로 끝난다.
+        """
+        return [
+            json.dumps({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "Not logged in · Please run /login"}]},
+                "error": "authentication_failed",
+                "is_api_error_message": True,
+            }),
+            json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "result": "Not logged in · Please run /login",
+            }),
+        ]
+
+    def test_auth_failure_message_includes_cli_reason_not_empty_stderr(self):
+        """종료 코드가 0이 아니어도 stdout 에 실려 온 원인을 버리지 않는다.
+
+        회귀 방지: 예전에는 종료 코드 분기가 먼저 걸려 빈 stderr 만 보고했고,
+        로그에 `claude CLI 종료 코드 1: ` 뒤가 비어 원인을 알 수 없었다.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            script, out = self._setup_script(tmp)
+
+            with patch.object(note_generator, "find_claude_cli", return_value="/fake/claude"), \
+                 patch.object(
+                     note_generator.subprocess, "Popen",
+                     side_effect=[FakeProcess(stdout_lines=self._auth_failure_lines(), returncode=1)],
+                 ), \
+                 patch.object(note_generator.time, "sleep"):
+                with self.assertRaises(RuntimeError) as ctx:
+                    note_generator.generate_note(str(script), str(out), "demo.mp4", "2026-05-04")
+
+            message = str(ctx.exception)
+            self.assertIn("authentication_failed", message)
+            self.assertIn("Not logged in", message)
+            self.assertIn("/login", message)
+
+    def test_auth_failure_does_not_retry(self):
+        """인증 만료는 재시도해도 결과가 같으므로 CLI 를 한 번만 호출한다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            script, out = self._setup_script(tmp)
+
+            fake_procs = [
+                FakeProcess(stdout_lines=self._auth_failure_lines(), returncode=1)
+                for _ in range(note_generator.MAX_RETRIES)
+            ]
+
+            with patch.object(note_generator, "find_claude_cli", return_value="/fake/claude"), \
+                 patch.object(note_generator.subprocess, "Popen", side_effect=fake_procs) as mock_popen, \
+                 patch.object(note_generator.time, "sleep") as mock_sleep:
+                with self.assertRaises(RuntimeError):
+                    note_generator.generate_note(str(script), str(out), "demo.mp4", "2026-05-04")
+
+            self.assertEqual(mock_popen.call_count, 1)
+            mock_sleep.assert_not_called()
+            self.assertFalse(out.exists())
+
+    def test_failure_without_any_detail_still_reports_something(self):
+        """stdout·stderr 모두 비어도 빈 메시지를 만들지 않는다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            script, out = self._setup_script(tmp)
+
+            fake_procs = [
+                FakeProcess(stdout_lines=[], returncode=1, stderr_text="")
+                for _ in range(note_generator.MAX_RETRIES)
+            ]
+
+            with patch.object(note_generator, "find_claude_cli", return_value="/fake/claude"), \
+                 patch.object(note_generator.subprocess, "Popen", side_effect=fake_procs), \
+                 patch.object(note_generator.time, "sleep"):
+                with self.assertRaises(RuntimeError) as ctx:
+                    note_generator.generate_note(str(script), str(out), "demo.mp4", "2026-05-04")
+
+            self.assertIn("원인 정보 없음", str(ctx.exception))
+
     def test_generate_note_succeeds_after_transient_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             script, out = self._setup_script(tmp)

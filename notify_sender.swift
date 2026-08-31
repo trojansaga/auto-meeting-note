@@ -2,11 +2,11 @@
 //
 // Python 측의 rumps/AppKit 호출은 macOS 14+ 에서 process executable 이름이
 // 그대로 알림 표시자(예: "python")로 노출되는 문제가 있다. 이 helper 는
-// AutoMeetingNote.app/Contents/MacOS/ 에 위치한 정식 .app bundle executable
-// 이므로 알림 송출 시 표시자가 "AutoMeetingNote" 로 잡힌다.
+// auto-meeting-note-v2.app/Contents/MacOS/ 에 위치한 정식 .app bundle executable
+// 이므로 알림 송출 시 표시자가 "auto-meeting-note-v2" 로 잡힌다.
 //
 // 사용:
-//   AutoMeetingNoteNotifySender --title=<title> [--subtitle=<sub>] --message=<msg>
+//   auto-meeting-note-v2NotifySender --title=<title> [--subtitle=<sub>] --message=<msg>
 //
 // 1순위: UserNotifications 프레임워크(UNUserNotificationCenter) — macOS 26
 //        포함 최신 권장 API. 권한 미허용 시 NSUserNotification 으로 폴백.
@@ -18,7 +18,7 @@ import Foundation
 import UserNotifications
 
 func parseArgs() -> (title: String, subtitle: String, message: String) {
-    var title = "AutoMeetingNote"
+    var title = "auto-meeting-note-v2"
     var subtitle = ""
     var message = ""
     for arg in CommandLine.arguments.dropFirst() {

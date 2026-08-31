@@ -28,7 +28,7 @@ DEFAULT_WHISPER_QUANT = "4bit"
 DEFAULT_QWEN_MODEL = "Qwen/Qwen3-ASR-0.6B"
 DEFAULT_QWEN_CHUNK_SECONDS = 600
 DEFAULT_APPLE_SPEECH_MODEL = "speech_transcriber"
-APPLE_SPEECH_BINARY_NAME = "AutoMeetingNoteAppleSpeech"
+APPLE_SPEECH_BINARY_NAME = "auto-meeting-note-v2AppleSpeech"
 
 STT_BACKENDS = {
     "whisper": "Whisper (MLX)",
@@ -125,7 +125,7 @@ def _macos_major_version() -> Optional[int]:
 
 
 def _runtime_dir() -> Path:
-    path = Path.home() / "Library" / "Application Support" / "AutoMeetingNote" / "runtime"
+    path = Path.home() / "Library" / "Application Support" / "auto-meeting-note-v2" / "runtime"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -207,7 +207,7 @@ def _ensure_apple_speech_binary() -> Path:
         return binary
 
     env = os.environ.copy()
-    swift_cache_dir = Path(env.get("TMPDIR", "/tmp")) / "AutoMeetingNoteSwiftModuleCache"
+    swift_cache_dir = Path(env.get("TMPDIR", "/tmp")) / "auto-meeting-note-v2SwiftModuleCache"
     swift_cache_dir.mkdir(parents=True, exist_ok=True)
     env["SWIFT_MODULECACHE_PATH"] = str(swift_cache_dir)
     env["CLANG_MODULE_CACHE_PATH"] = str(swift_cache_dir)

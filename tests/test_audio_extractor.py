@@ -124,6 +124,48 @@ class ExtractAudioTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "exit code 1"):
                     audio_extractor.extract_audio(str(mp4), str(out))
 
+    def test_extract_audio_includes_ffmpeg_stderr_in_error(self):
+        """종료 코드만 보고하면 원인을 알 수 없으므로 stderr 마지막 줄을 함께 올린다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            mp4, out = self._setup_input(tmp)
+            fake_process = _FakeProcess(
+                ["Invalid data found when processing input"], returncode=1
+            )
+
+            with patch.object(audio_extractor, "find_ffmpeg", return_value="/opt/ffmpeg"), \
+                 patch.object(audio_extractor.subprocess, "Popen", return_value=fake_process):
+                with self.assertRaises(RuntimeError) as ctx:
+                    audio_extractor.extract_audio(str(mp4), str(out))
+
+            self.assertIn("Invalid data found", str(ctx.exception))
+
+    def test_extract_audio_raises_no_audio_track_error_for_video_only_input(self):
+        """오디오 병합이 실패해 영상만 남은 mp4 는 원인을 명확히 알려야 한다.
+
+        회귀 방지: 예전에는 `ffmpeg 실행 실패 (exit code 234)` 만 남아
+        사용자가 원인을 알 수 없었다. 아래 stderr 는 실제 ffmpeg 출력이다.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            mp4, out = self._setup_input(tmp)
+            fake_process = _FakeProcess(
+                [
+                    "Stream #0:0[0x1](und): Video: h264 (Main) (avc1 / 0x31637661), 1134x736",
+                    "[out#0/wav @ 0x7d101c240] Output file does not contain any stream",
+                    "Error opening output file /tmp/x.wav.",
+                    "Error opening output files: Invalid argument",
+                ],
+                returncode=234,
+            )
+
+            with patch.object(audio_extractor, "find_ffmpeg", return_value="/opt/ffmpeg"), \
+                 patch.object(audio_extractor.subprocess, "Popen", return_value=fake_process):
+                with self.assertRaises(audio_extractor.NoAudioTrackError) as ctx:
+                    audio_extractor.extract_audio(str(mp4), str(out))
+
+            message = str(ctx.exception)
+            self.assertIn("오디오 트랙이 없습니다", message)
+            self.assertIn("_sys.wav", message)
+
     def test_extract_audio_cancels_on_stop_event_and_removes_partial_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             mp4, out = self._setup_input(tmp)

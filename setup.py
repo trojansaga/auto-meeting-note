@@ -14,9 +14,9 @@ OPTIONS = {
     'argv_emulation': False,
     'plist': {
         'LSUIElement': True,
-        'CFBundleName': 'AutoMeetingNote',
-        'CFBundleDisplayName': 'AutoMeetingNote',
-        'CFBundleIdentifier': 'com.automeetingnote.app',
+        'CFBundleName': 'auto-meeting-note-v2',
+        'CFBundleDisplayName': 'auto-meeting-note-v2',
+        'CFBundleIdentifier': 'com.automeetingnote.v2',
         'CFBundleVersion': APP_VERSION,
         'CFBundleShortVersionString': APP_VERSION,
         'NSMicrophoneUsageDescription': 'Audio processing for meeting transcription',
@@ -56,7 +56,7 @@ OPTIONS = {
 
 setup(
     app=APP,
-    name='AutoMeetingNote',
+    name='auto-meeting-note-v2',
     version=APP_VERSION,
     data_files=DATA_FILES,
     options={'py2app': OPTIONS},

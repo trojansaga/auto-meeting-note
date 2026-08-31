@@ -77,20 +77,21 @@ class SyncDiagnosticModeTests(unittest.TestCase):
         instance._sync_probe_due_at = 10.0
         instance._sync_probe_include_flash = True
 
+        emission = {
+            "include_flash": True,
+            "flash_started_at": 21.5,
+            "click_started_at": 21.5,
+            "click_method": "avaudioplayer_scheduled",
+            "click_timing_reliable": True,
+            "lead_seconds": 0.45,
+        }
         with patch("app.time.time", return_value=11.0), patch(
-            "app.emit_screen_flash", return_value=21.5
-        ) as flash_mock, patch(
-            "app.play_probe_click", return_value=21.7
-        ) as click_mock:
+            "app.emit_probe_signals", return_value=emission
+        ) as emit_mock:
             instance._flush_ui(None)
 
-        flash_mock.assert_called_once_with()
-        click_mock.assert_called_once_with(fake_session.probe_audio_path)
-        fake_session.record_probe_emission.assert_called_once_with(
-            include_flash=True,
-            flash_started_at=21.5,
-            click_started_at=21.7,
-        )
+        emit_mock.assert_called_once_with(fake_session.probe_audio_path, include_flash=True)
+        fake_session.record_probe_emission.assert_called_once_with(**emission)
         self.assertIsNone(instance._sync_probe_session)
         self.assertIsNone(instance._sync_probe_due_at)
 

@@ -17,6 +17,17 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+PROBE_SAMPLE_RATE = 48000
+PROBE_PULSE_DURATION = 0.016
+# 3연타 패턴. 단발 클릭이면 초반 잡음/키보드 소리에 오검출되므로 간격 자체를 지문으로 쓴다.
+PROBE_PULSES = (
+    (0.000, 2200.0),
+    (0.080, 2600.0),
+    (0.160, 2200.0),
+)
+PROBE_TOTAL_SECONDS = 0.28
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -82,13 +93,9 @@ class SyncDiagnosticSession:
         )
 
     def _write_probe_audio(self) -> None:
-        sample_rate = 48000
-        total_frames = int(sample_rate * 0.28)
-        pulses = (
-            (0.000, 0.016, 2200.0),
-            (0.080, 0.016, 2600.0),
-            (0.160, 0.016, 2200.0),
-        )
+        sample_rate = PROBE_SAMPLE_RATE
+        total_frames = int(sample_rate * PROBE_TOTAL_SECONDS)
+        duration = PROBE_PULSE_DURATION
         with wave.open(str(self.probe_audio_path), "wb") as wav_file:
             wav_file.setnchannels(1)
             wav_file.setsampwidth(2)
@@ -96,7 +103,7 @@ class SyncDiagnosticSession:
             for frame_idx in range(total_frames):
                 t = frame_idx / sample_rate
                 sample = 0.0
-                for start, duration, freq in pulses:
+                for start, freq in PROBE_PULSES:
                     if start <= t < (start + duration):
                         ramp = min((t - start) / 0.002, 1.0, ((start + duration) - t) / 0.002)
                         sample += math.sin(2.0 * math.pi * freq * (t - start)) * ramp * 0.8
@@ -108,7 +115,7 @@ class SyncDiagnosticSession:
         readme.write_text(
             "\n".join(
                 [
-                    "AutoMeetingNote Sync Diagnostic Session",
+                    "auto-meeting-note-v2 Sync Diagnostic Session",
                     "",
                     "이 폴더에는 녹화 직후 보존된 raw/final 산출물과 싱크 메타데이터가 들어 있습니다.",
                     "마이크 경로를 진단하려면 테스트 중 헤드폰 대신 스피커 출력으로 재생하세요.",
@@ -128,22 +135,10 @@ class SyncDiagnosticSession:
             self._metadata.setdefault("runtime", {}).update(_json_safe(payload))
             self._persist()
 
-    def record_probe_emission(
-        self,
-        *,
-        include_flash: bool,
-        flash_started_at: Optional[float],
-        click_started_at: Optional[float],
-    ) -> None:
+    def record_probe_emission(self, **payload) -> None:
         with self._lock:
-            self._metadata["probe"].update(
-                {
-                    "include_flash": bool(include_flash),
-                    "flash_started_at": flash_started_at,
-                    "click_started_at": click_started_at,
-                    "emitted_at": _utc_now(),
-                }
-            )
+            self._metadata["probe"].update(_json_safe(payload))
+            self._metadata["probe"]["emitted_at"] = _utc_now()
             self._persist()
 
     def record_sync_snapshot(self, stage: str, payload: dict) -> None:
@@ -202,42 +197,84 @@ class SyncDiagnosticSession:
             self._persist()
 
 
-def emit_screen_flash(duration_seconds: float = 0.18) -> Optional[float]:
+PROBE_LEAD_SECONDS = 0.45
+
+# AVAudioPlayer 는 재생이 끝나기 전에 GC 되면 소리가 잘리므로 참조를 붙잡아 둔다.
+_active_probe_players: list = []
+
+
+def _prepare_flash_windows() -> list:
+    """플래시 창을 alpha=0 으로 미리 띄워 둔다. 창 생성 비용(수십 ms)을 예약 시각 전에 털어내고,
+    실제 발광은 alphaValue 변경 한 번으로 끝내기 위한 준비 단계."""
+    from AppKit import NSBackingStoreBuffered, NSColor, NSScreen, NSWindow, NSWindowStyleMaskBorderless
+
+    windows = []
+    for screen in NSScreen.screens():
+        window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            screen.frame(),
+            NSWindowStyleMaskBorderless,
+            NSBackingStoreBuffered,
+            False,
+        )
+        window.setOpaque_(False)
+        window.setAlphaValue_(0.0)
+        window.setBackgroundColor_(NSColor.whiteColor())
+        window.setIgnoresMouseEvents_(True)
+        window.setLevel_(2000)
+        window.orderFrontRegardless()
+        windows.append(window)
+    return windows
+
+
+def _close_flash_windows_later(windows: list, duration_seconds: float) -> None:
+    import rumps
+
+    def _close(timer):
+        timer.stop()
+        for window in windows:
+            window.orderOut_(None)
+
+    rumps.Timer(_close, duration_seconds).start()
+
+
+def _wait_until(target: float) -> None:
+    remaining = target - time.time()
+    if remaining > 0.02:
+        time.sleep(remaining - 0.02)
+    while time.time() < target:  # 마지막 20ms 는 스핀으로 맞춘다
+        pass
+
+
+def _schedule_probe_click(probe_audio_path: Path, lead_seconds: float) -> tuple[Optional[float], str]:
+    """클릭을 lead_seconds 뒤에 예약 재생하고 실제 출력이 시작될 시각을 반환한다.
+
+    afplay 를 그때그때 spawn 하면 프로세스 생성 + 오디오 디바이스 워밍업 지연(실측 0.5~0.9초,
+    실행마다 편차 큼)이 타임스탬프에 그대로 섞여 들어가 진단이 "오디오가 1초 늦다"는 잘못된
+    결론을 낸다. AVAudioPlayer.playAtTime: 은 디바이스 클럭 기준 예약이라 그 지연이 빠진다.
+    """
     try:
-        import rumps
-        from AppKit import NSBackingStoreBuffered, NSColor, NSScreen, NSWindow, NSWindowStyleMaskBorderless
+        from AVFoundation import AVAudioPlayer
+        from Foundation import NSURL
 
-        windows = []
-        for screen in NSScreen.screens():
-            frame = screen.frame()
-            window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                frame,
-                NSWindowStyleMaskBorderless,
-                NSBackingStoreBuffered,
-                False,
-            )
-            window.setOpaque_(True)
-            window.setBackgroundColor_(NSColor.whiteColor())
-            window.setIgnoresMouseEvents_(True)
-            window.setLevel_(2000)
-            window.orderFrontRegardless()
-            windows.append(window)
+        url = NSURL.fileURLWithPath_(str(probe_audio_path))
+        player, error = AVAudioPlayer.alloc().initWithContentsOfURL_error_(url, None)
+        if player is None:
+            raise RuntimeError(f"AVAudioPlayer 생성 실패: {error}")
+        if not player.prepareToPlay():
+            raise RuntimeError("AVAudioPlayer prepareToPlay 실패")
 
-        flashed_at = time.time()
+        wall_before = time.time()
+        device_now = player.deviceCurrentTime()
+        wall_after = time.time()
+        if not player.playAtTime_(device_now + lead_seconds):
+            raise RuntimeError("AVAudioPlayer playAtTime 실패")
 
-        def _close(timer):
-            timer.stop()
-            for window in windows:
-                window.orderOut_(None)
-
-        rumps.Timer(_close, duration_seconds).start()
-        return flashed_at
+        _active_probe_players[:] = [p for p in _active_probe_players if p.isPlaying()]
+        _active_probe_players.append(player)
+        return (wall_before + wall_after) / 2.0 + lead_seconds, "avaudioplayer_scheduled"
     except Exception as exc:
-        logger.warning("화면 플래시 표시 실패: %s", exc)
-        return None
+        logger.warning("클릭 예약 재생 실패, afplay 폴백 (타임스탬프 신뢰 불가): %s", exc)
 
-
-def play_probe_click(probe_audio_path: Path) -> Optional[float]:
     try:
         started_at = time.time()
         subprocess.Popen(
@@ -245,10 +282,59 @@ def play_probe_click(probe_audio_path: Path) -> Optional[float]:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return started_at
+        return started_at, "afplay"
     except Exception as exc:
         logger.warning("진단 클릭 재생 실패: %s", exc)
-        return None
+        return None, "failed"
+
+
+def emit_probe_signals(
+    probe_audio_path: Path,
+    include_flash: bool = True,
+    duration_seconds: float = 0.18,
+    lead_seconds: float = PROBE_LEAD_SECONDS,
+) -> dict:
+    """클릭과 화면 플래시를 같은 절대 시각에 내보내고 각 신호의 실제 발생 시각을 반환한다.
+
+    메인 스레드를 lead_seconds 동안 붙잡으므로 싱크 진단 모드에서만 호출한다.
+    """
+    windows = []
+    if include_flash:
+        try:
+            windows = _prepare_flash_windows()
+        except Exception as exc:
+            logger.warning("화면 플래시 준비 실패: %s", exc)
+
+    click_started_at, click_method = _schedule_probe_click(probe_audio_path, lead_seconds)
+    reliable = click_method == "avaudioplayer_scheduled"
+
+    flash_started_at = None
+    if windows:
+        try:
+            if reliable and click_started_at is not None:
+                _wait_until(click_started_at)
+            # windows[0] 은 메뉴바가 있는 주 디스플레이 = 녹화 대상 화면. 그 창만 먼저 켜고
+            # 바로 시각을 찍는다. 창 전부를 켠 뒤 찍으면 창당 window server 왕복이 쌓여
+            # 타임스탬프가 늦어진다(2화면 실측 72ms — 허용치 80ms 를 거의 다 먹는다).
+            windows[0].setAlphaValue_(1.0)
+            flash_started_at = time.time()
+            for window in windows[1:]:
+                window.setAlphaValue_(1.0)
+            _close_flash_windows_later(windows, duration_seconds)
+        except Exception as exc:
+            logger.warning("화면 플래시 표시 실패: %s", exc)
+            for window in windows:
+                window.orderOut_(None)
+            flash_started_at = None
+
+    return {
+        "include_flash": bool(include_flash),
+        "flash_started_at": flash_started_at,
+        "click_started_at": click_started_at,
+        "click_method": click_method,
+        "click_timing_reliable": reliable,
+        "lead_seconds": lead_seconds,
+    }
 
 
 def _read_wav_envelope(path: Path, max_seconds: float = 8.0) -> tuple[list[float], int]:
@@ -320,7 +406,17 @@ def _read_wav_envelope(path: Path, max_seconds: float = 8.0) -> tuple[list[float
     return envelope, sample_rate
 
 
-def detect_audio_onset(path: Path) -> Optional[float]:
+def detect_audio_onset(
+    path: Path,
+    expected_near: Optional[float] = None,
+    search_radius: float = 1.0,
+) -> Optional[float]:
+    """프로브 클릭(3연타)이 시작되는 시각을 초 단위로 돌려준다. 못 찾으면 None.
+
+    expected_near 를 주면 그 시각 ±search_radius 안에서만 찾는다. 마이크처럼 SNR 이 낮은
+    트랙에서 다른 구간의 잡음을 클릭으로 오검출하지 않게 하는 용도로, 캡처 시작 시각 차이가
+    1초를 넘지는 않는다는 물리적 제약을 쓴다.
+    """
     try:
         envelope, sample_rate = _read_wav_envelope(path)
     except Exception as exc:
@@ -330,27 +426,73 @@ def detect_audio_onset(path: Path) -> Optional[float]:
     if not envelope:
         return None
 
-    peak = max(envelope)
-    if peak < 1e-6:
+    if max(envelope) < 1e-6:
         return None
-    quiet_window = envelope[: min(len(envelope), max(sample_rate // 20, 1))]
-    quiet_floor = min(quiet_window) if quiet_window else 0.0
-    if quiet_floor <= 1e-6 and peak >= 0.02:
-        return 0.0
-    sorted_env = sorted(envelope)
-    baseline = sorted_env[max(0, len(sorted_env) // 10)]
-    peak = max(envelope)
-    threshold = max(baseline * 6.0, peak * 0.20, 0.01)
-    step = max(sample_rate // 200, 1)  # 5ms
 
+    # 5ms 블록 평균으로 다운샘플
+    step = max(sample_rate // 200, 1)
+    blocks: list[float] = []
     for idx in range(0, len(envelope), step):
         window = envelope[idx:idx + step]
         if not window:
             break
-        level = sum(window) / len(window)
-        if level >= threshold:
-            return idx / sample_rate
-    return None
+        blocks.append(sum(window) / len(window))
+    if not blocks:
+        return None
+
+    return _match_probe_pattern(blocks, step / sample_rate, expected_near, search_radius)
+
+
+def _match_probe_pattern(
+    blocks: list[float],
+    block_seconds: float,
+    expected_near: Optional[float] = None,
+    search_radius: float = 1.0,
+) -> Optional[float]:
+    """프로브 3연타 간격을 정합 필터로 찾아 첫 펄스 시각을 돌려준다.
+
+    단순 threshold 로는 마이크 트랙의 초반 잡음(키보드/책상 소리)을 클릭으로 오검출한다
+    (실측: 진단 세션에서 실제 1.93초 클릭 대신 0.18초를 집어냄). 펄스 3개의 간격은
+    주변 소음이 우연히 만들지 않는 지문이라 신호 대비 잡음이 낮은 마이크에서도 버틴다.
+    """
+    if not blocks:
+        return None
+    pulse_blocks = max(1, int(round(PROBE_PULSE_DURATION / block_seconds)))
+    template = [0.0] * (int(round(PROBE_PULSES[-1][0] / block_seconds)) + pulse_blocks)
+    for start, _freq in PROBE_PULSES:
+        head = int(round(start / block_seconds))
+        for offset in range(pulse_blocks):
+            if head + offset < len(template):
+                template[head + offset] = 1.0
+    if len(blocks) < len(template) + 2:
+        return None
+
+    mean = sum(template) / len(template)
+    template = [value - mean for value in template]
+
+    scores = []
+    for start in range(len(blocks) - len(template) + 1):
+        scores.append(sum(t * blocks[start + idx] for idx, t in enumerate(template)))
+
+    lower, upper = 0, len(scores) - 1
+    if expected_near is not None:
+        lower = max(0, int((expected_near - search_radius) / block_seconds))
+        upper = min(len(scores) - 1, int((expected_near + search_radius) / block_seconds))
+        if lower > upper:
+            return None
+
+    best_idx = max(range(lower, upper + 1), key=scores.__getitem__)
+    best = scores[best_idx]
+    if best <= 0:
+        return None
+    # 잡음 구간 대비 충분히 튀는지 확인 (패턴이 없는 파일에서 엉뚱한 위치를 고르지 않도록).
+    # 잡음 기준은 찾은 패턴 자체를 제외한 구간에서, 탐색 창을 좁혀도 흔들리지 않게 전체에서 잡는다.
+    outside = [score for idx, score in enumerate(scores) if abs(idx - best_idx) >= len(template)]
+    if outside:
+        noise = sorted(outside)[int(len(outside) * 0.9)]
+        if noise > 0 and best < noise * 1.8:
+            return None
+    return best_idx * block_seconds
 
 
 def detect_video_flash(path: Path) -> Optional[float]:
@@ -420,57 +562,137 @@ def detect_video_flash(path: Path) -> Optional[float]:
         metadata_file.unlink(missing_ok=True)
 
 
-def infer_sync_cause(measurements: dict, tolerance: float = 0.08) -> dict:
+def _probe_emission_skew(probe: Optional[dict]) -> float:
+    """클릭 발생 시각 - 플래시 발생 시각. 두 신호를 같은 시각에 쏘지 못한 만큼은
+    싱크 오차가 아니라 프로브 자체의 편차이므로 측정값에서 빼 준다."""
+    if not probe:
+        return 0.0
+    click_at = probe.get("click_started_at")
+    flash_at = probe.get("flash_started_at")
+    if isinstance(click_at, (int, float)) and isinstance(flash_at, (int, float)):
+        return float(click_at) - float(flash_at)
+    return 0.0
+
+
+def infer_sync_cause(
+    measurements: dict,
+    tolerance: float = 0.08,
+    probe: Optional[dict] = None,
+    screen_snapshot: Optional[dict] = None,
+) -> dict:
     raw_video = measurements.get("raw_video_flash")
     raw_system = measurements.get("raw_system_click")
     raw_mic = measurements.get("raw_mic_click")
     final_video = measurements.get("final_video_flash")
     final_mix = measurements.get("final_mixed_click")
 
-    raw_system_delta = (raw_system - raw_video) if raw_system is not None and raw_video is not None else None
-    raw_mic_delta = (raw_mic - raw_video) if raw_mic is not None and raw_video is not None else None
-    final_delta = (final_mix - final_video) if final_mix is not None and final_video is not None else None
-
-    if raw_mic_delta is not None and abs(raw_mic_delta) > tolerance and (
-        raw_system_delta is None or abs(raw_system_delta) <= tolerance
-    ):
+    skew = _probe_emission_skew(probe)
+    if probe is not None and probe.get("click_timing_reliable") is False:
         return {
-            "category": "mic_capture_or_mic_offset",
-            "summary": "마이크 raw 트랙만 화면 기준에서 벗어나 있으므로 마이크 캡처 시작 시점 또는 mic offset 계산 경로가 원인입니다.",
-            "raw_mic_delta": raw_mic_delta,
-            "raw_system_delta": raw_system_delta,
-            "final_delta": final_delta,
+            "category": "probe_timing_unreliable",
+            "summary": (
+                "클릭이 예약 재생(AVAudioPlayer)에 실패해 afplay 폴백으로 재생됐습니다. "
+                "클릭 타임스탬프에 프로세스 spawn 지연이 섞여 있어 싱크 판정에 쓸 수 없습니다. 재측정하세요."
+            ),
+            "raw_mic_delta": None,
+            "raw_system_delta": None,
+            "final_delta": None,
         }
 
-    if raw_system_delta is not None and raw_mic_delta is not None:
-        if abs(raw_system_delta) > tolerance and abs(raw_mic_delta) > tolerance:
-            if raw_system_delta * raw_mic_delta > 0:
-                return {
-                    "category": "video_anchor_or_probe_timing",
-                    "summary": "시스템/마이크 raw 둘 다 같은 방향으로 벗어나 있어 화면 기준점 또는 진단 신호 시점 계산이 원인입니다.",
-                    "raw_mic_delta": raw_mic_delta,
-                    "raw_system_delta": raw_system_delta,
-                    "final_delta": final_delta,
-                }
+    # raw_*_delta 는 "오차"가 아니라 병합 때 적용해야 하는 offset(=필요량)이다.
+    # raw 트랙은 원래 화면과 어긋나 있고(캡처 시작 시각이 다르니 당연하다) 그걸 offset 으로
+    # 맞추는 것이 정상 동작이다. 실제 오차는 final_delta, 그리고 필요량과 적용량의 차이다.
+    raw_system_delta = (raw_system - raw_video - skew) if raw_system is not None and raw_video is not None else None
+    raw_mic_delta = (raw_mic - raw_video - skew) if raw_mic is not None and raw_video is not None else None
+    final_delta = (final_mix - final_video - skew) if final_mix is not None and final_video is not None else None
 
-    if final_delta is not None and abs(final_delta) > tolerance:
-        if (raw_system_delta is None or abs(raw_system_delta) <= tolerance) and (
-            raw_mic_delta is None or abs(raw_mic_delta) <= tolerance
-        ):
-            return {
-                "category": "merge_or_mux",
-                "summary": "raw 단계는 맞고 final만 어긋나 있으므로 ffmpeg 병합 또는 mux 단계가 원인입니다.",
-                "raw_mic_delta": raw_mic_delta,
-                "raw_system_delta": raw_system_delta,
-                "final_delta": final_delta,
-            }
-
-    return {
-        "category": "inconclusive",
-        "summary": "자동 판정이 충분하지 않습니다. raw/final 측정치를 함께 보고 수동으로 확인해야 합니다.",
+    result = {
         "raw_mic_delta": raw_mic_delta,
         "raw_system_delta": raw_system_delta,
         "final_delta": final_delta,
+    }
+
+    applied_sys = (screen_snapshot or {}).get("sys_offset")
+    applied_mic = (screen_snapshot or {}).get("mic_offset")
+    sys_anchor_error = (
+        float(applied_sys) - raw_system_delta
+        if isinstance(applied_sys, (int, float)) and raw_system_delta is not None
+        else None
+    )
+    mic_anchor_error = (
+        float(applied_mic) - raw_mic_delta
+        if isinstance(applied_mic, (int, float)) and raw_mic_delta is not None
+        else None
+    )
+    result["sys_anchor_error"] = sys_anchor_error
+    result["mic_anchor_error"] = mic_anchor_error
+
+    # 마이크 경로만 어긋난 경우: 마이크가 요구하는 offset 이 시스템 트랙과 크게 다르다.
+    # (둘 다 같은 화면을 기준으로 하니 요구량은 비슷해야 한다)
+    if mic_anchor_error is not None and abs(mic_anchor_error) > tolerance and (
+        sys_anchor_error is None or abs(sys_anchor_error) <= tolerance
+    ):
+        return {
+            **result,
+            "category": "mic_capture_or_mic_offset",
+            "summary": (
+                f"마이크에 적용된 offset 이 실측 필요량과 {mic_anchor_error * 1000:+.0f}ms 다릅니다. "
+                "마이크 캡처 시작 시점 또는 mic offset 계산 경로가 원인입니다."
+            ),
+        }
+    if mic_anchor_error is None and raw_mic_delta is not None and raw_system_delta is not None:
+        mic_vs_sys = raw_mic_delta - raw_system_delta
+        if abs(mic_vs_sys) > tolerance:
+            return {
+                **result,
+                "category": "mic_capture_or_mic_offset",
+                "summary": (
+                    f"마이크 raw 트랙이 시스템 트랙과 {mic_vs_sys * 1000:+.0f}ms 어긋나 있습니다. "
+                    "마이크 캡처 시작 시점 또는 mic offset 계산 경로가 원인입니다."
+                ),
+            }
+
+    # 적용 offset 이 실측 필요량과 다르면 앵커(영상 t=0 / 오디오 t=0) 계산이 원인이다.
+    if sys_anchor_error is not None and abs(sys_anchor_error) > tolerance:
+        return {
+            **result,
+            "category": "capture_anchor",
+            "summary": (
+                f"적용된 sys_offset 이 실측 필요량과 {sys_anchor_error * 1000:+.0f}ms 다릅니다. "
+                "영상 t=0 또는 오디오 t=0 앵커 계산이 원인입니다."
+            ),
+        }
+
+    if final_delta is not None and abs(final_delta) <= tolerance:
+        return {
+            **result,
+            "category": "in_sync",
+            "summary": f"final 편차 {final_delta * 1000:+.0f}ms — 허용치({tolerance * 1000:.0f}ms) 안입니다.",
+        }
+
+    if final_delta is not None and abs(final_delta) > tolerance:
+        if sys_anchor_error is not None and abs(sys_anchor_error) <= tolerance:
+            return {
+                **result,
+                "category": "merge_or_mux",
+                "summary": (
+                    f"offset 계산은 맞는데(오차 {sys_anchor_error * 1000:+.0f}ms) final 이 "
+                    f"{final_delta * 1000:+.0f}ms 어긋났습니다. ffmpeg 병합 또는 mux 단계가 원인입니다."
+                ),
+            }
+        return {
+            **result,
+            "category": "merge_or_anchor",
+            "summary": (
+                f"final 이 {final_delta * 1000:+.0f}ms 어긋났습니다. 적용 offset 기록이 없어 "
+                "앵커 계산과 병합 단계 중 어디가 원인인지 자동 분리할 수 없습니다."
+            ),
+        }
+
+    return {
+        **result,
+        "category": "inconclusive",
+        "summary": "자동 판정이 충분하지 않습니다. raw/final 측정치를 함께 보고 수동으로 확인해야 합니다.",
     }
 
 
@@ -492,24 +714,19 @@ def recommend_sync_adjustments(report: dict, fallback_current_mic_latency_correc
     if not isinstance(current_applied_correction, (int, float)):
         current_applied_correction = 0.0
 
+    # 영상 기준점은 실제로 측정된 플래시 프레임만 쓴다. 예전에는 플래시 측정이 없을 때
+    # click_started_at - screen anchor 로 대체했지만, 그 값은 클릭 재생 지연을 그대로 물고 있어
+    # 잘못된 mic_latency_correction 을 config 에 밀어 넣는 경로였다.
     video_probe_anchor = raw_video_flash
-    if not isinstance(video_probe_anchor, (int, float)):
-        click_started_at = probe.get("click_started_at")
-        screen_capture_started_at = screen_snapshot.get("screen.capture_started_at")
-        screen_started_at = screen_snapshot.get("screen.started_at")
-        if isinstance(click_started_at, (int, float)):
-            if isinstance(screen_capture_started_at, (int, float)):
-                video_probe_anchor = float(click_started_at) - float(screen_capture_started_at)
-            elif isinstance(screen_started_at, (int, float)):
-                video_probe_anchor = float(click_started_at) - float(screen_started_at)
 
     if (
         probe.get("include_flash")
+        and probe.get("click_timing_reliable") is not False
         and isinstance(video_probe_anchor, (int, float))
         and isinstance(raw_mic_click, (int, float))
         and isinstance(current_mic_offset, (int, float))
     ):
-        desired_mic_offset = float(raw_mic_click) - float(video_probe_anchor)
+        desired_mic_offset = float(raw_mic_click) - float(video_probe_anchor) - _probe_emission_skew(probe)
         correction = float(current_applied_correction) + (float(current_mic_offset) - desired_mic_offset)
         if 0.05 <= abs(correction) <= 2.0:
             recommendations["mic_latency_correction_seconds"] = round(correction, 3)
@@ -536,10 +753,13 @@ def analyze_session(session_dir: Path, fallback_current_mic_latency_correction: 
     final_video = _artifact_copy("final_video")
     final_audio = _artifact_copy("final_audio")
 
+    # 시스템 오디오는 탭에서 직접 받아 SNR 이 가장 높으므로 먼저 찾고,
+    # 마이크는 그 근처에서만 찾는다 (캡처 시작 시각 차이는 1초를 넘지 않는다).
+    raw_system_click = detect_audio_onset(raw_system) if raw_system else None
     measurements = {
         "raw_video_flash": detect_video_flash(raw_video) if raw_video else None,
-        "raw_system_click": detect_audio_onset(raw_system) if raw_system else None,
-        "raw_mic_click": detect_audio_onset(raw_mic) if raw_mic else None,
+        "raw_system_click": raw_system_click,
+        "raw_mic_click": detect_audio_onset(raw_mic, expected_near=raw_system_click) if raw_mic else None,
         "final_video_flash": detect_video_flash(final_video) if final_video else None,
         "final_mixed_click": detect_audio_onset(final_audio) if final_audio else None,
     }
@@ -579,7 +799,11 @@ def analyze_session(session_dir: Path, fallback_current_mic_latency_correction: 
     report = {
         "session": metadata,
         "measurements": measurements,
-        "inference": infer_sync_cause(measurements),
+        "inference": infer_sync_cause(
+            measurements,
+            probe=metadata.get("probe"),
+            screen_snapshot=metadata.get("sync_snapshots", {}).get("screen_start"),
+        ),
     }
     report["recommendations"] = recommend_sync_adjustments(
         report,

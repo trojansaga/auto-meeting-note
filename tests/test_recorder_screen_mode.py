@@ -54,6 +54,7 @@ class _FakeSystemAudioCapture:
     def __init__(self):
         self.started_at = 100.0
         self.first_sample_at = 100.0
+        self.first_sample_host_at = 100.0
         self.mic_capture_active = False
         self.mic_started_at = None
         self.output_path = None
